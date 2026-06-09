@@ -1,6 +1,6 @@
 # Setup
 
-Install https://docs.astral.sh/uv/#installation[uv]
+Install [uv](https://docs.astral.sh/uv/#installation)
 
 Then:
 
