@@ -1,0 +1,12 @@
+dotenv
+Pillow
+biopython
+fabric
+mdanalysis
+playwright
+psycopg2
+python-irodsclient
+requests
+toml
+python-lsp-server
+black
