@@ -9,6 +9,7 @@ import pytraj as pt
 import parmed as pmd
 import sys
 from subprocess import getstatusoutput
+from typing import List
 
 warnings.filterwarnings("ignore")
 
@@ -127,28 +128,30 @@ def find_matching_top_file(gro_file):
 
 
 # --------------------------------------------------
-def find_matching_struct_for_top(top_file, ext):
-    """Find a structure file (.tpr or .gro) alongside a .top file.
+def find_matching_struct_for_top(base_files: List[str], ext: str):
+    """Find a structure file (.tpr or .gro) alongside a topology or trajectory file.
 
     Args:
-        top_file: Path to .top topology file
+        base_files: List of path to topology/trajectory files
         ext: Extension to search for (e.g. ".tpr" or ".gro")
 
     Returns:
         Path to matching file, or None if not found
     """
-    top_dir = os.path.dirname(top_file) or "."
-    top_stem = os.path.splitext(os.path.basename(top_file))[0]
 
-    # Try exact stem match first
-    exact_match = os.path.join(top_dir, top_stem + ext)
-    if os.path.isfile(exact_match):
-        return exact_match
+    for base_file in base_files:
+        base_dir = os.path.dirname(base_file) or "."
+        base_stem = os.path.splitext(os.path.basename(base_file))[0]
 
-    # Fall back to any file with that extension in the same directory
-    candidates = [f for f in os.listdir(top_dir) if f.endswith(ext)]
-    if len(candidates) == 1:
-        return os.path.join(top_dir, candidates[0])
+        # Try exact stem match first
+        exact_match = os.path.join(base_dir, base_stem + ext)
+        if os.path.isfile(exact_match):
+            return exact_match
+
+        # Fall back to any file with that extension in the same directory
+        candidates = [f for f in os.listdir(base_dir) if f.endswith(ext)]
+        if len(candidates) == 1:
+            return os.path.join(base_dir, candidates[0])
 
     return None
 
@@ -183,11 +186,15 @@ def main():
                 warn("No TPR provided and no matching .top file found.")
         elif not tpr_file and topology_file.endswith(".top"):
             # topology is a .top — look for a .tpr to use directly, or a .gro to generate one
-            tpr_file = find_matching_struct_for_top(topology_file, ".tpr")
+            tpr_file = find_matching_struct_for_top(
+                [topology_file, trajectory_file], ".tpr"
+            )
             if tpr_file:
                 verbose(f"Found TPR file alongside .top: {tpr_file}")
             else:
-                gro_file = find_matching_struct_for_top(topology_file, ".gro")
+                gro_file = find_matching_struct_for_top(
+                    [topology_file, trajectory_file], ".gro"
+                )
                 if gro_file:
                     verbose(
                         f"No TPR found. Generating from {os.path.basename(topology_file)} + {os.path.basename(gro_file)}..."
