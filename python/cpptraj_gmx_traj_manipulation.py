@@ -1049,9 +1049,14 @@ def write_gromacs_bash(
             else:
                 cpptraj_topo = os.path.join(outdir, "topology.pdb")
                 try:
-                    pmd.load_file(topfile).save(
-                        cpptraj_topo, format="pdb", overwrite=True
-                    )
+                    orig_dir = os.getcwd()
+                    os.chdir(os.path.dirname(os.path.abspath(topfile)))
+                    try:
+                        pmd.load_file(topfile).save(
+                            cpptraj_topo, format="pdb", overwrite=True
+                        )
+                    finally:
+                        os.chdir(orig_dir)
                     verbose("Generated PDB from GRO for cpptraj topology")
                 except Exception as e:
                     warn(f"Could not generate PDB topology for cpptraj: {e}")
