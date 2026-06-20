@@ -282,7 +282,7 @@ def get_files(args: Args) -> Dict[str, List[str]]:
         "media_files": [],
     }
 
-    for file in simulation["original_files"]:
+    for file in simulation.get("original_files", []):
         files["original_files"].append(mkpath(file["name"]))
 
     for file in simulation["processed_files"]:
