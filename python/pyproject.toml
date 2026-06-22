@@ -26,4 +26,8 @@ dependencies = [
     "tabulate>=0.10.0",
     "toml>=0.10.2",
     "ty>=0.0.14",
+    "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

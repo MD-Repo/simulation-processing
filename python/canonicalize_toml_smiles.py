@@ -45,14 +45,14 @@ def fix_toml(path: str) -> int:
 
     def replace(m: re.Match) -> str:
         nonlocal changes
-        original = m.group(2)
+        original = m.group(3)
         canonical = canonicalize(original, conv)
         if canonical != original:
             changes += 1
-        return m.group(1) + canonical + m.group(3)
+        return m.group(1) + canonical + m.group(4)
 
     updated = re.sub(
-        r'^(smiles = ")([^"]+)(")',
+        r"^(smiles = (['\"]))(.*?)(\2)",
         replace,
         content,
         flags=re.MULTILINE,

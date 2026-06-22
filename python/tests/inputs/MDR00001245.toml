@@ -1,0 +1,69 @@
+lead_contributor_orcid = "0000-0000-0000-0000"
+trajectory_file_names = [ "10974_trj_102.xtc", "10973_trj_102.xtc", "10975_trj_102.xtc",]
+structure_file_name = "10978_dyn_102.pdb"
+topology_file_name = "10977_dyn_102.psf"
+temperature_kelvin = 310
+integration_timestep_fs = 4
+short_description = "C-x-c chemokine receptor type 4 in complex with it1t. Classical unbiased (NVT ensemble) complex flexibility assay."
+software_name = "ACEMD"
+software_version = "3.0.0"
+mdrepo_id = "MDR00001245"
+toml_version = 2
+forcefield = "CHARMM36m"
+forcefield_comments = "ligand params: CGenFF and SwissParam"
+protonation_method = "PROPKA"
+pdb_id = "3odu"
+uniprot_ids = [ "P00720", "P61073",]
+additional_files = []
+[[ligands]]
+name = "It1t"
+smiles = 'CC1(C)[NH+]=C2N(C1)C(=CS2)CS/C(=[NH+]\C1CCCCC1)/NC1CCCCC1'
+
+[[solutes]]
+name = "Cl-"
+concentration_mol_liter = 0.207
+
+[[solutes]]
+name = "Na+"
+concentration_mol_liter = 0.157
+
+[[papers]]
+title = "Structures of the CXCR4 Chemokine GPCR with Small-Molecule and Cyclic Peptide Antagonists"
+authors = "Wu, B., Chien, E., Mol, C., Fenalti, G., Liu, W., Katritch, V., Abagyan, R., Brooun, A., Wells, P., Bi, F., Hamel, D., Kuhn, P., Handel, T., Cherezov, V., Stevens, R."
+journal = "Science"
+volume = 330
+number = "6007"
+year = 2010
+pages = "1066-1071"
+doi = "10.1126/science.1194396"
+
+[[papers]]
+title = "GPCRmd uncovers the dynamics of the 3D-GPCRome"
+authors = "Rodríguez-Espigares, I., Torrens-Fontanals, M., Tiemann, J.K.S. et al."
+journal = "Nat Methods"
+volume = 17
+number = "1"
+year = 2020
+pages = "777–787"
+doi = "10.1038/s41592-020-0884-y"
+
+[[external_links]]
+url = "https://www.gpcrmd.org/dynadb/dynamics/id/102"
+
+[[contributors]]
+name = "Ismael Rodríguez-Espigares"
+orcid = "0000-0002-1602-8679"
+
+[[contributors]]
+name = "Ramon Guixà-González"
+orcid = "0000-0003-0397-9800"
+email = "ramon.guixa@psi.ch"
+
+[[contributors]]
+name = "Jana Selent"
+orcid = "0000-0002-1844-4449"
+email = "jana.selent@upf.edu"
+
+[[contributors]]
+name = "GPCRmd community"
+
