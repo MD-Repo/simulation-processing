@@ -26,6 +26,7 @@ class Args(NamedTuple):
     out_file: TextIO
     data_dir: str
     simulation_id: Optional[int]
+    replace_original_files: bool
 
 
 # --------------------------------------------------
@@ -72,6 +73,12 @@ def get_args() -> Args:
         help="Simulation ID (if reprocessing, will remove existing processed files)",
     )
 
+    parser.add_argument(
+        "--replace-original-files",
+        action="store_true",
+        help="Delete original/uploaded files",
+    )
+
     args = parser.parse_args()
 
     if not os.path.isdir(args.data_dir):
@@ -83,6 +90,7 @@ def get_args() -> Args:
         out_file=open(args.out_file, "wt"),
         data_dir=args.data_dir,
         simulation_id=args.simulation_id,
+        replace_original_files=args.replace_original_files,
     )
 
 
@@ -141,13 +149,47 @@ def main() -> None:
             (sim_id,),
         )
 
-    for file in sim["original_files"]:
+        if args.replace_original_files:
+            print("Removing previous uploaded files")
+            cur.execute(
+                """
+                select id
+                from   md_uploaded_file
+                where  simulation_id=%s
+                """,
+                (sim_id,),
+            )
+
+            for res in cur.fetchall():
+                cur.execute(
+                    """
+                    delete
+                    from   md_frontend_download_instance_uploaded_files
+                    where  simulationuploadedfile_id=%s
+                    """,
+                    (res[0],),
+                )
+
+            cur.execute(
+                """
+                delete
+                from   md_uploaded_file
+                where  simulation_id=%s
+                """,
+                (sim_id,),
+            )
+
+    for file in sim.get("original_files", []):
         file_id = create_uploaded_file(cur, sim_id, mdrepo_id, "uploaded", file)
         print(f"Original file {file['file_type']} => {file_id}")
 
     for file in sim["processed_files"]:
         file_id = create_processed_file(cur, sim_id, mdrepo_id, "processed", file)
         print(f"Processed file {file['file_type']} => {file_id}")
+
+    for trajectory_file_name in sim.get("replicates", []):
+        replicate_id = create_replicate(cur, sim_id, trajectory_file_name)
+        print(f"Replicate '{trajectory_file_name}' => {replicate_id}")
 
     for rank, contributor in enumerate(sim.get("contributors", []), start=1):
         c_id = create_contributor(cur, sim_id, contributor, rank)
@@ -270,6 +312,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                    forcefield=%s,
                    forcefield_comments=%s,
                    fasta_sequence=%s,
+                   num_replicates=%s,
                    temperature=%s,
                    protonation_method=%s,
                    is_placeholder=%s,
@@ -296,6 +339,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                 sim.get("forcefield", ""),
                 sim.get("forcefield_comments", ""),
                 sim["fasta_sequence"],
+                sim["num_replicates"],
                 sim["temperature_kelvin"],
                 sim.get("protonation_method"),
                 is_placeholder,
@@ -329,6 +373,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                    forcefield,
                    forcefield_comments,
                    fasta_sequence,
+                   num_replicates,
                    temperature,
                    protonation_method,
                    is_placeholder,
@@ -338,7 +383,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                    is_coarse_grained,
                    creation_date)
             values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             returning id;
             """,
             (
@@ -359,6 +404,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                 sim.get("forcefield", ""),
                 sim.get("forcefield_comments", ""),
                 sim["fasta_sequence"],
+                sim["num_replicates"],
                 sim["temperature_kelvin"],
                 sim.get("protonation_method"),
                 is_placeholder,
@@ -370,16 +416,6 @@ def get_simulation(cur, sim, sim_id) -> int:
             ),
         )
         sim_id = cur.fetchone()[0]
-
-    replicate_group_id = get_replicate_group(cur, sim_id, sim, user_id, software_id)
-    cur.execute(
-        """
-        update md_simulation
-        set    replicate_group_id=%s
-        where  id=%s
-        """,
-        (replicate_group_id, sim_id),
-    )
 
     return sim_id
 
@@ -434,52 +470,6 @@ def get_user(cur, orcid) -> Optional[int]:
         return res[0]
 
     sys.exit(f"Failed to find ORCID '{orcid}'")
-
-
-# --------------------------------------------------
-def get_replicate_group(cur, sim_id, sim, user_id, software_id) -> int:
-    replicate_key = "-".join(
-        map(
-            str,
-            [
-                sim["structure_hash"],
-                sim["duration"],
-                sim["temperature_kelvin"],
-                software_id,
-            ],
-        )
-    )
-
-    cur.execute(
-        """
-        select id
-        from   md_replicate_group
-        where  replicate_key=%s
-        and    user_id=%s
-        """,
-        (replicate_key, user_id),
-    )
-
-    if res := cur.fetchone():
-        return res["id"]
-
-    cur.execute(
-        """
-        insert
-        into   md_replicate_group
-               (replicate_key, user_id, description, sample_mdrepo_id)
-        values (%s, %s, %s, %s)
-        returning id
-        """,
-        (
-            replicate_key,
-            user_id,
-            sim["short_description"],
-            f"MDR{sim_id:08}",
-        ),
-    )
-
-    return cur.fetchone()[0]
 
 
 # --------------------------------------------------
@@ -1022,6 +1012,34 @@ def create_warnings(cur, sim_id, vals: List[str]) -> int:
         num_created += 1
 
     return num_created
+
+
+# --------------------------------------------------
+def create_replicate(cur, sim_id, trajectory_file_name) -> int:
+    cur.execute(
+        """
+        select id
+        from   md_replicate
+        where  simulation_id=%s
+        and    trajectory_file_name=%s
+        """,
+        (sim_id, trajectory_file_name),
+    )
+
+    if res := cur.fetchone():
+        return res[0]
+
+    cur.execute(
+        """
+        insert
+        into   md_replicate (simulation_id, trajectory_file_name)
+        values (%s, %s)
+        returning id
+        """,
+        (sim_id, trajectory_file_name),
+    )
+
+    return cur.fetchone()[0]
 
 
 # --------------------------------------------------
