@@ -1,80 +1,48 @@
 #!/usr/bin/env python3
 """
-canonicalize_toml_smiles.py — Rewrite ligand SMILES in an mdrepo metadata toml
-to OpenBabel canonical form before processing.
-
-Some upstream SMILES strings use non-standard protonation notation
-(e.g. [N+H3], [N+H2], [N+H]) which is rejected by mdr-process's SMILES
-validator. OpenBabel parses these correctly and emits standard canonical SMILES
-(e.g. [NH3+], [NH2+], [NH+]) that pass validation. This script is called
-automatically by mdr-process before validation.
-
-Usage:
-    python canonicalize_toml_smiles.py mdrepo-metadata.toml [...]
-    uv run canonicalize_toml_smiles.py mdrepo-metadata.toml
+Author : Ken Youens-Clark <kyclark@gmail.com>
+Date   : 2026-06-22
+Purpose: Canonicalize a SMILES string
 """
 
-import re
+import argparse
 import sys
+from typing import NamedTuple
 
-from openbabel import openbabel as ob
-
-ob.obErrorLog.SetOutputLevel(ob.obError)
-
-
-def _make_converter() -> ob.OBConversion:
-    conv = ob.OBConversion()
-    conv.SetInFormat("smi")
-    conv.SetOutFormat("can")
-    return conv
+from rdkit import Chem
+from rdkit.Chem import MolToSmiles
 
 
-def canonicalize(smiles: str, conv: ob.OBConversion) -> str:
-    mol = ob.OBMol()
-    if conv.ReadString(mol, smiles):
-        return conv.WriteString(mol).strip().split("\t")[0]
-    return smiles
+class Args(NamedTuple):
+    smiles: str
 
 
-def fix_toml(path: str) -> int:
-    conv = _make_converter()
-    with open(path) as f:
-        content = f.read()
-
-    changes = 0
-
-    def replace(m: re.Match) -> str:
-        nonlocal changes
-        original = m.group(3)
-        canonical = canonicalize(original, conv)
-        if canonical != original:
-            changes += 1
-        return m.group(1) + canonical + m.group(4)
-
-    updated = re.sub(
-        r"^(smiles = (['\"]))(.*?)(\2)",
-        replace,
-        content,
-        flags=re.MULTILINE,
+# --------------------------------------------------
+def get_args() -> Args:
+    parser = argparse.ArgumentParser(
+        description="Canonicalize a SMILES string",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    if changes:
-        with open(path, "w") as f:
-            f.write(updated)
+    parser.add_argument("smiles", metavar="SMILES", help="Input SMILES string")
 
-    return changes
+    args = parser.parse_args()
+
+    return Args(smiles=args.smiles)
 
 
+# --------------------------------------------------
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <toml> [...]", file=sys.stderr)
+    args = get_args()
+
+    mol = Chem.MolFromSmiles(args.smiles)
+    if mol is None:
+        print(f"Error: invalid SMILES: {args.smiles!r}", file=sys.stderr)
         sys.exit(1)
 
-    for path in sys.argv[1:]:
-        n = fix_toml(path)
-        if n:
-            print(f"{path}: canonicalized {n} SMILES string{'s' if n != 1 else ''}")
+    print(MolToSmiles(mol))
 
 
+# --------------------------------------------------
 if __name__ == "__main__":
     main()
