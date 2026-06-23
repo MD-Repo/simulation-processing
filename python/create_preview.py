@@ -13,6 +13,7 @@ build is checked in alongside this script as molstar.js / molstar.css.
 import argparse
 import base64
 import contextlib
+import fcntl
 import os
 import subprocess
 import sys
@@ -26,6 +27,16 @@ warnings.filterwarnings("ignore")
 HERE = os.path.dirname(os.path.abspath(__file__))
 MOLSTAR_JS = os.path.join(HERE, "molstar.js")
 MOLSTAR_CSS = os.path.join(HERE, "molstar.css")
+MAX_RENDER_TRIES = 4
+
+# The reprocess pipeline renders a thumbnail for every representative
+# trajectory at once -- a dozen-plus headed-Chromium + Xvfb instances
+# concurrently -- which exhausts resources: a render crashes and then the Xvfb
+# itself dies ("Missing X server or $DISPLAY"). A cross-process flock semaphore
+# caps how many renders run simultaneously regardless of how many the pipeline
+# spawns. Tune with CREATE_PREVIEW_SLOTS; the lock dir with CREATE_PREVIEW_SEM_DIR.
+SEM_DIR = os.environ.get("CREATE_PREVIEW_SEM_DIR", "/tmp/create_preview_sem")
+SEM_SLOTS = max(1, int(os.environ.get("CREATE_PREVIEW_SLOTS", "8")))
 
 
 class Args(NamedTuple):
@@ -99,12 +110,22 @@ def ensure_display() -> Iterator[None]:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            # Accept this display only once OUR Xvfb is confirmed alive AND owns
+            # the lock. Xvfb takes the lock with O_EXCL, so under a concurrent
+            # race the loser's process exits; if ours died, move to the next
+            # number instead of binding to a display we don't own.
+            ready = False
             for _ in range(50):
+                if proc.poll() is not None:
+                    break
                 if os.path.exists(lock):
+                    ready = True
                     break
                 time.sleep(0.1)
-            else:
-                proc.terminate()
+            if not ready:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait()
                 continue
             prev_display = os.environ.get("DISPLAY")
             os.environ["DISPLAY"] = display
@@ -120,6 +141,28 @@ def ensure_display() -> Iterator[None]:
             return
 
     raise RuntimeError("No free display number found for Xvfb")
+
+
+# --------------------------------------------------
+@contextlib.contextmanager
+def render_slot() -> Iterator[None]:
+    """Acquire one of SEM_SLOTS cross-process render slots (flock semaphore)."""
+    os.makedirs(SEM_DIR, exist_ok=True)
+    while True:
+        for i in range(SEM_SLOTS):
+            fh = open(os.path.join(SEM_DIR, f"slot_{i}.lock"), "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fh.close()
+                continue
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+            return
+        time.sleep(0.5)
 
 
 # Mirror the site: Viewer.create + loadTrajectory(model + coordinates), with all
@@ -179,6 +222,32 @@ def main() -> None:
         with open(args.trajectory, "rb") as fh:
             xtc_b64 = base64.b64encode(fh.read()).decode("ascii")
 
+    # Under the concurrent render storm an individual render can crash
+    # (TargetClosedError) and even take its Xvfb down. Retry a few times; each
+    # attempt holds a concurrency slot and gets its OWN fresh Xvfb + browser so
+    # a dead display recovers and the system isn't overloaded.
+    last_err = None
+    for attempt in range(1, MAX_RENDER_TRIES + 1):
+        try:
+            with render_slot():
+                render_once(pdb, xtc_b64, width, height, args.out_file)
+            last_err = None
+            break
+        except Exception as err:  # noqa: BLE001 - retry any render failure
+            last_err = err
+            print(f"[create_preview] render attempt {attempt}/{MAX_RENDER_TRIES} "
+                  f"failed: {err}", file=sys.stderr)
+            time.sleep(2)
+    if last_err is not None:
+        raise last_err
+
+    print(f"Wrote '{args.out_file}'")
+
+
+# --------------------------------------------------
+def render_once(pdb: str, xtc_b64, width: int, height: int, out_file: str) -> None:
+    """Render a single thumbnail in a fresh Xvfb + browser (one attempt)."""
+
     with ensure_display(), sync_playwright() as p:
         browser = p.chromium.launch(
             headless=False,
@@ -190,25 +259,25 @@ def main() -> None:
                 "--disable-dev-shm-usage",
             ],
         )
-        page = browser.new_page(viewport={"width": width, "height": height})
-        page.on("pageerror", lambda err: print(f"[browser error] {err}", file=sys.stderr))
-        page.set_content(
-            "<html><head></head><body style='margin:0'>"
-            f"<div id='app' style='position:absolute;inset:0;width:{width}px;height:{height}px'></div>"
-            "</body></html>"
-        )
-        page.add_style_tag(path=MOLSTAR_CSS)
-        page.add_style_tag(content=".msp-viewport-controls,.msp-viewport-top-left-controls{display:none!important}")
-        page.add_script_tag(path=MOLSTAR_JS)
-        page.set_default_timeout(180 * 10**3)
-        page.evaluate(LOAD_JS, {"pdb": pdb, "xtcB64": xtc_b64})
-        page.wait_for_timeout(2500)
-        # Screenshot the molstar canvas directly (no HTML overlays).
-        canvas = page.query_selector("canvas.msp-canvas") or page.query_selector("canvas")
-        canvas.screenshot(path=args.out_file)
-        browser.close()
-
-    print(f"Wrote '{args.out_file}'")
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            page.on("pageerror", lambda err: print(f"[browser error] {err}", file=sys.stderr))
+            page.set_content(
+                "<html><head></head><body style='margin:0'>"
+                f"<div id='app' style='position:absolute;inset:0;width:{width}px;height:{height}px'></div>"
+                "</body></html>"
+            )
+            page.add_style_tag(path=MOLSTAR_CSS)
+            page.add_style_tag(content=".msp-viewport-controls,.msp-viewport-top-left-controls{display:none!important}")
+            page.add_script_tag(path=MOLSTAR_JS)
+            page.set_default_timeout(180 * 10**3)
+            page.evaluate(LOAD_JS, {"pdb": pdb, "xtcB64": xtc_b64})
+            page.wait_for_timeout(2500)
+            # Screenshot the molstar canvas directly (no HTML overlays).
+            canvas = page.query_selector("canvas.msp-canvas") or page.query_selector("canvas")
+            canvas.screenshot(path=out_file)
+        finally:
+            browser.close()
 
 
 # --------------------------------------------------
