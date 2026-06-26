@@ -8,6 +8,12 @@ Then:
 uv add --requirements requirements.txt
 ```
 
+To install `playwright`:
+
+```
+source .venv/bin/activate && playwright install
+```
+
 Programs can be run with:
 
 * `uv run <program>` 
