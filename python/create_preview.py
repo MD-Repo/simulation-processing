@@ -20,6 +20,7 @@ import sys
 import time
 import warnings
 from typing import NamedTuple, Iterator
+from PIL import Image
 from playwright.sync_api import sync_playwright
 
 warnings.filterwarnings("ignore")
@@ -207,6 +208,28 @@ async ({pdb, xtcB64}) => {
 
 
 # --------------------------------------------------
+def make_transparent(image: Image.Image) -> Image.Image:
+    """Make a white background transparent.
+
+    Every fully-white pixel becomes fully transparent; anti-aliased edges
+    (off-white) are left opaque so the molecule keeps clean borders. Mirrors
+    the behavior the NGL preview used before the Mol* switch.
+    """
+
+    image = image.convert("RGBA")
+    data = image.load()
+    width, height = image.size
+
+    for y in range(height):
+        for x in range(width):
+            item = data[x, y]  # type: ignore
+            if all(i == 255 for i in item):
+                data[x, y] = (255, 255, 255, 0)  # type: ignore
+
+    return image
+
+
+# --------------------------------------------------
 def main() -> None:
     """ Make a jazz noise here """
 
@@ -276,6 +299,9 @@ def render_once(pdb: str, xtc_b64, width: int, height: int, out_file: str) -> No
             # Screenshot the molstar canvas directly (no HTML overlays).
             canvas = page.query_selector("canvas.msp-canvas") or page.query_selector("canvas")
             canvas.screenshot(path=out_file)
+            # The render is on a white background; turn that background
+            # transparent so the thumbnail composites cleanly on the site.
+            make_transparent(Image.open(out_file)).save(out_file)
         finally:
             browser.close()
 
