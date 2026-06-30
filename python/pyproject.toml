@@ -27,6 +27,7 @@ dependencies = [
     "toml>=0.10.2",
     "ty>=0.0.14",
     "pytest>=8.0",
+    "rdkit>=2026.3.3",
 ]
 
 [tool.pytest.ini_options]
