@@ -8,10 +8,13 @@ Purpose: Canonicalize a SMILES string
 import argparse
 import sys
 import toml
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
-from rdkit import Chem
-from rdkit.Chem import MolToSmiles
+from openbabel import pybel
+
+# OpenBabel accepts non-standard protonation such as [N+H3] (which strict RDKit
+# parsing rejects as invalid) and canonicalizes it to [NH3+]. Quiet its logger.
+pybel.ob.obErrorLog.SetOutputLevel(0)
 
 
 class Args(NamedTuple):
@@ -33,6 +36,17 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
+def canonicalize(smiles: str) -> Optional[str]:
+    """Canonical SMILES via OpenBabel, or None if the SMILES is invalid."""
+    try:
+        mol = pybel.readstring("smi", smiles)
+    except Exception:
+        return None
+    canonical = mol.write("can").strip()
+    return canonical.split()[0] if canonical else None
+
+
+# --------------------------------------------------
 def main() -> None:
     args = get_args()
 
@@ -42,8 +56,7 @@ def main() -> None:
 
     for ligand in data.get("ligands", []):
         if orig_smiles := ligand.get("smiles"):
-            if mol := Chem.MolFromSmiles(orig_smiles):
-                new_smiles = MolToSmiles(mol)
+            if new_smiles := canonicalize(orig_smiles):
                 if new_smiles != orig_smiles:
                     ligand["smiles"] = new_smiles
                     num_changed += 1
