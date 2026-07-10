@@ -11,6 +11,7 @@ import json
 import os
 import psycopg2
 import psycopg2.extras
+import re
 import sys
 from datetime import datetime
 from dotenv import dotenv_values
@@ -27,6 +28,7 @@ class Args(NamedTuple):
     irods_env: str
     landing_dirs: List[str]
     ticket_ids: List[str]
+    pattern: Optional[re.Pattern]
 
 
 class Ticket(NamedTuple):
@@ -106,6 +108,22 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "-T",
+        "--ticket-file",
+        help="File of ticket IDs, one per line",
+        metavar="FILE",
+        type=argparse.FileType("rt"),
+    )
+
+    parser.add_argument(
+        "-p",
+        "--pattern",
+        help="Only download files whose name matches this regex",
+        metavar="REGEX",
+        default="",
+    )
+
+    parser.add_argument(
         "-e",
         "--irods-env",
         help="IRODS environment file",
@@ -121,6 +139,27 @@ def get_args() -> Args:
     if not os.path.isfile(args.irods_env):
         parser.error("Invalid --irods-env '{args.irods_env}'")
 
+    ticket_ids = list(args.ticket_id or [])
+    if args.ticket_file:
+        for line_num, line in enumerate(args.ticket_file, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ticket_ids.append(int(line))
+            except ValueError:
+                parser.error(
+                    f"Invalid ticket ID '{line}' on line {line_num} "
+                    f"of --ticket-file '{args.ticket_file.name}'"
+                )
+
+    pattern = None
+    if args.pattern:
+        try:
+            pattern = re.compile(args.pattern)
+        except re.error as e:
+            parser.error(f"Invalid --pattern '{args.pattern}': {e}")
+
     if not args.out_dir:
         args.out_dir = os.path.join("/opt/mdrepo/landing", args.server)
 
@@ -132,7 +171,8 @@ def get_args() -> Args:
         out_dir=args.out_dir,
         irods_env=args.irods_env,
         landing_dirs=args.landing_dir or [],
-        ticket_ids=args.ticket_id or [],
+        ticket_ids=ticket_ids,
+        pattern=pattern,
     )
 
 
@@ -214,14 +254,38 @@ def main() -> None:
                 # Get the JSON file with the expected MD5 values
                 irods_completed = os.path.join(landing_dir, SUBMISSION_COMPLETE)
                 if not session.data_objects.exists(irods_completed):
-                    sys.exit(f"Missing {irods_completed}")
+                    print(f"Warning: Missing {SUBMISSION_COMPLETE}")
+                    continue
 
                 local_completed = os.path.join(dest_dir, SUBMISSION_COMPLETE)
-                if os.path.isfile(local_completed):
-                    os.remove(local_completed)
 
-                session.data_objects.get(irods_completed, local_completed)
-                completed = json.load(open(local_completed))
+                # Download the completed JSON, retrying (and falling back to
+                # gocmd) because session.data_objects.get occasionally writes an
+                # empty/truncated file on the compound resource.
+                completed = None
+                for retry in range(3):
+                    if os.path.isfile(local_completed):
+                        os.remove(local_completed)
+
+                    if retry == 0:
+                        session.data_objects.get(irods_completed, local_completed)
+                    else:
+                        cmd = f"gocmd get {irods_completed} {local_completed}"
+                        rv, out = getstatusoutput(cmd)
+                        if rv != 0:
+                            print(f"Retry {retry}: error running {cmd}: {out}")
+                            continue
+
+                    try:
+                        with open(local_completed) as fh:
+                            completed = json.load(fh)
+                        break
+                    except (json.JSONDecodeError, OSError) as e:
+                        print(f"Retry {retry}: bad {SUBMISSION_COMPLETE}: {e}")
+
+                if completed is None:
+                    print(f"Unable to fetch {SUBMISSION_COMPLETE}, skipping part")
+                    continue
                 # NB: despite its name, "irods_path" holds just the basename
                 # (e.g. "1_prod.mdc"), so this dict is keyed by basename and
                 # matches obj.name in the loop below.
@@ -239,6 +303,12 @@ def main() -> None:
                 for obj_num, obj in enumerate(data_objects, start=1):
                     filename = obj.name
                     if filename == SUBMISSION_COMPLETE:
+                        continue
+
+                    if args.pattern and not args.pattern.search(filename):
+                        print(
+                            f"    {obj_num:2}: {filename} (skipping, no pattern match)"
+                        )
                         continue
 
                     irods_md5 = obj.chksum()
