@@ -158,21 +158,23 @@ def main() -> None:
         for ticket_num, ticket in enumerate(tickets, start=1):
             irods_tickets = ticket.irods_tickets.split(";")
             created = ticket.created_at
+            created_by = f"{ticket.first_name} {ticket.last_name} ({ticket.email})"
+            ticket_dir = os.path.join(args.out_dir, f"ticket-{ticket.ticket_id}")
+            if not os.path.isdir(ticket_dir):
+                os.makedirs(ticket_dir)
+
             print(
                 "\n".join(
                     [
                         f">>> {ticket_num}: Ticket {ticket.ticket_id} <<<",
                         f" Created   : {created.strftime('%Y-%m-%d %H:%M')}",
-                        f" Created by: {ticket.first_name} {ticket.last_name} ({ticket.email})",
+                        f" Created by: {created_by}",
                         f" Token     : {ticket.token}",
+                        f" Directory : {ticket_dir}",
                         f" Num parts : {len(irods_tickets)}",
                     ]
                 )
             )
-
-            ticket_dir = os.path.join(args.out_dir, f"ticket-{ticket.ticket_id}")
-            if not os.path.isdir(ticket_dir):
-                os.makedirs(ticket_dir)
 
             ticket_info = os.path.join(ticket_dir, "ticket.json")
             with open(ticket_info, "wt") as fh:
@@ -220,6 +222,9 @@ def main() -> None:
 
                 session.data_objects.get(irods_completed, local_completed)
                 completed = json.load(open(local_completed))
+                # NB: despite its name, "irods_path" holds just the basename
+                # (e.g. "1_prod.mdc"), so this dict is keyed by basename and
+                # matches obj.name in the loop below.
                 hash_by_filename = {
                     v["irods_path"]: v["md5_hash"] for v in completed["files"]
                 }
@@ -237,6 +242,23 @@ def main() -> None:
                         continue
 
                     irods_md5 = obj.chksum()
+
+                    # Read the MD5 from the catalog instead of calling
+                    # obj.chksum(), which triggers a server-side operation that
+                    # fails with HIERARCHY_ERROR on the cache+archive compound
+                    # resource. Good replicas already carry the stored checksum.
+                    # checksums = {
+                    #     r.checksum
+                    #     for r in obj.replicas
+                    #     if r.status == "1" and r.checksum
+                    # }
+                    # if not checksums:
+                    #     print(f"    no good replica checksum for '{obj.path}', skipping")
+                    #     continue
+                    # if len(checksums) > 1:
+                    #     print(f"    replicas disagree on checksum for '{obj.path}': {checksums}")
+                    #     continue
+                    # irods_md5 = checksums.pop()
                     if completed_md5 := hash_by_filename.get(filename):
                         if completed_md5 != irods_md5:
                             print(
