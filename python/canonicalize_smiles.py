@@ -50,7 +50,13 @@ def canonicalize(smiles: str) -> Optional[str]:
 def main() -> None:
     args = get_args()
 
-    data = toml.load(args.file)
+    try:
+        data = toml.load(args.file)
+    except FileNotFoundError:
+        sys.exit(f'Error: File not found: "{args.file}"')
+    except toml.TomlDecodeError as err:
+        sys.exit(f'Error: Invalid TOML in "{args.file}": {err}')
+
     num_changed = 0
     errors = []
 
