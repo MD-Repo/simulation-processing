@@ -48,19 +48,6 @@ class Ticket(NamedTuple):
     email: str
 
 
-class UploadInstance(NamedTuple):
-    """UploadInstance"""
-
-    created_on: datetime.datetime
-    simulation_id: Optional[int]
-    user_id: int
-    successful: bool
-    lead_contributor_orcid: str
-    filenames: str
-    ticket_id: int
-    landing_id: str
-
-
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
 
 
@@ -459,70 +446,6 @@ def find_tickets(cur, args: Args) -> List[Ticket]:
             )
 
     return tickets
-
-
-# --------------------------------------------------
-def get_upload_instance(cur, ticket: Ticket, landing_dir: str, filenames: str):
-    """Get upload instance"""
-
-    cur.execute(
-        """
-        select id
-        from   md_upload_instance
-        where  ticket_id=%s
-        and    landing_id=%s
-        """,
-        (ticket.ticket_id, landing_dir),
-    )
-
-    upload_instance_id = None
-    if res := cur.fetchone():
-        upload_instance_id = res[0]
-    else:
-        cur.execute(
-            """
-            insert
-            into   md_upload_instance
-                   (user_id, lead_contributor_id, filenames, ticket_id, landing_id)
-            values (%s, %s, %s, %s, %s)
-            returning id
-            """,
-            (
-                Ticket.user_id,
-                Ticket.orcid,
-                filenames,
-                Ticket.ticket_id,
-                landing_dir,
-            ),
-        )
-        upload_instance_id = cur.fetchone()[0]
-
-    if not upload_instance_id:
-        sys.exit(
-            "Failed to create upload instance for ticket {ticket} landing {landing_dir}"
-        )
-
-    cur.execute(
-        """
-        select created_on, simulation_id, user_id, successful, lead_contributor_orcid,
-               filenames, ticket_id, landing_id
-        from   md_upload_instance
-        where  id=%s
-        """,
-        (upload_instance_id,),
-    )
-
-    if res := cur.fetchone():
-        return UploadInstance(
-            created_on=res["created_on"],
-            simulation_id=res["simulation_id"],
-            user_id=res["user_id"],
-            successful=res["successful"],
-            lead_contributor_orcid=res["lead_contributor_orcid"],
-            filenames=res["filenames"],
-            ticket_id=res["ticket_id"],
-            landing_id=res["landing_id"],
-        )
 
 
 # --------------------------------------------------

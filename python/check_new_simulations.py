@@ -22,6 +22,10 @@ from typing import List, NamedTuple, Optional
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 MAX_DAYS_OLD = 7
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
+FRONTEND_BASE_URLS = {
+    "staging": "https://staging.mdrepo.org",
+    "prod": "https://mdrepo.org",
+}
 
 
 class Args(NamedTuple):
@@ -57,7 +61,7 @@ def get_args() -> Args:
 
     parser.add_argument(
         "--dry-run",
-        help="Log intended changes without making them",
+        help="Log intended changes without making them (implies --verbose)",
         action="store_true",
     )
 
@@ -69,7 +73,7 @@ def get_args() -> Args:
         landing_id=args.landing_id,
         server=args.server,
         dry_run=args.dry_run,
-        verbose=args.verbose,
+        verbose=args.verbose or args.dry_run,
     )
 
 
@@ -115,8 +119,10 @@ def main() -> None:
     with iRODSSession(irods_env_file=irods_env, ssl_context=ssl_context) as session:
         status("Got IRODS session")
 
+        base_url = FRONTEND_BASE_URLS[args.server]
+
         for ticket in unprocessed:
-            process_ticket(cur, session, ticket, args.dry_run, status)
+            process_ticket(cur, session, ticket, base_url, args.dry_run, status)
 
     status("FINISHED check_new_simulations")
 
@@ -128,27 +134,25 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
     if landing_id:
         cur.execute(
             """
-            select id, created_at, created_by_id, irods_tickets
+            select id, created_at, irods_tickets
             from   md_ticket
             where  irods_tickets like %s
             """,
             (f"%{landing_id}%",),
         )
     else:
-        cur.execute(
-            """
-            select id, created_at, created_by_id, irods_tickets
+        cur.execute("""
+            select id, created_at, irods_tickets
             from   md_ticket
             where  ticket_type = 'u'
             and    upload_notification_sent = false
-            """
-        )
+            """)
 
     return cur.fetchall()
 
 
 # --------------------------------------------------
-def process_ticket(cur, session, ticket, dry_run: bool, status) -> None:
+def process_ticket(cur, session, ticket, base_url: str, dry_run: bool, status) -> None:
     """Check a single ticket's IRODS collections and act on its status"""
 
     created = ticket["created_at"]
@@ -157,7 +161,6 @@ def process_ticket(cur, session, ticket, dry_run: bool, status) -> None:
 
     collections = []
     upload_complete = []
-    filenames: List[str] = []
     landing_dirs: List[str] = []
 
     irods_tickets = ticket["irods_tickets"]
@@ -172,7 +175,6 @@ def process_ticket(cur, session, ticket, dry_run: bool, status) -> None:
                     coll = session.collections.get(landing_dir)
                     collections.append(coll)
                     coll_filenames = [o.name for o in coll.data_objects]
-                    filenames.extend(coll_filenames)
                     upload_complete.append(SUBMISSION_COMPLETE in coll_filenames)
                 else:
                     upload_complete.append(False)
@@ -183,55 +185,22 @@ def process_ticket(cur, session, ticket, dry_run: bool, status) -> None:
     is_complete = bool(upload_complete) and all(upload_complete)
 
     if is_complete:
-        lead_contributor_orcid = get_orcid(cur, ticket["created_by_id"]) or "NA"
-        keep_filenames = [
-            f for f in filenames if not f.startswith("mdrepo-submission.")
-        ]
-
         msg = f"New simulation upload {ticket['id']}: {', '.join(landing_dirs)}"
 
         if dry_run:
             status(
-                f"DRY RUN: would create upload instance for ticket {ticket['id']} "
-                f"({', '.join(keep_filenames)}), notify Slack, mark notified"
+                f"DRY RUN: would notify Slack and mark ticket {ticket['id']} "
+                "notified and used for upload"
             )
         else:
-            cur.execute(
-                """
-                insert
-                into   md_upload_instance
-                       (created_on, user_id, ticket_id, lead_contributor_orcid,
-                        filenames)
-                values (now(), %s, %s, %s, %s)
-                returning id
-                """,
-                (
-                    ticket["created_by_id"],
-                    ticket["id"],
-                    lead_contributor_orcid,
-                    ", ".join(keep_filenames),
-                ),
-            )
-            upload_instance_id = cur.fetchone()[0]
-
-            cur.execute(
-                """
-                insert
-                into   md_upload_instance_message
-                       (timestamp, message, simulation_upload_id, is_error,
-                        is_warning)
-                values (now(), %s, %s, false, false)
-                """,
-                ("Files received, awaiting processing", upload_instance_id),
-            )
-
             status(msg)
-            send_slack_message(msg)
+            send_slack_message(msg, base_url)
 
             cur.execute(
                 """
                 update md_ticket
-                set    upload_notification_sent = true
+                set    upload_notification_sent = true,
+                       used_for_upload = true
                 where  id = %s
                 """,
                 (ticket["id"],),
@@ -244,52 +213,37 @@ def process_ticket(cur, session, ticket, dry_run: bool, status) -> None:
                 "incomplete: would DELETE"
             )
         else:
-            status(f"Ticket {ticket['id']} is {days_old} days old and incomplete: DELETE")
+            status(
+                f"Ticket {ticket['id']} is {days_old} days old and incomplete: DELETE"
+            )
             for coll in collections:
                 coll.remove()
             cur.execute("delete from md_ticket where id = %s", (ticket["id"],))
 
 
 # --------------------------------------------------
-def get_orcid(cur, user_id: Optional[int]) -> Optional[str]:
-    """Get a user's first linked social-account uid (mirrors User.orcid)"""
-
-    if user_id is None:
-        return None
-
-    cur.execute(
-        """
-        select uid
-        from   socialaccount_socialaccount
-        where  user_id = %s
-        order  by id
-        limit  1
-        """,
-        (user_id,),
-    )
-    res = cur.fetchone()
-    return res["uid"] if res else None
-
-
-# --------------------------------------------------
-def send_slack_message(message: str, channel: str = "mdrepo-alerts") -> None:
+def send_slack_message(
+    message: str, base_url: str, channel: str = "mdrepo-alerts"
+) -> None:
     """Post a message to Slack (best-effort, mirrors slack_messages.send_message)"""
 
+    token = os.getenv("SLACK_TOKEN")
+    if not token:
+        print(f'No SLACK_TOKEN, not sending Slack message "{message}"')
+        return
+
     try:
-        token = os.getenv("SLACK_TOKEN")
-        if token:
-            domain = os.getenv("FRONTEND_BASE_URL")
-            resp = requests.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "channel": channel,
-                    "text": f"{message} ({domain})",
-                    "username": "Bot User",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "channel": channel,
+                "text": f"{message} ({base_url})",
+                "username": "Bot User",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
     except Exception as e:
         print(f'Unable to send Slack message "{message}": {e}')
 
