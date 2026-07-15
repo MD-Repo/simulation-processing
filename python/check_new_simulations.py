@@ -9,7 +9,6 @@ Purpose: Scan for unprocessed simulation uploads (cron replacement for the
 import argparse
 import os
 import re
-import requests
 import psycopg2
 import psycopg2.extras
 import ssl
@@ -19,13 +18,11 @@ from dotenv import load_dotenv
 from irods.session import iRODSSession
 from typing import List, NamedTuple, Optional
 
+from common import FRONTEND_BASE_URLS, send_slack_message
+
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 MAX_DAYS_OLD = 7
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
-FRONTEND_BASE_URLS = {
-    "staging": "https://staging.mdrepo.org",
-    "prod": "https://mdrepo.org",
-}
 
 
 class Args(NamedTuple):
@@ -122,7 +119,15 @@ def main() -> None:
         base_url = FRONTEND_BASE_URLS[args.server]
 
         for ticket in unprocessed:
-            process_ticket(cur, session, ticket, base_url, args.dry_run, status)
+            process_ticket(
+                cur,
+                session,
+                ticket,
+                args.server,
+                base_url,
+                args.dry_run,
+                status,
+            )
 
     status("FINISHED check_new_simulations")
 
@@ -152,7 +157,15 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
 
 
 # --------------------------------------------------
-def process_ticket(cur, session, ticket, base_url: str, dry_run: bool, status) -> None:
+def process_ticket(
+    cur,
+    session,
+    ticket,
+    server: str,
+    base_url: str,
+    dry_run: bool,
+    status,
+) -> None:
     """Check a single ticket's IRODS collections and act on its status"""
 
     created = ticket["created_at"]
@@ -189,22 +202,31 @@ def process_ticket(cur, session, ticket, base_url: str, dry_run: bool, status) -
 
         if dry_run:
             status(
-                f"DRY RUN: would notify Slack and mark ticket {ticket['id']} "
-                "notified and used for upload"
+                f"DRY RUN: would notify Slack, mark ticket {ticket['id']} "
+                "notified and used for upload, then enqueue an mdr-process job"
             )
         else:
             status(msg)
             send_slack_message(msg, base_url)
 
+            # Mark the ticket and enqueue the job as one atomic statement, so a
+            # crash can't leave a ticket marked "notified" but never queued
+            # (which no future scan would re-find). Safe under autocommit.
             cur.execute(
                 """
-                update md_ticket
-                set    upload_notification_sent = true,
-                       used_for_upload = true
-                where  id = %s
+                with marked as (
+                    update md_ticket
+                    set    upload_notification_sent = true,
+                           used_for_upload = true
+                    where  id = %s
+                    returning id
+                )
+                insert into md_process_job (ticket_id, server, status)
+                select id, %s, 'pending' from marked
                 """,
-                (ticket["id"],),
+                (ticket["id"], server),
             )
+            status(f"Enqueued mdr-process job for ticket {ticket['id']}")
 
     if not is_complete and days_old >= MAX_DAYS_OLD:
         if dry_run:
@@ -219,33 +241,6 @@ def process_ticket(cur, session, ticket, base_url: str, dry_run: bool, status) -
             for coll in collections:
                 coll.remove()
             cur.execute("delete from md_ticket where id = %s", (ticket["id"],))
-
-
-# --------------------------------------------------
-def send_slack_message(
-    message: str, base_url: str, channel: str = "mdrepo-alerts"
-) -> None:
-    """Post a message to Slack (best-effort, mirrors slack_messages.send_message)"""
-
-    token = os.getenv("SLACK_TOKEN")
-    if not token:
-        print(f'No SLACK_TOKEN, not sending Slack message "{message}"')
-        return
-
-    try:
-        resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "channel": channel,
-                "text": f"{message} ({base_url})",
-                "username": "Bot User",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f'Unable to send Slack message "{message}": {e}')
 
 
 # --------------------------------------------------
