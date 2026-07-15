@@ -60,3 +60,26 @@ def test_invalid_smiles_exits_nonzero(tmp_path):
     result = run(toml_file)
     assert result.returncode != 0
     assert "Errors" in result.stderr
+
+
+def test_unescaped_backslash_smiles_is_repaired(tmp_path):
+    # A literal (unescaped) backslash in a double-quoted TOML basic string
+    # is invalid TOML but valid SMILES stereo-bond syntax. This mirrors a
+    # real mdrepo-metadata.toml ligand entry authored outside this tool.
+    smiles = r"CCN1CCC(CC1)Nc2ccc3c(c2)/C(=C(\c4ccccc4)/c5[nH]c6ccc(cc6n5)OC)/C(=O)N3"
+    toml_file = tmp_path / "test.toml"
+    toml_file.write_text(f'[[ligands]]\nsmiles = "{smiles}"\n')
+
+    result = run(toml_file)
+    assert result.returncode == 0
+    assert "Repaired" in result.stderr
+
+    backup = toml_file.with_suffix(toml_file.suffix + ".bak")
+    assert backup.exists()
+    assert backup.read_text() == f'[[ligands]]\nsmiles = "{smiles}"\n'
+
+    data = toml.loads(toml_file.read_text())
+    new_smiles = data["ligands"][0]["smiles"]
+    assert new_smiles  # non-empty canonical SMILES
+    assert "\\" in new_smiles
+    assert f"smiles = '{new_smiles}'" in toml_file.read_text()
