@@ -216,7 +216,9 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> None:
     server = job["server"]
 
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"ticket-{ticket_id}.log")
+    # Include the server: ticket IDs are per-database, so prod and staging can
+    # share a ticket id and would otherwise clobber each other's log.
+    log_file = os.path.join(log_dir, f"ticket-{ticket_id}-{server}.log")
 
     # "-l debug" writes the log to --log-file, leaving the failure on stderr
     cmd = [

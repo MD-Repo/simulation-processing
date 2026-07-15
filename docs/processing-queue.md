@@ -72,7 +72,7 @@ synchronously in its own process (blocking the scan for up to 12h per run).
 | `status` | `pending` → `running` → `succeeded` \| `failed` |
 | `exit_code` | `mdr-process` return code (null until it runs) |
 | `last_error` | stderr / debug-log tail on failure |
-| `log_file` | reserved; the worker writes logs to `logs/ticket-<id>.log` |
+| `log_file` | reserved; the worker writes logs to `logs/ticket-<id>-<server>.log` |
 | `created_at` | `db_default=Now()` |
 | `started_at` | set when claimed |
 | `finished_at` | set on terminal state |
@@ -95,8 +95,13 @@ Installed under the `exouser` crontab (currently **staging** only):
 
 ```cron
 # --- simulation-processing queue (staging) ---
-# PATH set here so the worker can find mdr-process in ~/.cargo/bin.
-PATH=/home/exouser/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# PATH set here so the worker can find every binary mdr-process needs, none of
+# which are on cron's default PATH:
+#   ~/.cargo/bin         mdr-process itself
+#   ~/.local/bin         uv (mdr-process shells out to `uv run` for its python
+#                        helpers: fetch_uploads.py, canonicalize_smiles.py, ...)
+#   /usr/local/blast/bin blastp (the sequence-search step)
+PATH=/home/exouser/.cargo/bin:/home/exouser/.local/bin:/usr/local/blast/bin:/usr/local/bin:/usr/bin:/bin
 
 # Scan for completed uploads and enqueue mdr-process jobs (every 5 min).
 # flock -n guards against overlapping scans (the scanner has no internal lock).
@@ -115,6 +120,19 @@ Notes:
   surprise dependency syncs mid-run. The tradeoff: after pulling changes that
   touch dependencies, run `uv sync` once as part of deploy (nothing in cron does
   it for you).
+- **`mdr-process`'s own binaries must be on the cron PATH — not just the
+  launcher's.** We launch the scripts with `.venv/bin/python` (which needs
+  nothing extra), but `mdr-process` then shells out to other tools, and cron's
+  default PATH finds none of them. Known ones so far:
+  - **`uv`** (`which("uv")` in `ticket.rs`) — missing it fails every job at the
+    fetch step with *"Failed to find uv (cannot find binary path)"* plus a
+    downstream *"ticket-<id>/ticket.json: No such file or directory"*.
+  - **`blastp`** — the sequence-search step; missing it fails with a
+    *blastp not found* error.
+
+  Both are covered by the `PATH=` line above. If a future job fails with a
+  "not found" / "cannot find binary" error, the fix is almost always adding that
+  tool's directory to this `PATH=`.
 - **Adding prod later:** copy both lines with `--server prod` and `-prod` lock /
   log names. The `PATH=` line already covers both. Keep staging and prod on
   distinct lock/log names so they never collide.
@@ -131,7 +149,7 @@ tail -n 20 /opt/mdrepo/simulation-processing/python/logs/drain_process_queue-sta
 tail -n 20 /opt/mdrepo/simulation-processing/python/logs/check_new_simulations-staging.log
 
 # Per-ticket mdr-process debug log (written by the worker for each job)
-tail -n 50 /opt/mdrepo/simulation-processing/python/logs/ticket-<TICKET_ID>.log
+tail -n 50 /opt/mdrepo/simulation-processing/python/logs/ticket-<TICKET_ID>-<server>.log
 ```
 
 These scripts run without `--verbose`, so an **idle tick writes nothing** — an
@@ -139,7 +157,7 @@ empty log is normal, not a sign of failure. Add `--verbose` to a cron line if yo
 want a "found N tickets / no pending jobs" heartbeat.
 
 Cron stdout/stderr → the `*-staging.log` files above; `mdr-process`'s own debug
-output → `logs/ticket-<id>.log`.
+output → `logs/ticket-<id>-<server>.log`.
 
 ### Inspecting the queue
 
@@ -160,7 +178,7 @@ where  status = 'running' and started_at < now() - interval '12 hours';
 ```
 
 A failed job's full context: `last_error` on the row, plus the referenced
-`logs/ticket-<id>.log`. There is no automatic recovery — clearing a failed job is
+`logs/ticket-<id>-<server>.log`. There is no automatic recovery — clearing a failed job is
 a manual decision (fix the cause, then re-run `mdr-process` by hand, typically
 with `--force`).
 
