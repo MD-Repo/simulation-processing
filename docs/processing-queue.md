@@ -58,6 +58,24 @@ synchronously in its own process (blocking the scan for up to 12h per run).
   are Django models; the standalone scripts already query them with psycopg2.
   `md_process_job` follows suit. `created_at` uses `db_default=Now()` so the
   worker's raw-SQL inserts still get a server-side timestamp.
+- **Raw SQL gets no `on_delete` behaviour — the ORM emulates it, the database
+  does not.** Django's `on_delete` (`SET_NULL` on `Simulation.md_repo_ticket` and
+  `SimulationUploadInstance.ticket`, `CASCADE` on `ProcessJob.ticket`) is applied
+  by the ORM in Python; the FK constraints carry no `ON DELETE` clause. So
+  `ticket.delete()` nulls the referencing rows first, while
+  `delete from md_ticket ...` just raises `ForeignKeyViolation`. This bit the
+  scanner when it was ported off the Django management command: the reap below
+  crashed on the first referenced ticket it met. Any raw delete of a `md_*` row
+  must handle the referencing rows itself — check the models, not the DB, for
+  what points at it.
+- **The reap only touches genuinely abandoned tickets.** A ticket that is
+  incomplete and older than `MAX_DAYS_OLD` is deleted along with its IRODS
+  collections. But "incomplete" only means the upload never got its
+  `mdrepo-submission.completed.json` marker — some old tickets produced real,
+  public simulations anyway. `ticket_dependents()` therefore skips any ticket
+  with rows referencing it (`TICKET_REFERENCES`, kept in sync with the models),
+  so the reap can never unlink a simulation from its provenance. Keep that guard
+  in front of the delete.
 - **Two independent locks, same goal.** The scanner has no internal guard, so the
   cron line wraps it in `flock -n`. The worker locks *itself* (`fcntl.flock` in
   `acquire_lock`), so its cron line needs no external `flock`.
@@ -91,25 +109,34 @@ pending ──▶ running ──▶ succeeded
 
 ## Cron setup
 
-Installed under the `exouser` crontab (currently **staging** only):
+Installed under the `exouser` crontab, for **staging and prod**:
 
 ```cron
 # --- simulation-processing queue (staging) ---
 # PATH set here so the worker can find every binary mdr-process needs, none of
 # which are on cron's default PATH:
-#   ~/.cargo/bin         mdr-process itself
-#   ~/.local/bin         uv (mdr-process shells out to `uv run` for its python
-#                        helpers: fetch_uploads.py, canonicalize_smiles.py, ...)
-#   /usr/local/blast/bin blastp (the sequence-search step)
-PATH=/home/exouser/.cargo/bin:/home/exouser/.local/bin:/usr/local/blast/bin:/usr/local/bin:/usr/bin:/bin
+#   ~/.cargo/bin           mdr-process itself
+#   ~/.local/bin           uv (mdr-process shells out to `uv run` for its python
+#                          helpers: fetch_uploads.py, canonicalize_smiles.py, ...)
+#   /usr/local/blast/bin   blastp (the sequence-search step)
+#   /usr/local/gromacs/bin gmx (the trajectory-manipulation step)
+PATH=/home/exouser/.cargo/bin:/home/exouser/.local/bin:/usr/local/blast/bin:/usr/local/gromacs/bin:/usr/local/bin:/usr/bin:/bin
 
 # Scan for completed uploads and enqueue mdr-process jobs (every 5 min).
 # flock -n guards against overlapping scans (the scanner has no internal lock).
-*/5 * * * * cd /opt/mdrepo/simulation-processing/python && flock -n /tmp/check_new_simulations-staging.lock .venv/bin/python check_new_simulations.py --server staging >> logs/check_new_simulations-staging.log 2>&1
+# --verbose: the scanner DELETES abandoned tickets and their IRODS collections;
+# without it those removals leave no record at all (it only logs on a crash).
+*/5 * * * * cd /opt/mdrepo/simulation-processing/python && flock -n /tmp/check_new_simulations-staging.lock .venv/bin/python check_new_simulations.py --server staging --verbose >> logs/check_new_simulations-staging.log 2>&1
 
 # Drain the queue: run pending jobs serially, one mdr-process at a time (every min).
 # The worker self-locks via fcntl.flock, so a tick fired while a job is running exits immediately.
 * * * * * cd /opt/mdrepo/simulation-processing/python && .venv/bin/python drain_process_queue.py --server staging >> logs/drain_process_queue-staging.log 2>&1
+
+# --- simulation-processing queue (prod) ---
+# Mirrors staging above; shares the PATH= line. Distinct -prod lock/log names so
+# the two servers never collide (the worker also self-locks per server).
+*/5 * * * * cd /opt/mdrepo/simulation-processing/python && flock -n /tmp/check_new_simulations-prod.lock .venv/bin/python check_new_simulations.py --server prod --verbose >> logs/check_new_simulations-prod.log 2>&1
+* * * * * cd /opt/mdrepo/simulation-processing/python && .venv/bin/python drain_process_queue.py --server prod >> logs/drain_process_queue-prod.log 2>&1
 ```
 
 Notes:
@@ -129,13 +156,22 @@ Notes:
     downstream *"ticket-<id>/ticket.json: No such file or directory"*.
   - **`blastp`** — the sequence-search step; missing it fails with a
     *blastp not found* error.
+  - **`gmx`** (GROMACS) — the trajectory-manipulation step
+    (`cpptraj_gmx_traj_manipulation.py`); missing it fails with
+    *"Failed to execute 'which gmx'"*. PATH alone is enough: `gmx` locates its
+    own data prefix, so cron does **not** need to source `GMXRC`. (An
+    interactive shell picks `gmx` up because `~/.bashrc` sources `GMXRC`, which
+    is why this breaks only under cron.)
 
-  Both are covered by the `PATH=` line above. If a future job fails with a
+  All three are covered by the `PATH=` line above. If a future job fails with a
   "not found" / "cannot find binary" error, the fix is almost always adding that
   tool's directory to this `PATH=`.
-- **Adding prod later:** copy both lines with `--server prod` and `-prod` lock /
-  log names. The `PATH=` line already covers both. Keep staging and prod on
-  distinct lock/log names so they never collide.
+- **Staging and prod share one `PATH=` line.** Cron applies an environment
+  setting to every job *below* it in the file, so the single `PATH=` covers both
+  server blocks — and the two `export_mapping_file.py` jobs above it keep cron's
+  default environment. Add new queue jobs below the `PATH=` line, not above it.
+- **Staging and prod are kept on distinct lock / log names** (`-staging` vs
+  `-prod`) so the two never collide; the worker also self-locks per server.
 
 ## Operations
 
@@ -152,9 +188,15 @@ tail -n 20 /opt/mdrepo/simulation-processing/python/logs/check_new_simulations-s
 tail -n 50 /opt/mdrepo/simulation-processing/python/logs/ticket-<TICKET_ID>-<server>.log
 ```
 
-These scripts run without `--verbose`, so an **idle tick writes nothing** — an
-empty log is normal, not a sign of failure. Add `--verbose` to a cron line if you
-want a "found N tickets / no pending jobs" heartbeat.
+The **scanner** runs with `--verbose` (see the cron block above): it deletes
+abandoned tickets and their IRODS collections, and those removals must not be
+silent. The **worker** does not, so an idle drain tick writes nothing — an empty
+`drain_process_queue-*.log` is normal, not a sign of failure.
+
+Note what this means for the scanner's history: before `--verbose` was added, a
+successful run printed nothing at all, so `check_new_simulations-*.log` contains
+**only crash tracebacks** up to 2026-07-16. A long quiet stretch in the old log
+is not an outage — it is the scan working.
 
 Cron stdout/stderr → the `*-staging.log` files above; `mdr-process`'s own debug
 output → `logs/ticket-<id>-<server>.log`.
@@ -190,6 +232,33 @@ above). Reconcile it against `mdr-process`'s own state (`md_upload_instance` /
 `md_upload_instance_message`, `md_ticket.processing_complete`) to decide whether
 it actually succeeded or needs a rerun. There is no automatic monitor for this
 yet — see *Future work*.
+
+### Historical tickets excluded from the scan (prod, 2026-07-16)
+
+96 prod tickets (ids 7 … 1006, 190–884 days old) had simulations and upload
+instances attached but `upload_notification_sent = false` — a fossil of the old
+Django path, which set the flag *after* processing rather than atomically with
+the enqueue. They were incomplete and old, so the reap tried to delete them every
+run and crashed on the FK (see the `on_delete` note above), which blocked the
+prod scan entirely.
+
+They were resolved by backfilling the scan's own gate rather than deleting them,
+which preserved the ticket rows and the **4,273** simulation links hanging off
+them:
+
+```sql
+update md_ticket t
+set    upload_notification_sent = true
+where  t.ticket_type = 'u'
+  and  t.upload_notification_sent = false
+  and (exists (select 1 from md_simulation s where s.md_repo_ticket_id = t.id)
+    or exists (select 1 from md_upload_instance u where u.ticket_id = t.id));
+-- 96 rows; reverse by setting the flag back to false.
+```
+
+Current code cannot recreate this state: the enqueue marks the ticket atomically
+*before* any simulation exists, so a ticket can't end up with dependents and the
+flag still false. `ticket_dependents()` guards the case regardless.
 
 ## Future work
 

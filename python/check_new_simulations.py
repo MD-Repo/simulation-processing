@@ -24,6 +24,16 @@ TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 MAX_DAYS_OLD = 7
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
 
+# Tables with a FK to md_ticket, per the Django models (Simulation,
+# SimulationUploadInstance, ProcessJob). Postgres reports only the first
+# constraint a delete violates, so all of them have to be checked to decide
+# whether a ticket is really unreferenced. Keep in sync with the models.
+TICKET_REFERENCES = (
+    ("md_simulation", "md_repo_ticket_id", "simulation"),
+    ("md_upload_instance", "ticket_id", "upload instance"),
+    ("md_process_job", "ticket_id", "process job"),
+)
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -118,16 +128,28 @@ def main() -> None:
 
         base_url = FRONTEND_BASE_URLS[args.server]
 
+        failed = 0
         for ticket in unprocessed:
-            process_ticket(
-                cur,
-                session,
-                ticket,
-                args.server,
-                base_url,
-                args.dry_run,
-                status,
-            )
+            # One unhappy ticket must not strand the rest of the scan: without
+            # this, an error here aborts the loop and every later ticket is
+            # silently never processed.
+            try:
+                process_ticket(
+                    cur,
+                    session,
+                    ticket,
+                    args.server,
+                    base_url,
+                    args.dry_run,
+                    status,
+                )
+            except Exception as e:
+                failed += 1
+                status(f"ERROR on ticket {ticket['id']}, skipping: {e}")
+
+    if failed:
+        status(f"FINISHED check_new_simulations ({failed} ticket(s) errored)")
+        sys.exit(1)
 
     status("FINISHED check_new_simulations")
 
@@ -154,6 +176,26 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
             """)
 
     return cur.fetchall()
+
+
+# --------------------------------------------------
+def ticket_dependents(cur, ticket_id: int) -> str:
+    """Describe rows referencing this ticket, or "" if it is unreferenced
+
+    Deleting a ticket here is raw SQL, so it gets none of the on_delete
+    behaviour the Django models declare -- that is emulated by the ORM, not by
+    the database (the constraints carry no ON DELETE clause). A raw delete of a
+    referenced ticket therefore just raises ForeignKeyViolation.
+    """
+
+    counts = []
+    for table, col, label in TICKET_REFERENCES:
+        cur.execute(f"select count(*) from {table} where {col} = %s", (ticket_id,))
+        n = cur.fetchone()[0]
+        if n:
+            counts.append(f"{n} {label}{'s' if n > 1 else ''}")
+
+    return ", ".join(counts)
 
 
 # --------------------------------------------------
@@ -229,7 +271,16 @@ def process_ticket(
             status(f"Enqueued mdr-process job for ticket {ticket['id']}")
 
     if not is_complete and days_old >= MAX_DAYS_OLD:
-        if dry_run:
+        # The reap is for abandoned uploads. A ticket with rows hanging off it
+        # produced real data despite never getting its completion marker, so it
+        # isn't abandoned -- leave it (and its IRODS collections) alone.
+        dependents = ticket_dependents(cur, ticket["id"])
+        if dependents:
+            status(
+                f"Ticket {ticket['id']} is {days_old} days old and incomplete "
+                f"but has {dependents}: SKIP (not abandoned)"
+            )
+        elif dry_run:
             status(
                 f"DRY RUN: ticket {ticket['id']} is {days_old} days old and "
                 "incomplete: would DELETE"
