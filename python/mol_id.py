@@ -65,77 +65,191 @@ with warnings.catch_warnings():
 # ---------------------------------------------------------------------------
 
 # Residue names to ignore when auto-detecting the ligand.
-_AMINO_ACIDS = frozenset({
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-    # Common protonation / tautomer variants (Amber, CHARMM)
-    "HIE", "HID", "HIP", "HSD", "HSE", "HSP",
-    "ASH", "GLH", "LYN", "CYM", "CYX",
-})
+_AMINO_ACIDS = frozenset(
+    {
+        "ALA",
+        "ARG",
+        "ASN",
+        "ASP",
+        "CYS",
+        "GLN",
+        "GLU",
+        "GLY",
+        "HIS",
+        "ILE",
+        "LEU",
+        "LYS",
+        "MET",
+        "PHE",
+        "PRO",
+        "SER",
+        "THR",
+        "TRP",
+        "TYR",
+        "VAL",
+        # Common protonation / tautomer variants (Amber, CHARMM)
+        "HIE",
+        "HID",
+        "HIP",
+        "HSD",
+        "HSE",
+        "HSP",
+        "ASH",
+        "GLH",
+        "LYN",
+        "CYM",
+        "CYX",
+    }
+)
 
-_NUCLEOTIDES = frozenset({
-    "A", "C", "G", "T", "U",
-    "DA", "DC", "DG", "DT", "DU",
-    "RA", "RC", "RG", "RT", "RU",
-    "ADE", "CYT", "GUA", "THY", "URA",
-})
+_NUCLEOTIDES = frozenset(
+    {
+        "A",
+        "C",
+        "G",
+        "T",
+        "U",
+        "DA",
+        "DC",
+        "DG",
+        "DT",
+        "DU",
+        "RA",
+        "RC",
+        "RG",
+        "RT",
+        "RU",
+        "ADE",
+        "CYT",
+        "GUA",
+        "THY",
+        "URA",
+    }
+)
 
-_WATERS = frozenset({
-    "HOH", "WAT", "H2O", "TIP", "TIP3", "TIP3P", "TIP4", "TIP4P", "TIP5",
-    "SOL", "T3P", "T4P", "SPC", "SPCE",
-    "OPC",          # OPC 4-site water model (AMBER)
-    # GROMACS writes 4-char residue names one column early; MDAnalysis reads
-    # the last 3 chars. These are the misread forms of common water models:
-    "IP3",          # TIP3 misread
-    "IP4",          # TIP4 / TIP4P misread
-    "IP5",          # TIP5 misread
-})
+_WATERS = frozenset(
+    {
+        "HOH",
+        "WAT",
+        "H2O",
+        "TIP",
+        "TIP3",
+        "TIP3P",
+        "TIP4",
+        "TIP4P",
+        "TIP5",
+        "SOL",
+        "T3P",
+        "T4P",
+        "SPC",
+        "SPCE",
+        "OPC",  # OPC 4-site water model (AMBER)
+        # GROMACS writes 4-char residue names one column early; MDAnalysis reads
+        # the last 3 chars. These are the misread forms of common water models:
+        "IP3",  # TIP3 misread
+        "IP4",  # TIP4 / TIP4P misread
+        "IP5",  # TIP5 misread
+    }
+)
 
 # Common lipid residue names.  Also includes the 3-char suffixes that appear
 # when GROMACS writes a 4-char lipid name (e.g. POPC) one column early and
 # MDAnalysis reads columns 18-20, dropping the first character.
-_LIPIDS = frozenset({
-    # Phosphatidylcholines
-    "DPPC", "POPC", "DOPC", "DLPC", "DMPC", "DSPC",
-    # Phosphatidylethanolamines
-    "POPE", "DPPE", "DOPE", "DLPE", "DMPE", "DSPE",
-    # Phosphatidylglycerols
-    "POPG", "DPPG", "DLPG", "DMPG", "DSPG",
-    # Phosphatidylserines / phosphatidic acids
-    "DOPS", "DPPS", "DOPA",
-    # Cholesterol / sphingolipids
-    "CHOL", "CHL1", "CER", "PSM",
-    # Lysophospholipids / other
-    "DHPC",
-    # GROMACS 4-char misreads (last 3 chars of the real name):
-    "PPC",   # DPPC
-    # OPC already in _WATERS (covers POPC → OPC too)
-    "OPE",   # POPE / DOPE
-    "LPC",   # DLPC
-    "MPC",   # DMPC
-    # SPC already in _WATERS (covers DSPC → SPC)
-    "OPG",   # POPG
-    "PPE",   # DPPE
-    "PPG",   # DPPG
-    "HOL",   # CHOL
-    "HL1",   # CHL1
-    "OPS",   # DOPS
-    "OPA",   # DOPA
-    "HPC",   # DHPC
-})
+_LIPIDS = frozenset(
+    {
+        # Phosphatidylcholines
+        "DPPC",
+        "POPC",
+        "DOPC",
+        "DLPC",
+        "DMPC",
+        "DSPC",
+        # Phosphatidylethanolamines
+        "POPE",
+        "DPPE",
+        "DOPE",
+        "DLPE",
+        "DMPE",
+        "DSPE",
+        # Phosphatidylglycerols
+        "POPG",
+        "DPPG",
+        "DLPG",
+        "DMPG",
+        "DSPG",
+        # Phosphatidylserines / phosphatidic acids
+        "DOPS",
+        "DPPS",
+        "DOPA",
+        # Cholesterol / sphingolipids
+        "CHOL",
+        "CHL1",
+        "CER",
+        "PSM",
+        # Lysophospholipids / other
+        "DHPC",
+        # GROMACS 4-char misreads (last 3 chars of the real name):
+        "PPC",  # DPPC
+        # OPC already in _WATERS (covers POPC → OPC too)
+        "OPE",  # POPE / DOPE
+        "LPC",  # DLPC
+        "MPC",  # DMPC
+        # SPC already in _WATERS (covers DSPC → SPC)
+        "OPG",  # POPG
+        "PPE",  # DPPE
+        "PPG",  # DPPG
+        "HOL",  # CHOL
+        "HL1",  # CHL1
+        "OPS",  # DOPS
+        "OPA",  # DOPA
+        "HPC",  # DHPC
+    }
+)
 
 # Monatomic ions, by element symbol or common force-field alias.
-_ION_NAMES = frozenset({
-    "NA", "K", "MG", "CA", "CL", "ZN", "FE", "MN", "CU", "BR", "I", "IOD",
-    "LI", "RB", "CS", "F", "CO", "NI", "HG", "CD", "BA", "SR", "AL", "SE",
-    "SOD", "POT", "CLA", "MGY",
-})
+_ION_NAMES = frozenset(
+    {
+        "NA",
+        "K",
+        "MG",
+        "CA",
+        "CL",
+        "ZN",
+        "FE",
+        "MN",
+        "CU",
+        "BR",
+        "I",
+        "IOD",
+        "LI",
+        "RB",
+        "CS",
+        "F",
+        "CO",
+        "NI",
+        "HG",
+        "CD",
+        "BA",
+        "SR",
+        "AL",
+        "SE",
+        "SOD",
+        "POT",
+        "CLA",
+        "MGY",
+    }
+)
 
 
 def _is_skipped_residue(resname: str) -> bool:
     """True if this residue name is part of the protein/nucleic/solvent/ion/lipid background."""
     rn = (resname or "").upper()
-    if rn in _AMINO_ACIDS or rn in _NUCLEOTIDES or rn in _WATERS or rn in _LIPIDS:
+    if (
+        rn in _AMINO_ACIDS
+        or rn in _NUCLEOTIDES
+        or rn in _WATERS
+        or rn in _LIPIDS
+    ):
         return True
     # Strip charge/multiplicity decorations: "Na+", "MG2+", "CL-", etc.
     stripped = rn.rstrip("+-0123456789")
@@ -145,16 +259,16 @@ def _is_skipped_residue(resname: str) -> bool:
 # Map our friendly format names (and common file extensions) to the
 # topology_format strings MDAnalysis expects.
 _FMT_TO_MDA = {
-    "pdb":     "PDB",
-    "gro":     "GRO",
-    "top":     "ITP",     # MDAnalysis treats GROMACS .top/.itp text files identically
-    "itp":     "ITP",
-    "tpr":     "TPR",
-    "psf":     "PSF",
-    "cif":     "MMCIF",
-    "mmcif":   "MMCIF",
-    "prmtop":  "TOP",     # Amber parm
-    "parm7":   "TOP",
+    "pdb": "PDB",
+    "gro": "GRO",
+    "top": "ITP",  # MDAnalysis treats GROMACS .top/.itp text files identically
+    "itp": "ITP",
+    "tpr": "TPR",
+    "psf": "PSF",
+    "cif": "MMCIF",
+    "mmcif": "MMCIF",
+    "prmtop": "TOP",  # Amber parm
+    "parm7": "TOP",
 }
 
 
@@ -181,10 +295,25 @@ def detect_format(path: str) -> Optional[str]:
 
     head = head_bytes.decode("utf-8", errors="replace").splitlines()
 
-    if any(re.match(r"^\s*\[\s*(defaults|atomtypes|moleculetype|system|molecules)\s*\]", L) for L in head):
+    if any(
+        re.match(
+            r"^\s*\[\s*(defaults|atomtypes|moleculetype|system|molecules)\s*\]",
+            L,
+        )
+        for L in head
+    ):
         return "ITP"  # GROMACS topology / .itp text format
 
-    pdb_records = ("ATOM  ", "HETATM", "HEADER", "CRYST1", "MODEL ", "REMARK", "TITLE ", "COMPND")
+    pdb_records = (
+        "ATOM  ",
+        "HETATM",
+        "HEADER",
+        "CRYST1",
+        "MODEL ",
+        "REMARK",
+        "TITLE ",
+        "COMPND",
+    )
     if any(L.startswith(pdb_records) for L in head):
         return "PDB"
 
@@ -228,7 +357,9 @@ def find_ligand_resnames(universe) -> dict:
     return counts
 
 
-def resolve_target_resnames(universe, path: str, resname: Optional[str]) -> list:
+def resolve_target_resnames(
+    universe, path: str, resname: Optional[str]
+) -> list:
     """
     Decide which residue name(s) to extract from a Universe.
 
@@ -240,7 +371,11 @@ def resolve_target_resnames(universe, path: str, resname: Optional[str]) -> list
 
     Always returns a non-empty list, or raises ValueError.
     """
-    present = set(map(str, np.unique(universe.atoms.resnames))) if hasattr(universe.atoms, "resnames") else set()
+    present = (
+        set(map(str, np.unique(universe.atoms.resnames)))
+        if hasattr(universe.atoms, "resnames")
+        else set()
+    )
     if resname is not None and resname in present:
         return [resname]
 
@@ -388,13 +523,19 @@ def universe_to_smiles(universe, resname: str) -> dict:
         mask = np.char.upper(resnames.astype(str)) == resname.upper()
     all_match = universe.atoms[mask]
     if len(all_match) == 0:
-        raise ValueError(f"No atoms with residue name '{resname}' in the file.")
+        raise ValueError(
+            f"No atoms with residue name '{resname}' in the file."
+        )
 
     # If multiple copies of the same residue name are present (e.g., many lipid
     # molecules in a full simulation box), use only the first residue instance so
     # that SMILES represents a single molecule rather than all copies concatenated.
     unique_resix = np.unique(all_match.resindices)
-    sel = all_match[all_match.resindices == unique_resix[0]] if len(unique_resix) > 1 else all_match
+    sel = (
+        all_match[all_match.resindices == unique_resix[0]]
+        if len(unique_resix) > 1
+        else all_match
+    )
 
     has_coords = False
     try:
@@ -403,7 +544,9 @@ def universe_to_smiles(universe, resname: str) -> dict:
     except (mda.exceptions.NoDataError, AttributeError):
         has_coords = False
 
-    return _smiles_from_coords(sel) if has_coords else _smiles_from_topology(sel)
+    return (
+        _smiles_from_coords(sel) if has_coords else _smiles_from_topology(sel)
+    )
 
 
 def structure_to_smiles(
@@ -464,8 +607,6 @@ def _http_get_json(
     return None
 
 
-
-
 def smiles_to_inchikey(smiles: str) -> Optional[str]:
     """Compute the InChIKey for a SMILES string via OpenBabel."""
     conv = ob.OBConversion()
@@ -485,10 +626,10 @@ def query_wikidata_by_inchikey(inchikey: str) -> Optional[str]:
     Returns None if no Wikidata entry has this InChIKey.
     """
     sparql = (
-        'SELECT ?itemLabel WHERE { '
+        "SELECT ?itemLabel WHERE { "
         f'?item wdt:P235 "{inchikey}" . '
         'SERVICE wikibase:label { bd:serviceParam wikibase:language "en". } '
-        '} LIMIT 1'
+        "} LIMIT 1"
     )
     url = "https://query.wikidata.org/sparql?" + urllib.parse.urlencode(
         {"query": sparql, "format": "json"}
@@ -520,7 +661,9 @@ def query_pdbe_by_inchikey(inchikey: str) -> Optional[str]:
     Only covers compounds that appear in at least one PDB structure.
     """
     refs = _unichem_refs(inchikey)
-    pdbe_id = next((x["src_compound_id"] for x in refs if x.get("src_id") == "5"), None)
+    pdbe_id = next(
+        (x["src_compound_id"] for x in refs if x.get("src_id") == "5"), None
+    )
     if not pdbe_id:
         return None
     data = _http_get_json(
@@ -533,8 +676,6 @@ def query_pdbe_by_inchikey(inchikey: str) -> Optional[str]:
         return None
     name = entries[0][0].get("name", "").strip()
     return name or None
-
-
 
 
 # --- Heuristic ranker for PubChem synonyms ---------------------------------
@@ -557,17 +698,17 @@ def is_junk_synonym(name: str) -> bool:
     if not n:
         return True
     if _CAS_RE.match(n):
-        return True                    # CAS number, e.g. "3805-37-6"
+        return True  # CAS number, e.g. "3805-37-6"
     if _PDB_ID_RE.match(n):
-        return True                    # PDB ID, e.g. "8hvp"
+        return True  # PDB ID, e.g. "8hvp"
     if _INCHIKEY_RE.match(n):
-        return True                    # InChIKey masquerading as a synonym
+        return True  # InChIKey masquerading as a synonym
     if ":" in n:
-        return True                    # registry IDs: CHEBI:..., MeSH:..., RefChem:...
+        return True  # registry IDs: CHEBI:..., MeSH:..., RefChem:...
     if len(n) > 80:
-        return True                    # IUPAC behemoths
+        return True  # IUPAC behemoths
     if " " not in n and len(n) > 30:
-        return True                    # long no-space tokens: peptide notations, vendor codes
+        return True  # long no-space tokens: peptide notations, vendor codes
     # Code-like: no spaces, embedded digits and letters, all-caps or all-lowercase.
     # Catches uppercase codes ("A2P5P", "CHEMBL123") and lowercase catalog numbers
     # ("orb1702635"). Mixed-case names and pure acronyms without digits survive.
@@ -615,7 +756,9 @@ def smiles_to_name(smiles: str) -> dict:
         result["inchikey"] = inchikey
 
     # --- 1. Wikidata by InChIKey ---
-    wikidata_label = query_wikidata_by_inchikey(inchikey) if inchikey else None
+    wikidata_label = (
+        query_wikidata_by_inchikey(inchikey) if inchikey else None
+    )
     if wikidata_label:
         result["wikidata_label"] = wikidata_label
 
@@ -651,9 +794,9 @@ def smiles_to_name(smiles: str) -> dict:
                 f"{cid}/synonyms/JSON"
             )
             if syn_data and "InformationList" in syn_data:
-                pubchem_synonyms = (
-                    syn_data["InformationList"]["Information"][0].get("Synonym", [])
-                )
+                pubchem_synonyms = syn_data["InformationList"]["Information"][
+                    0
+                ].get("Synonym", [])
                 result["synonyms"] = pubchem_synonyms[:10]
 
     # --- 3. PDBe and ChEBI lookups via UniChem ---
@@ -661,14 +804,17 @@ def smiles_to_name(smiles: str) -> dict:
     if pdbe_name:
         result["pdbe_name"] = pdbe_name
 
-
     # --- 4. Pick a display name ---
     # Priority: Wikidata (readable) → PubChem synonym (junk-filtered) →
     #           Wikidata (code-like) → CCD → ChEBI → PubChem title
     best_name: Optional[str] = None
     name_source: Optional[str] = None
 
-    if wikidata_label and any(c.islower() for c in wikidata_label) and not is_junk_synonym(wikidata_label):
+    if (
+        wikidata_label
+        and any(c.islower() for c in wikidata_label)
+        and not is_junk_synonym(wikidata_label)
+    ):
         best_name = wikidata_label
         name_source = "wikidata"
 
@@ -678,7 +824,11 @@ def smiles_to_name(smiles: str) -> dict:
             best_name = syn
             name_source = "pubchem_synonyms"
 
-    if best_name is None and wikidata_label and not is_junk_synonym(wikidata_label):
+    if (
+        best_name is None
+        and wikidata_label
+        and not is_junk_synonym(wikidata_label)
+    ):
         best_name = wikidata_label
         name_source = "wikidata"
 
@@ -701,16 +851,22 @@ def smiles_to_name(smiles: str) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 class _SmartHelpFormatter(argparse.HelpFormatter):
     """
     Wraps single-paragraph description text to terminal width, but preserves
     any text that already contains explicit newlines (e.g. our hand-formatted
     epilog blocks of examples) verbatim.
     """
+
     def _fill_text(self, text, width, indent):
         if "\n" in text.strip():
-            return "".join(indent + line for line in text.splitlines(keepends=True))
-        return textwrap.fill(text, width, initial_indent=indent, subsequent_indent=indent)
+            return "".join(
+                indent + line for line in text.splitlines(keepends=True)
+            )
+        return textwrap.fill(
+            text, width, initial_indent=indent, subsequent_indent=indent
+        )
 
 
 def main():
@@ -724,7 +880,7 @@ def main():
         "  uv run mol_id.py smiles-from-structure prod.pdb\n"
         "  uv run mol_id.py smiles-from-structure run.tpr\n"
         "  uv run mol_id.py both system.gro\n"
-        "  uv run mol_id.py name-from-smiles \"CN1C=NC2=C1C(=O)N(C(=O)N2C)C\"\n"
+        '  uv run mol_id.py name-from-smiles "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"\n'
         "\n"
         "Best results come from inputs that carry both connectivity and 3D\n"
         "coordinates (.tpr, .pdb with CONECT records, or any file paired with\n"
@@ -740,11 +896,14 @@ def main():
         epilog=top_epilog,
         formatter_class=_SmartHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    sub = parser.add_subparsers(
+        dest="command", required=True, metavar="COMMAND"
+    )
 
     def _add_verbose_arg(p):
         p.add_argument(
-            "-v", "--verbose",
+            "-v",
+            "--verbose",
             action="store_true",
             default=False,
             help="Print full JSON output instead of the concise default.",
@@ -761,13 +920,26 @@ def main():
             ),
         )
         p.add_argument(
-            "--format", dest="fmt",
-            choices=["pdb", "gro", "top", "itp", "tpr", "psf", "cif", "mmcif", "prmtop", "parm7"],
+            "--format",
+            dest="fmt",
+            choices=[
+                "pdb",
+                "gro",
+                "top",
+                "itp",
+                "tpr",
+                "psf",
+                "cif",
+                "mmcif",
+                "prmtop",
+                "parm7",
+            ],
             default=None,
             help="Force input file format instead of sniffing from content / extension.",
         )
         p.add_argument(
-            "--resname", default=None,
+            "--resname",
+            default=None,
             help=(
                 "Residue name of the ligand. If omitted, auto-detected by elimination "
                 "(skips amino acids, nucleotides, water, and ions)."
@@ -802,11 +974,14 @@ def main():
         ),
         epilog=(
             "Example:\n"
-            "  uv run mol_id.py name-from-smiles \"CN1C=NC2=C1C(=O)N(C(=O)N2C)C\""
+            '  uv run mol_id.py name-from-smiles "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"'
         ),
         formatter_class=_SmartHelpFormatter,
     )
-    p2.add_argument("smiles", help="SMILES string (quote it to protect special characters from the shell).")
+    p2.add_argument(
+        "smiles",
+        help="SMILES string (quote it to protect special characters from the shell).",
+    )
     _add_verbose_arg(p2)
 
     p3 = sub.add_parser(
@@ -819,14 +994,14 @@ def main():
             "name for whatever ligand(s) it contains."
         ),
         epilog=(
-            "Example:\n"
-            "  uv run mol_id.py both prod.tpr -o result.json"
+            "Example:\n" "  uv run mol_id.py both prod.tpr -o result.json"
         ),
         formatter_class=_SmartHelpFormatter,
     )
     _add_struct_args(p3)
     p3.add_argument(
-        "-o", "--outfile",
+        "-o",
+        "--outfile",
         help="Write full JSON output to this file instead of stdout.",
     )
     _add_verbose_arg(p3)
@@ -834,7 +1009,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "smiles-from-structure":
-        results = structure_to_smiles(args.path, fmt=args.fmt, resname=args.resname)
+        results = structure_to_smiles(
+            args.path, fmt=args.fmt, resname=args.resname
+        )
         if args.verbose:
             print(json.dumps(results, indent=2))
         else:
@@ -848,7 +1025,9 @@ def main():
             print(result["best_name"])
 
     elif args.command == "both":
-        struct_results = structure_to_smiles(args.path, fmt=args.fmt, resname=args.resname)
+        struct_results = structure_to_smiles(
+            args.path, fmt=args.fmt, resname=args.resname
+        )
         combined = [
             {"structure": sr, "name": smiles_to_name(sr["smiles"])}
             for sr in struct_results
