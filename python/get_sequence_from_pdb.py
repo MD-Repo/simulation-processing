@@ -6,7 +6,6 @@ Purpose: Get sequence from PDB
 """
 
 import argparse
-import json
 import os
 import sys
 from collections import defaultdict
