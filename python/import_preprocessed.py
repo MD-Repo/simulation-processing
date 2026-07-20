@@ -219,13 +219,6 @@ def main() -> None:
         pdb_id = create_pdb(cur, sim_id, pdb)
         print(f"PDB {pdb['pdb_id']} => {pdb_id}")
 
-    if warnings := data.get("warnings"):
-        num_created = create_warnings(cur, sim_id, warnings)
-        if len(warnings) == num_created:
-            print(f"Created {num_created} warnings")
-        else:
-            print(f"Created {num_created} warnings but expected {len(warnings)}")
-
     output = {
         "server": args.server,
         "filename": args.file,
@@ -995,23 +988,6 @@ def create_paper(cur, sim_id, paper) -> int:
     )
 
     return cur.fetchone()[0]
-
-
-# --------------------------------------------------
-def create_warnings(cur, sim_id, vals: List[str]) -> int:
-    num_created = 0
-    for val in vals:
-        cur.execute(
-            """
-            insert
-            into   md_import_warning (simulation_id, warning)
-            values (%s, %s)
-            """,
-            (sim_id, val),
-        )
-        num_created += 1
-
-    return num_created
 
 
 # --------------------------------------------------
