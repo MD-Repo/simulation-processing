@@ -848,7 +848,7 @@ def create_external_link(cur, sim_id, link) -> Optional[int]:
         if label:
             cur.execute(
                 """
-                update md_external_url
+                update md_external_link
                 set    label=%s
                 where  id=%s
                 """,
