@@ -338,7 +338,7 @@ def get_simulation(cur, sim, sim_id) -> int:
                 is_placeholder,
                 is_deprecated,
                 sim.get("is_embargoed", False),
-                sim.get("is_coarse_graing", False),
+                sim.get("is_coarse_grained", False),
                 sim_id,
             ),
         )
