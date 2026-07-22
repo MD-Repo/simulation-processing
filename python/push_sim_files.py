@@ -7,17 +7,27 @@ Purpose: Push simulation files to cat/IRODS
 
 import argparse
 import fabric
+import irods.keywords as kw
 import json
 import os
 import psycopg2
-import shlex
+import queue
 import sys
-from datetime import datetime as dt
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime as dt, timedelta
 import humanize
 from dotenv import dotenv_values
 from irods.session import iRODSSession
 from typing import Dict, List, NamedTuple, TextIO, Optional
 from subprocess import getstatusoutput
+
+# Attempts per file before giving up
+NUM_RETRIES = 3
+
+# Serializes output from the upload threads
+PRINT_LOCK = threading.Lock()
 
 
 class Args(NamedTuple):
@@ -31,6 +41,7 @@ class Args(NamedTuple):
     file_types: List[str]
     out_file: Optional[str]
     remove_processed_dir: bool
+    threads: int
 
 
 # --------------------------------------------------
@@ -106,6 +117,15 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "-n",
+        "--threads",
+        help="Number of concurrent IRODS uploads",
+        metavar="INT",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
         "--remove-processed-dir",
         help="Remove existing 'processed' dir",
         action="store_true",
@@ -119,6 +139,9 @@ def get_args() -> Args:
     if not args.irods_env or not os.path.isfile(args.irods_env):
         parser.error(f'Invaid or missing --irods-env file "{args.irods_env}"')
 
+    if args.threads < 1:
+        parser.error(f'--threads "{args.threads}" must be positive')
+
     return Args(
         file=args.file,
         simulation_id=args.simulation_id,
@@ -128,6 +151,7 @@ def get_args() -> Args:
         file_types=args.file_types,
         out_file=args.out_file,
         remove_processed_dir=args.remove_processed_dir,
+        threads=args.threads,
     )
 
 
@@ -208,8 +232,8 @@ def main() -> None:
                 print(f"Making IRODS dir '{irods_dir}'")
                 session.collections.create(irods_dir)
 
-            # Gather the files needing upload so they can be pushed with a
-            # single "gocmd put" rather than one connection per file
+            # Gather the files needing upload so they can all be pushed
+            # concurrently rather than one at a time
             upload = []
             upload_size = 0
             for local_path in paths:
@@ -231,7 +255,7 @@ def main() -> None:
                 if local_size == remote_size:
                     print(f" {local_path} [{human_size}] (already uploaded)")
                 else:
-                    print(f" {local_path} [{human_size}] ->\n  {irods_dir}")
+                    print(f" {local_path} [{human_size}] (queued)")
                     upload.append(local_path)
                     upload_size += local_size
 
@@ -245,22 +269,48 @@ def main() -> None:
 
             if upload:
                 human_size = humanize.naturalsize(upload_size)
+                num_threads = min(args.threads, len(upload))
                 print(
-                    f"Uploading {len(upload)} file(s) [{human_size}] "
-                    f"to '{irods_dir}'",
-                    end="",
+                    f"Uploading {len(upload)} file(s) [{human_size}] to "
+                    f"'{irods_dir}' using {num_threads} thread(s)"
                 )
                 sys.stdout.flush()
 
+                # A session cannot be shared across threads, so hand each
+                # worker its own clone (see the python-irodsclient README)
+                sessions = queue.Queue()
+                for _ in range(num_threads):
+                    sessions.put(session.clone())
+
                 start = dt.now()
-                sources = " ".join(map(shlex.quote, upload))
-                cmd = f"gocmd put --thread-num 10 -f {sources} {shlex.quote(irods_dir)}"
-                rv, out = getstatusoutput(cmd)
-                if rv != 0:
-                    sys.exit(f"Error running '{cmd}': {out}")
+                errors = []
+                try:
+                    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+                        futures = {
+                            pool.submit(put_file, sessions, path, irods_dir): path
+                            for path in upload
+                        }
+
+                        for future in as_completed(futures):
+                            local_path = futures[future]
+                            basename = os.path.basename(local_path)
+                            try:
+                                took = humanize.precisedelta(future.result())
+                                print(f" {basename} (took {took})")
+                            except Exception as e:
+                                print(f" {basename} FAILED: {e}")
+                                errors.append(f"{local_path}: {e}")
+                            sys.stdout.flush()
+                finally:
+                    # Leaving clones open causes SYS_HEADER_READ_LEN_ERR
+                    while not sessions.empty():
+                        sessions.get().cleanup()
+
+                if errors:
+                    sys.exit("Upload errors:\n" + "\n".join(errors))
 
                 elapsed = humanize.precisedelta(dt.now() - start)
-                print(f" (took {elapsed})")
+                print(f"Uploaded {len(upload)} file(s) in {elapsed}")
 
     cur.execute(
         """
@@ -279,6 +329,37 @@ def main() -> None:
             print(json.dumps(results, indent=4), file=fh)
 
     print("Done")
+
+
+# --------------------------------------------------
+def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelta:
+    """Upload one file to IRODS, retrying on failure"""
+
+    # Borrow a session for the life of this upload
+    session = sessions.get()
+    basename = os.path.basename(local_path)
+    remote_path = os.path.join(irods_dir, basename)
+
+    # Files over 32M are transferred with multiple threads automatically
+    options = {kw.FORCE_FLAG_KW: "", kw.VERIFY_CHKSUM_KW: ""}
+
+    try:
+        start = dt.now()
+        for attempt in range(1, NUM_RETRIES + 1):
+            try:
+                session.data_objects.put(local_path, remote_path, **options)
+                return dt.now() - start
+            except Exception as e:
+                if attempt == NUM_RETRIES:
+                    raise
+
+                with PRINT_LOCK:
+                    print(f" {basename} attempt {attempt} failed: {e}")
+                    sys.stdout.flush()
+
+                time.sleep(2**attempt)
+    finally:
+        sessions.put(session)
 
 
 # --------------------------------------------------
