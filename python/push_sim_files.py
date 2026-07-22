@@ -10,6 +10,7 @@ import fabric
 import json
 import os
 import psycopg2
+import shlex
 import sys
 from datetime import datetime as dt
 import humanize
@@ -207,45 +208,59 @@ def main() -> None:
                 print(f"Making IRODS dir '{irods_dir}'")
                 session.collections.create(irods_dir)
 
+            # Gather the files needing upload so they can be pushed with a
+            # single "gocmd put" rather than one connection per file
+            upload = []
+            upload_size = 0
             for local_path in paths:
-                if os.path.isfile(local_path):
-                    local_size = os.path.getsize(local_path)
-                    human_size = humanize.naturalsize(local_size)
-                    print(
-                        f" {local_path} [{human_size}] ->\n  {irods_dir}",
-                        end="",
-                    )
-                    sys.stdout.flush()
-
-                    # Check if we can skip
-                    basename = os.path.basename(local_path)
-                    remote_path = os.path.join(irods_dir, basename)
-                    remote_size = 0
-                    if session.data_objects.exists(remote_path):
-                        obj = session.data_objects.get(remote_path)
-                        remote_size = obj.size
-
-                    if local_size == remote_size:
-                        print(" (already uploaded)")
-                    else:
-                        start = dt.now()
-                        cmd = f"gocmd put --webdav -f {local_path} {irods_dir}"
-                        rv, out = getstatusoutput(cmd)
-                        if rv != 0:
-                            sys.exit(f"Error running '{cmd}': {out}")
-
-                        elapsed = humanize.precisedelta(dt.now() - start)
-                        print(f" (took {elapsed})")
-
-                    results.append(
-                        {
-                            "src": local_path,
-                            "dest": remote_path,
-                            "size": local_size,
-                        }
-                    )
-                else:
+                if not os.path.isfile(local_path):
                     print(f"Invalid path '{local_path}'")
+                    continue
+
+                local_size = os.path.getsize(local_path)
+                human_size = humanize.naturalsize(local_size)
+
+                # Check if we can skip
+                basename = os.path.basename(local_path)
+                remote_path = os.path.join(irods_dir, basename)
+                remote_size = 0
+                if session.data_objects.exists(remote_path):
+                    obj = session.data_objects.get(remote_path)
+                    remote_size = obj.size
+
+                if local_size == remote_size:
+                    print(f" {local_path} [{human_size}] (already uploaded)")
+                else:
+                    print(f" {local_path} [{human_size}] ->\n  {irods_dir}")
+                    upload.append(local_path)
+                    upload_size += local_size
+
+                results.append(
+                    {
+                        "src": local_path,
+                        "dest": remote_path,
+                        "size": local_size,
+                    }
+                )
+
+            if upload:
+                human_size = humanize.naturalsize(upload_size)
+                print(
+                    f"Uploading {len(upload)} file(s) [{human_size}] "
+                    f"to '{irods_dir}'",
+                    end="",
+                )
+                sys.stdout.flush()
+
+                start = dt.now()
+                sources = " ".join(map(shlex.quote, upload))
+                cmd = f"gocmd put --thread-num 10 -f {sources} {shlex.quote(irods_dir)}"
+                rv, out = getstatusoutput(cmd)
+                if rv != 0:
+                    sys.exit(f"Error running '{cmd}': {out}")
+
+                elapsed = humanize.precisedelta(dt.now() - start)
+                print(f" (took {elapsed})")
 
     cur.execute(
         """
