@@ -229,7 +229,7 @@ def main() -> None:
                         print(" (already uploaded)")
                     else:
                         start = dt.now()
-                        cmd = f"gocmd put -f {local_path} {irods_dir}"
+                        cmd = f"gocmd put --webdav -f {local_path} {irods_dir}"
                         rv, out = getstatusoutput(cmd)
                         if rv != 0:
                             sys.exit(f"Error running '{cmd}': {out}")
