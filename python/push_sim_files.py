@@ -12,13 +12,14 @@ import json
 import os
 import psycopg2
 import queue
+import signal
 import sys
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime as dt, timedelta
 import humanize
 from dotenv import dotenv_values
+from irods.parallel import abort_parallel_transfers
 from irods.session import iRODSSession
 from typing import Dict, List, NamedTuple, TextIO, Optional
 from subprocess import getstatusoutput
@@ -28,6 +29,9 @@ NUM_RETRIES = 3
 
 # Serializes output from the upload threads
 PRINT_LOCK = threading.Lock()
+
+# Set when a terminating signal asks the uploads to stop
+ABORT = threading.Event()
 
 
 class Args(NamedTuple):
@@ -122,7 +126,7 @@ def get_args() -> Args:
         help="Number of concurrent IRODS uploads",
         metavar="INT",
         type=int,
-        default=8,
+        default=4,
     )
 
     parser.add_argument(
@@ -282,29 +286,61 @@ def main() -> None:
                 for _ in range(num_threads):
                     sessions.put(session.clone())
 
+                # A terminating signal must reach the parallel transfer
+                # threads that python-irodsclient spawns for files over 32M,
+                # or they can keep running after the main program is done
+                prev_handlers = {
+                    sig: signal.signal(sig, abort_uploads)
+                    for sig in (signal.SIGINT, signal.SIGTERM)
+                }
+
                 start = dt.now()
                 errors = []
+                reported = set()
+                futures = {}
+                pool = ThreadPoolExecutor(max_workers=num_threads)
                 try:
-                    with ThreadPoolExecutor(max_workers=num_threads) as pool:
-                        futures = {
-                            pool.submit(put_file, sessions, path, irods_dir): path
-                            for path in upload
-                        }
+                    futures = {
+                        pool.submit(put_file, sessions, path, irods_dir): path
+                        for path in upload
+                    }
 
-                        for future in as_completed(futures):
-                            local_path = futures[future]
-                            basename = os.path.basename(local_path)
-                            try:
-                                took = humanize.precisedelta(future.result())
-                                print(f" {basename} (took {took})")
-                            except Exception as e:
-                                print(f" {basename} FAILED: {e}")
-                                errors.append(f"{local_path}: {e}")
-                            sys.stdout.flush()
+                    for future in as_completed(futures):
+                        local_path = futures[future]
+                        basename = os.path.basename(local_path)
+                        reported.add(future)
+                        try:
+                            took = humanize.precisedelta(future.result())
+                            print(f" {basename} (took {took})")
+                        except Exception as e:
+                            print(f" {basename} FAILED: {e}")
+                            errors.append(f"{local_path}: {e}")
+                        sys.stdout.flush()
+
+                        if ABORT.is_set():
+                            print("Dropping the uploads that have not started")
+                            break
                 finally:
+                    pool.shutdown(wait=True, cancel_futures=ABORT.is_set())
+
+                    for sig, handler in prev_handlers.items():
+                        signal.signal(sig, handler)
+
+                    # Account for the files the loop above broke out of
+                    for future, local_path in futures.items():
+                        if future in reported:
+                            continue
+                        if future.cancelled():
+                            errors.append(f"{local_path}: not uploaded (aborted)")
+                        elif exc := future.exception():
+                            errors.append(f"{local_path}: {exc}")
+
                     # Leaving clones open causes SYS_HEADER_READ_LEN_ERR
                     while not sessions.empty():
                         sessions.get().cleanup()
+
+                if ABORT.is_set():
+                    sys.exit("Uploads aborted:\n" + "\n".join(errors))
 
                 if errors:
                     sys.exit("Upload errors:\n" + "\n".join(errors))
@@ -332,8 +368,22 @@ def main() -> None:
 
 
 # --------------------------------------------------
+def abort_uploads(signum, _frame) -> None:
+    """Stop the in-flight IRODS transfers on a terminating signal"""
+
+    # Let a second signal kill the process outright in case a transfer
+    # thread refuses to wind down
+    signal.signal(signum, signal.SIG_DFL)
+    ABORT.set()
+    abort_parallel_transfers()
+
+
+# --------------------------------------------------
 def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelta:
     """Upload one file to IRODS, retrying on failure"""
+
+    if ABORT.is_set():
+        raise RuntimeError("aborted before the upload started")
 
     # Borrow a session for the life of this upload
     session = sessions.get()
@@ -341,7 +391,7 @@ def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelt
     remote_path = os.path.join(irods_dir, basename)
 
     # Files over 32M are transferred with multiple threads automatically
-    options = {kw.FORCE_FLAG_KW: "", kw.VERIFY_CHKSUM_KW: ""}
+    options = {kw.FORCE_FLAG_KW: ""}
 
     try:
         start = dt.now()
@@ -350,14 +400,18 @@ def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelt
                 session.data_objects.put(local_path, remote_path, **options)
                 return dt.now() - start
             except Exception as e:
-                if attempt == NUM_RETRIES:
+                # An aborted transfer raises like any other failure, so check
+                # before deciding this one is worth another attempt
+                if ABORT.is_set() or attempt == NUM_RETRIES:
                     raise
 
                 with PRINT_LOCK:
                     print(f" {basename} attempt {attempt} failed: {e}")
                     sys.stdout.flush()
 
-                time.sleep(2**attempt)
+                # Returns True as soon as an abort is signalled
+                if ABORT.wait(2**attempt):
+                    raise
     finally:
         sessions.put(session)
 
