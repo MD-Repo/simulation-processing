@@ -247,7 +247,9 @@ def main() -> None:
                 # concurrently rather than one at a time
                 upload = []
                 upload_size = 0
-                for local_path in paths:
+
+                # A path listed twice must not be force-put twice concurrently
+                for local_path in dict.fromkeys(paths):
                     if not os.path.isfile(local_path):
                         print(f"Invalid path '{local_path}'")
                         continue
@@ -341,13 +343,21 @@ def main() -> None:
                         for future, local_path in futures.items():
                             if future in reported:
                                 continue
+                            basename = os.path.basename(local_path)
                             if future.cancelled():
                                 errors.append(f"{local_path}: not uploaded (aborted)")
                             elif exc := future.exception():
                                 errors.append(f"{local_path}: {exc}")
+                            else:
+                                # Finished while the pool was shutting down
+                                took = humanize.precisedelta(future.result())
+                                print(f" {basename} (took {took})")
 
                     if ABORT.is_set():
-                        sys.exit("Uploads aborted:\n" + "\n".join(errors))
+                        message = "Uploads aborted"
+                        if errors:
+                            message += ":\n" + "\n".join(errors)
+                        sys.exit(message)
 
                     if errors:
                         sys.exit("Upload errors:\n" + "\n".join(errors))
