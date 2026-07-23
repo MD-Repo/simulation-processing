@@ -219,6 +219,12 @@ def main() -> None:
     irods_root = f"/iplant/home/shared/mdrepo/{args.server}/release/{mdrepo_id}"
 
     results = []
+
+    # A session cannot be shared across threads, so each upload thread borrows
+    # a clone from here (see the python-irodsclient README). Filled on first
+    # use and shared by both sub dirs so we only authenticate once.
+    sessions = queue.Queue()
+
     with iRODSSession(irods_env_file=args.irods_env) as session:
         if args.remove_processed_dir:
             processed_path = os.path.join(irods_root, "processed")
@@ -229,124 +235,129 @@ def main() -> None:
                 if rv != 0:
                     sys.exit(f"Error running '{cmd}': {out}")
 
-        for sub_dir, paths in push:
-            irods_dir = os.path.join(irods_root, sub_dir)
-            print(f"Checking IRODS dir '{irods_dir}'")
-            if not session.collections.exists(irods_dir):
-                print(f"Making IRODS dir '{irods_dir}'")
-                session.collections.create(irods_dir)
+        try:
+            for sub_dir, paths in push:
+                irods_dir = os.path.join(irods_root, sub_dir)
+                print(f"Checking IRODS dir '{irods_dir}'")
+                if not session.collections.exists(irods_dir):
+                    print(f"Making IRODS dir '{irods_dir}'")
+                    session.collections.create(irods_dir)
 
-            # Gather the files needing upload so they can all be pushed
-            # concurrently rather than one at a time
-            upload = []
-            upload_size = 0
-            for local_path in paths:
-                if not os.path.isfile(local_path):
-                    print(f"Invalid path '{local_path}'")
-                    continue
+                # Gather the files needing upload so they can all be pushed
+                # concurrently rather than one at a time
+                upload = []
+                upload_size = 0
+                for local_path in paths:
+                    if not os.path.isfile(local_path):
+                        print(f"Invalid path '{local_path}'")
+                        continue
 
-                local_size = os.path.getsize(local_path)
-                human_size = humanize.naturalsize(local_size)
+                    local_size = os.path.getsize(local_path)
+                    human_size = humanize.naturalsize(local_size)
 
-                # Check if we can skip
-                basename = os.path.basename(local_path)
-                remote_path = os.path.join(irods_dir, basename)
-                remote_size = 0
-                if session.data_objects.exists(remote_path):
-                    obj = session.data_objects.get(remote_path)
-                    remote_size = obj.size
+                    # Check if we can skip
+                    basename = os.path.basename(local_path)
+                    remote_path = os.path.join(irods_dir, basename)
+                    remote_size = 0
+                    if session.data_objects.exists(remote_path):
+                        obj = session.data_objects.get(remote_path)
+                        remote_size = obj.size
 
-                if local_size == remote_size:
-                    print(f" {local_path} [{human_size}] (already uploaded)")
-                else:
-                    print(f" {local_path} [{human_size}] (queued)")
-                    upload.append(local_path)
-                    upload_size += local_size
+                    if local_size == remote_size:
+                        print(f" {local_path} [{human_size}] (already uploaded)")
+                    else:
+                        print(f" {local_path} [{human_size}] (queued)")
+                        upload.append(local_path)
+                        upload_size += local_size
 
-                results.append(
-                    {
-                        "src": local_path,
-                        "dest": remote_path,
-                        "size": local_size,
-                    }
-                )
+                    results.append(
+                        {
+                            "src": local_path,
+                            "dest": remote_path,
+                            "size": local_size,
+                        }
+                    )
 
-            if upload:
-                human_size = humanize.naturalsize(upload_size)
-                num_threads = min(args.threads, len(upload))
-                print(
-                    f"Uploading {len(upload)} file(s) [{human_size}] to "
-                    f"'{irods_dir}' using {num_threads} thread(s)"
-                )
-                sys.stdout.flush()
+                if upload:
+                    human_size = humanize.naturalsize(upload_size)
+                    num_threads = min(args.threads, len(upload))
+                    print(
+                        f"Uploading {len(upload)} file(s) [{human_size}] to "
+                        f"'{irods_dir}' using {num_threads} thread(s)"
+                    )
+                    sys.stdout.flush()
 
-                # A session cannot be shared across threads, so hand each
-                # worker its own clone (see the python-irodsclient README)
-                sessions = queue.Queue()
-                for _ in range(num_threads):
-                    sessions.put(session.clone())
+                    # Every thread must be able to take a clone without
+                    # waiting, but clones from an earlier sub dir still count
+                    while sessions.qsize() < num_threads:
+                        sessions.put(session.clone())
 
-                # A terminating signal must reach the parallel transfer
-                # threads that python-irodsclient spawns for files over 32M,
-                # or they can keep running after the main program is done
-                prev_handlers = {
-                    sig: signal.signal(sig, abort_uploads)
-                    for sig in (signal.SIGINT, signal.SIGTERM)
-                }
-
-                start = dt.now()
-                errors = []
-                reported = set()
-                futures = {}
-                pool = ThreadPoolExecutor(max_workers=num_threads)
-                try:
-                    futures = {
-                        pool.submit(put_file, sessions, path, irods_dir): path
-                        for path in upload
+                    # A terminating signal must reach the parallel transfer
+                    # threads that python-irodsclient spawns for files over
+                    # 32M, or they can keep running after the main program
+                    # is done
+                    prev_handlers = {
+                        sig: signal.signal(sig, abort_uploads)
+                        for sig in (signal.SIGINT, signal.SIGTERM)
                     }
 
-                    for future in as_completed(futures):
-                        local_path = futures[future]
-                        basename = os.path.basename(local_path)
-                        reported.add(future)
-                        try:
-                            took = humanize.precisedelta(future.result())
-                            print(f" {basename} (took {took})")
-                        except Exception as e:
-                            print(f" {basename} FAILED: {e}")
-                            errors.append(f"{local_path}: {e}")
-                        sys.stdout.flush()
+                    start = dt.now()
+                    errors = []
+                    reported = set()
+                    futures = {}
+                    pool = ThreadPoolExecutor(max_workers=num_threads)
+                    try:
+                        futures = {
+                            pool.submit(put_file, sessions, path, irods_dir): path
+                            for path in upload
+                        }
 
-                        if ABORT.is_set():
-                            print("Dropping the uploads that have not started")
-                            break
-                finally:
-                    pool.shutdown(wait=True, cancel_futures=ABORT.is_set())
+                        for future in as_completed(futures):
+                            local_path = futures[future]
+                            basename = os.path.basename(local_path)
+                            reported.add(future)
+                            try:
+                                took = humanize.precisedelta(future.result())
+                                message = f" {basename} (took {took})"
+                            except Exception as e:
+                                message = f" {basename} FAILED: {e}"
+                                errors.append(f"{local_path}: {e}")
 
-                    for sig, handler in prev_handlers.items():
-                        signal.signal(sig, handler)
+                            # The upload threads print retries under this lock
+                            with PRINT_LOCK:
+                                print(message)
+                                sys.stdout.flush()
 
-                    # Account for the files the loop above broke out of
-                    for future, local_path in futures.items():
-                        if future in reported:
-                            continue
-                        if future.cancelled():
-                            errors.append(f"{local_path}: not uploaded (aborted)")
-                        elif exc := future.exception():
-                            errors.append(f"{local_path}: {exc}")
+                            if ABORT.is_set():
+                                print("Dropping the uploads that have not started")
+                                break
+                    finally:
+                        pool.shutdown(wait=True, cancel_futures=ABORT.is_set())
 
-                    # Leaving clones open causes SYS_HEADER_READ_LEN_ERR
-                    while not sessions.empty():
-                        sessions.get().cleanup()
+                        for sig, handler in prev_handlers.items():
+                            signal.signal(sig, handler)
 
-                if ABORT.is_set():
-                    sys.exit("Uploads aborted:\n" + "\n".join(errors))
+                        # Account for the files the loop above broke out of
+                        for future, local_path in futures.items():
+                            if future in reported:
+                                continue
+                            if future.cancelled():
+                                errors.append(f"{local_path}: not uploaded (aborted)")
+                            elif exc := future.exception():
+                                errors.append(f"{local_path}: {exc}")
 
-                if errors:
-                    sys.exit("Upload errors:\n" + "\n".join(errors))
+                    if ABORT.is_set():
+                        sys.exit("Uploads aborted:\n" + "\n".join(errors))
 
-                elapsed = humanize.precisedelta(dt.now() - start)
-                print(f"Uploaded {len(upload)} file(s) in {elapsed}")
+                    if errors:
+                        sys.exit("Upload errors:\n" + "\n".join(errors))
+
+                    elapsed = humanize.precisedelta(dt.now() - start)
+                    print(f"Uploaded {len(upload)} file(s) in {elapsed}")
+        finally:
+            # Leaving clones open causes SYS_HEADER_READ_LEN_ERR
+            while not sessions.empty():
+                sessions.get().cleanup()
 
     cur.execute(
         """
@@ -382,38 +393,42 @@ def abort_uploads(signum, _frame) -> None:
 def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelta:
     """Upload one file to IRODS, retrying on failure"""
 
-    if ABORT.is_set():
-        raise RuntimeError("aborted before the upload started")
-
-    # Borrow a session for the life of this upload
-    session = sessions.get()
     basename = os.path.basename(local_path)
     remote_path = os.path.join(irods_dir, basename)
 
     # Files over 32M are transferred with multiple threads automatically
     options = {kw.FORCE_FLAG_KW: ""}
 
-    try:
-        start = dt.now()
-        for attempt in range(1, NUM_RETRIES + 1):
-            try:
-                session.data_objects.put(local_path, remote_path, **options)
-                return dt.now() - start
-            except Exception as e:
-                # An aborted transfer raises like any other failure, so check
-                # before deciding this one is worth another attempt
-                if ABORT.is_set() or attempt == NUM_RETRIES:
-                    raise
+    for attempt in range(1, NUM_RETRIES + 1):
+        if ABORT.is_set():
+            raise RuntimeError("aborted before the upload started")
 
-                with PRINT_LOCK:
-                    print(f" {basename} attempt {attempt} failed: {e}")
-                    sys.stdout.flush()
+        # Borrow a session for the length of this attempt only
+        session = sessions.get()
+        try:
+            start = dt.now()
+            session.data_objects.put(local_path, remote_path, **options)
+            return dt.now() - start
+        except Exception as e:
+            # A failed transfer can leave a connection mid-protocol, so drop
+            # this clone's connections rather than retry over them
+            session.cleanup()
 
-                # Returns True as soon as an abort is signalled
-                if ABORT.wait(2**attempt):
-                    raise
-    finally:
-        sessions.put(session)
+            # An aborted transfer raises like any other failure, so check
+            # before deciding this one is worth another attempt
+            if ABORT.is_set() or attempt == NUM_RETRIES:
+                raise
+
+            with PRINT_LOCK:
+                print(f" {basename} attempt {attempt} failed: {e}")
+                sys.stdout.flush()
+        finally:
+            sessions.put(session)
+
+        # Backing off out here leaves the session free for another thread.
+        # The wait returns True as soon as an abort is signalled.
+        if ABORT.wait(2**attempt):
+            raise RuntimeError("aborted during the retry backoff")
 
 
 # --------------------------------------------------

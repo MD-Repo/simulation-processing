@@ -33,31 +33,18 @@ a non-zero exit. The non-zero exit is load-bearing: the queue worker keys off it
 preserve it. The redundancy is just the DB flag being set separately from the
 exit signal.
 
-## Cleanups in the `python/push_sim_files.py` upload path
+## Cleanups in the `python/push_sim_files.py` upload path — DONE
 
-Deferred nits from the review of the python-irodsclient upload path. None are
-correctness bugs today; each is a latent trap or a small inconsistency.
+Nits from the review of the python-irodsclient upload path, all addressed:
+`PRINT_LOCK` now covers the main thread's per-file prints as well as the upload
+threads' retry messages; `put_file` borrows a clone per attempt (so the backoff
+no longer holds one) and calls `session.cleanup()` after a failure rather than
+retrying over a connection that may be stuck mid-protocol; the clone pool is
+built once outside the `sub_dir` loop, grown only as needed, and drained in a
+`finally`, so we authenticate once and leak nothing on a partial failure; and
+the reported per-file time now covers only the attempt that succeeded.
 
-- **`PRINT_LOCK` only guards one side.** `put_file` takes it for the retry
-  message, but the main thread's per-file prints in the `as_completed` loop do
-  not, so nothing is actually serialized. Either take the lock in both places or
-  drop it.
-- **Retries reuse a possibly-poisoned session.** When an upload dies
-  mid-protocol the connection goes back into that clone's pool and the next
-  attempt can pick it up again. A `session.cleanup()` before retrying forces
-  fresh connections — relevant given the `SYS_HEADER_READ_LEN_ERR` failures that
-  motivated the clone-per-thread design.
-- **Backoff holds the borrowed session.** `ABORT.wait(2**attempt)` blocks while
-  the worker still owns its clone. Harmless only because the number of clones
-  equals `max_workers`; if those ever diverge, a sleeping worker starves a live
-  one.
-- **Clones are built outside the `try`.** A failure partway through the
-  `session.clone()` loop leaks the earlier clones (python-irodsclient's atexit
-  hook eventually collects them). They are also rebuilt per `sub_dir`, so we
-  authenticate twice per run instead of once.
-- **Per-file elapsed time includes retry backoff.** `start` is set before the
-  retry loop, so the reported "took" is wall clock, not transfer time.
-- **Partial state on failure.** `sys.exit` on upload errors skips the
-  `is_placeholder` update and the `--out-file` write while some files have
-  already landed in IRODS. Pre-existing behavior, but per-file failures make it
-  more reachable than the old single `gocmd put` did.
+Deliberately left alone: `sys.exit` on upload errors skips the `is_placeholder`
+update and the `--out-file` write even though some files have already landed in
+IRODS. A rerun skips those files via the size check anyway, and keeping the
+out-file to successful runs only means its presence stays unambiguous.
