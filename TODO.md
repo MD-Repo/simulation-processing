@@ -32,3 +32,19 @@ a non-zero exit. The non-zero exit is load-bearing: the queue worker keys off it
 (see [`docs/processing-queue.md`](docs/processing-queue.md)), so any change must
 preserve it. The redundancy is just the DB flag being set separately from the
 exit signal.
+
+## Cleanups in the `python/push_sim_files.py` upload path — DONE
+
+Nits from the review of the python-irodsclient upload path, all addressed:
+`PRINT_LOCK` now covers the main thread's per-file prints as well as the upload
+threads' retry messages; `put_file` borrows a clone per attempt (so the backoff
+no longer holds one) and calls `session.cleanup()` after a failure rather than
+retrying over a connection that may be stuck mid-protocol; the clone pool is
+built once outside the `sub_dir` loop, grown only as needed, and drained in a
+`finally`, so we authenticate once and leak nothing on a partial failure; and
+the reported per-file time now covers only the attempt that succeeded.
+
+Deliberately left alone: `sys.exit` on upload errors skips the `is_placeholder`
+update and the `--out-file` write even though some files have already landed in
+IRODS. A rerun skips those files via the size check anyway, and keeping the
+out-file to successful runs only means its presence stays unambiguous.
