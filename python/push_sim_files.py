@@ -10,8 +10,8 @@ import fabric
 import irods.keywords as kw
 import json
 import os
-import psycopg2
 import queue
+import shlex
 import signal
 import sys
 import threading
@@ -173,16 +173,14 @@ def main() -> None:
         else:
             sys.exit(f"Missing env '{key}'")
 
-    dsn = get_env("PRODUCTION_DSN" if args.server == "prod" else "STAGING_DSN")
     media_host = get_env("MEDIA_HOST")
     media_port = get_env("MEDIA_PORT")
     media_user = get_env("MEDIA_USER")
     media_pass = get_env("MEDIA_PASSWORD")
 
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = True
-    cur = conn.cursor()
     files = get_files(args)
+    errors: List[str] = []
+    file_results: List[dict] = []
     mdrepo_id = f"MDR{args.simulation_id:08d}"
 
     #
@@ -198,14 +196,18 @@ def main() -> None:
     print(f"Making media dir '{media_dir}'")
     media_server.run(f'mkdir -p "{media_dir}"', warn=False)
 
-    if any(map(lambda t: t in args.file_types, ["all", "media"])):
+    do_media = any(t in args.file_types for t in ["all", "media"])
+    if do_media:
         for local_path in files["media_files"]:
             if os.path.isfile(local_path):
                 remote_path = os.path.join(media_dir, os.path.basename(local_path))
                 print(f" {local_path} -> {remote_path}")
-                media_server.put(local_path, remote=remote_path)
+                try:
+                    media_server.put(local_path, remote=remote_path)
+                except Exception as e:
+                    errors.append(f"{local_path} -> media: {e}")
             else:
-                print(f"Invalid path '{local_path}'")
+                errors.append(f"Invalid path '{local_path}'")
 
     push = []
     if any(map(lambda t: t in args.file_types, ["all", "original"])):
@@ -218,7 +220,35 @@ def main() -> None:
     #
     irods_root = f"/iplant/home/shared/mdrepo/{args.server}/release/{mdrepo_id}"
 
-    results = []
+    # Every file this run is responsible for, paired with the remote path and
+    # the expected MD5 (from import.json) to verify it against after uploading.
+    targets = []
+    if do_media:
+        for local_path in files["media_files"]:
+            meta = files["meta"].get(local_path, {})
+            targets.append(
+                {
+                    "location": "media",
+                    "src": local_path,
+                    "dest": os.path.join(media_dir, os.path.basename(local_path)),
+                    "expected_md5": meta.get("md5", ""),
+                    "size": meta.get("size", 0),
+                }
+            )
+    for sub_dir, paths in push:
+        for local_path in dict.fromkeys(paths):
+            meta = files["meta"].get(local_path, {})
+            targets.append(
+                {
+                    "location": "irods",
+                    "src": local_path,
+                    "dest": os.path.join(
+                        irods_root, sub_dir, os.path.basename(local_path)
+                    ),
+                    "expected_md5": meta.get("md5", ""),
+                    "size": meta.get("size", 0),
+                }
+            )
 
     # A session cannot be shared across threads, so each upload thread borrows
     # a clone from here (see the python-irodsclient README). Filled on first
@@ -272,14 +302,6 @@ def main() -> None:
                         upload.append(local_path)
                         upload_size += local_size
 
-                    results.append(
-                        {
-                            "src": local_path,
-                            "dest": remote_path,
-                            "size": local_size,
-                        }
-                    )
-
                 if upload:
                     human_size = humanize.naturalsize(upload_size)
                     num_threads = min(args.threads, len(upload))
@@ -304,7 +326,6 @@ def main() -> None:
                     }
 
                     start = dt.now()
-                    errors = []
                     reported = set()
                     futures = {}
                     pool = ThreadPoolExecutor(max_workers=num_threads)
@@ -359,9 +380,6 @@ def main() -> None:
                             message += ":\n" + "\n".join(errors)
                         sys.exit(message)
 
-                    if errors:
-                        sys.exit("Upload errors:\n" + "\n".join(errors))
-
                     elapsed = humanize.precisedelta(dt.now() - start)
                     print(f"Uploaded {len(upload)} file(s) in {elapsed}")
         finally:
@@ -369,22 +387,58 @@ def main() -> None:
             while not sessions.empty():
                 sessions.get().cleanup()
 
-    cur.execute(
-        """
-        update md_simulation
-        set    is_placeholder=False
-        where  id=%s
-        """,
-        (args.simulation_id,),
-    )
+        # Verify every file landed on its remote with a matching MD5. This runs
+        # regardless of upload errors: the is_placeholder flip (now done in
+        # Rust) keys off observed remote state, not off whether this particular
+        # run uploaded cleanly. A partial push therefore leaves the simulation a
+        # placeholder, and a later run that completes it clears the flag.
+        print("Verifying uploads")
+        for target in targets:
+            if target["location"] == "media":
+                present, remote_md5 = verify_media(media_server, target["dest"])
+            else:
+                present, remote_md5 = verify_irods(
+                    session, target["dest"], target["size"]
+                )
 
-    print(f"results = {results}")
+            verified = present and remote_md5 == target["expected_md5"].lower()
+            if not verified:
+                why = "md5 mismatch" if present else "missing"
+                print(
+                    f" NOT VERIFIED [{target['location']}] {target['dest']} ({why})"
+                )
+
+            file_results.append(
+                {
+                    "location": target["location"],
+                    "src": target["src"],
+                    "dest": target["dest"],
+                    "size": target["size"],
+                    "expected_md5": target["expected_md5"].lower(),
+                    "remote_md5": remote_md5,
+                    "present": present,
+                    "verified": verified,
+                }
+            )
+
+    complete = bool(file_results) and all(f["verified"] for f in file_results)
+
+    result = {
+        "simulation_id": args.simulation_id,
+        "complete": complete,
+        "files": file_results,
+        "errors": errors,
+    }
 
     if filename := args.out_file:
         print(f"Writing results to '{filename}'")
         with open(filename, "wt") as fh:
-            print(json.dumps(results, indent=4), file=fh)
+            print(json.dumps(result, indent=4), file=fh)
 
+    n_verified = sum(1 for f in file_results if f["verified"])
+    print(f"Verified {n_verified}/{len(file_results)} file(s); complete={complete}")
+    if errors:
+        print("Upload errors:\n" + "\n".join(errors))
     print("Done")
 
 
@@ -455,19 +509,57 @@ def get_files(args: Args) -> Dict[str, List[str]]:
         "original_files": [],
         "processed_files": [],
         "media_files": [],
+        # local_path -> {"md5", "size"} from import.json, for post-upload
+        # verification
+        "meta": {},
     }
 
     for file in simulation.get("original_files", []):
-        files["original_files"].append(mkpath(file["name"]))
+        local_path = mkpath(file["name"])
+        files["original_files"].append(local_path)
+        files["meta"][local_path] = {"md5": file["md5_sum"], "size": file["size"]}
 
     for file in simulation["processed_files"]:
         local_path = mkpath(os.path.join("processed", file["name"]))
         files["processed_files"].append(local_path)
+        files["meta"][local_path] = {"md5": file["md5_sum"], "size": file["size"]}
 
         if file["name"] in ["thumbnail.png", "minimal.pdb", "sampled.xtc"]:
             files["media_files"].append(local_path)
 
     return files
+
+
+# --------------------------------------------------
+def verify_irods(session, remote_path: str, expected_size: int):
+    """Return (present, md5) for an IRODS object. `present` requires the remote
+    size to match the local file; `md5` is the object's server-side checksum
+    (the zone hashes with MD5, so this compares to our manifest directly)."""
+
+    if not session.data_objects.exists(remote_path):
+        return (False, None)
+
+    obj = session.data_objects.get(remote_path)
+    if obj.size != expected_size:
+        return (False, None)
+
+    # chksum() forces server-side computation and returns it. MD5-scheme
+    # checksums come back as bare hex; strip any "md5:" prefix defensively.
+    chksum = obj.chksum() or ""
+    return (True, chksum.split(":", 1)[-1].strip().lower())
+
+
+# --------------------------------------------------
+def verify_media(media_server, remote_path: str):
+    """Return (present, md5) for a file on the media server, via `md5sum` over
+    SSH. A missing file makes md5sum fail, which reads as not-present."""
+
+    result = media_server.run(
+        f"md5sum -- {shlex.quote(remote_path)}", warn=True, hide=True
+    )
+    if result.ok and result.stdout.strip():
+        return (True, result.stdout.split()[0].strip().lower())
+    return (False, None)
 
 
 # --------------------------------------------------
