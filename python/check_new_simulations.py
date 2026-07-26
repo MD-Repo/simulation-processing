@@ -240,7 +240,11 @@ def process_ticket(
     is_complete = bool(upload_complete) and all(upload_complete)
 
     if is_complete:
-        msg = f"New simulation upload {ticket['id']}: {', '.join(landing_dirs)}"
+        num_simulations = len(landing_dirs)
+        msg = (
+            f"New simulation upload {ticket['id']} containing "
+            f"{num_simulations} simulation{'' if num_simulations == 1 else 's'}"
+        )
 
         if dry_run:
             status(
