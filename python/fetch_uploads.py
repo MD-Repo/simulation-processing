@@ -15,6 +15,7 @@ import re
 import sys
 from datetime import datetime
 from dotenv import dotenv_values
+from irods.exception import CollectionDoesNotExist
 from irods.session import iRODSSession
 from subprocess import getstatusoutput
 from typing import List, NamedTuple, Optional
@@ -211,6 +212,7 @@ def main() -> None:
                         "last_name": ticket.last_name,
                         "email": ticket.email,
                         "orcid": ticket.orcid,
+                        "username": ticket.username,
                         "institution": ticket.institution,
                     },
                     fh,
@@ -224,10 +226,14 @@ def main() -> None:
 
                 landing_dir = irods_ticket.split(":")[1]
 
+                # Only swallow "genuinely doesn't exist" -- anything else
+                # (e.g. a NetworkException from iRODS being unreachable) must
+                # propagate so the job fails loudly instead of silently
+                # skipping this part and possibly finishing "successfully".
                 coll = None
                 try:
                     coll = session.collections.get(landing_dir)
-                except Exception as e:
+                except CollectionDoesNotExist:
                     pass
 
                 if coll is None:

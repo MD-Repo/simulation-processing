@@ -38,12 +38,38 @@ synchronously in its own process (blocking the scan for up to 12h per run).
 
 ## Design decisions
 
-- **No retry; failures need a human.** `mdr-process` is not safe to blindly
-  re-run (it wants `--force`), so a failed job is **terminal**. The worker marks
-  it `failed` and posts a Slack notice — that notice *is* the human handoff.
-  Nothing re-enqueues it. (This is also why we did not use Celery/RQ: their
-  headline feature, retry-with-backoff, is unwanted, and it isn't worth running
-  Redis + a worker daemon for it.)
+- **No retry (mostly); failures need a human.** `mdr-process` is not safe to
+  blindly re-run once it has started mutating things (it wants `--force`), so a
+  failed job is **terminal**. The worker marks it `failed` and posts a Slack
+  notice — that notice *is* the human handoff. Nothing re-enqueues it. (This is
+  also why we did not use Celery/RQ: their headline feature, retry-with-backoff,
+  is unwanted for most failures, and it isn't worth running Redis + a worker
+  daemon for the one case below.)
+  - **Exception: transient iRODS connection failures.** `fetch_uploads.py` is
+    the very first thing `mdr-process ticket` runs, before any DB write or file
+    processing, so this class of failure is safe to requeue and re-run from
+    scratch. Two distinct code paths there can surface it: `gocmd` (shelled out
+    to for each file download) writes its own stderr message
+    `"Failed to establish a connection to iRODS server"` on a connection
+    failure; the script's own iRODS session calls (e.g.
+    `session.collections.get`) can instead raise python-irodsclient's
+    `NetworkException` directly, which propagates as an uncaught traceback.
+    `is_retryable_irods_error` matches either. The worker resets the job to
+    `pending` and bumps `num_attempts` instead of calling it terminal, up to
+    `MAX_RETRY_ATTEMPTS` (5); beyond that it falls through to the normal
+    terminal `failed` + Slack path. See `is_retryable_irods_error` /
+    `requeue_for_retry` in `drain_process_queue.py`. (`fetch_uploads.py` used to
+    have a bare `except: pass` around `session.collections.get` that silently
+    swallowed *any* error there, including a connection failure, printing
+    `"Unable to get landing directory"` and continuing rather than failing —
+    fixed to catch only `CollectionDoesNotExist`, so a real connection failure
+    now propagates instead of being swallowed.)
+  - **Why requeue stops the drain loop.** `claim_job` always takes the oldest
+    `pending` row, so a requeued job would otherwise be reclaimed immediately by
+    the same drain loop with no pause at all. Instead `run_job` returns `False`
+    on a requeue and `main` stops draining for this invocation, so the retry
+    waits for the next cron minute — a ~1 min backoff for free from the existing
+    cron cadence, no `sleep()` needed.
 - **Serial processing (head-of-line blocking accepted).** The worker holds a
   single lock and runs jobs one at a time in `created_at` order. A large
   trajectory therefore delays smaller jobs queued behind it. That is fine given
@@ -87,25 +113,31 @@ synchronously in its own process (blocking the scan for up to 12h per run).
 | `id` | PK |
 | `ticket_id` | FK → `md_ticket(id)`, `ON DELETE CASCADE` |
 | `server` | `staging` or `prod`; workers filter on it |
-| `status` | `pending` → `running` → `succeeded` \| `failed` |
+| `status` | `pending` → `running` → `succeeded` \| `failed` (or back to `pending` on a retryable iRODS failure) |
 | `exit_code` | `mdr-process` return code (null until it runs) |
-| `last_error` | stderr / debug-log tail on failure |
+| `last_error` | stderr / debug-log tail on failure (or the retryable error, while requeued) |
 | `log_file` | reserved; the worker writes logs to `logs/ticket-<id>-<server>.log` |
+| `num_attempts` | bumped each time a retryable iRODS connection failure requeues the job; capped at `MAX_RETRY_ATTEMPTS` (5) before it's treated as terminal |
 | `created_at` | `db_default=Now()` |
-| `started_at` | set when claimed |
-| `finished_at` | set on terminal state |
+| `started_at` | set when claimed; cleared back to null on a requeue |
+| `finished_at` | set on terminal state; cleared back to null on a requeue |
 
 State machine (only these transitions):
 
 ```
 pending ──▶ running ──▶ succeeded
-                   └──▶ failed        (terminal; needs a human)
+                   ├──▶ failed        (terminal; needs a human)
+                   └──▶ pending       (retryable iRODS connection failure,
+                                       num_attempts < MAX_RETRY_ATTEMPTS;
+                                       otherwise falls through to failed)
 ```
 
 - The scanner inserts `pending`.
 - The worker claims with `UPDATE ... FOR UPDATE SKIP LOCKED` → `running` (the
   `SKIP LOCKED` makes it safe to run multiple workers later).
-- On exit 0 → `succeeded`; on non-zero / timeout / missing binary → `failed`.
+- On exit 0 → `succeeded`; on non-zero / timeout / missing binary → `failed`,
+  *except* a retryable iRODS connection failure from the fetch step with
+  `num_attempts < MAX_RETRY_ATTEMPTS`, which goes back to `pending` instead.
 
 ## Cron setup
 
@@ -209,6 +241,12 @@ select id, ticket_id, exit_code, finished_at, left(last_error, 200) as err
 from   md_process_job
 where  status = 'failed'
 order  by finished_at desc;
+
+-- Jobs currently mid-retry (pending again after a transient iRODS failure)
+select id, ticket_id, num_attempts, left(last_error, 200) as err
+from   md_process_job
+where  status = 'pending' and num_attempts > 0
+order  by num_attempts desc;
 
 -- Backlog and in-flight work
 select status, count(*) from md_process_job group by status;
