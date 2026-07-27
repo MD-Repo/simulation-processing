@@ -161,18 +161,22 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
     if landing_id:
         cur.execute(
             """
-            select id, created_at, irods_tickets
-            from   md_ticket
-            where  irods_tickets like %s
+            select t.id, t.created_at, t.irods_tickets,
+                   u.username, u.first_name, u.last_name
+            from   md_ticket t
+            join   md_user u on u.id = t.created_by_id
+            where  t.irods_tickets like %s
             """,
             (f"%{landing_id}%",),
         )
     else:
         cur.execute("""
-            select id, created_at, irods_tickets
-            from   md_ticket
-            where  ticket_type = 'u'
-            and    upload_notification_sent = false
+            select t.id, t.created_at, t.irods_tickets,
+                   u.username, u.first_name, u.last_name
+            from   md_ticket t
+            join   md_user u on u.id = t.created_by_id
+            where  t.ticket_type = 'u'
+            and    t.upload_notification_sent = false
             """)
 
     return cur.fetchall()
@@ -241,8 +245,12 @@ def process_ticket(
 
     if is_complete:
         num_simulations = len(landing_dirs)
+        full_name = f"{ticket['first_name']} {ticket['last_name']}".strip()
+        user_label = (
+            f"{full_name} ({ticket['username']})" if full_name else ticket["username"]
+        )
         msg = (
-            f"New simulation upload {ticket['id']} containing "
+            f"New simulation upload {ticket['id']} by {user_label} containing "
             f"{num_simulations} simulation{'' if num_simulations == 1 else 's'}"
         )
 
