@@ -25,13 +25,17 @@ import fcntl
 import os
 import psycopg2
 import psycopg2.extras
+import signal
 import subprocess
 import sys
+import time
+from datetime import timedelta
 from typing import NamedTuple, Optional
 
 from common import FRONTEND_BASE_URLS, send_slack_message
 
 PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
+KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
 ERROR_LINES = 20  # tail of mdr-process output to include in a failure notice
 MAX_RETRY_ATTEMPTS = 5  # requeue this many times before treating it as terminal
 
@@ -253,22 +257,48 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
     ]
     status(f"Job {job['id']} (ticket {ticket_id}): running {' '.join(cmd)}")
 
+    # start_new_session puts mdr-process in its own process group, so a timeout
+    # can signal the whole tree. Without it, killing the group would signal this
+    # worker too, and killing only the child would orphan gocmd/gmx/blastp --
+    # which is what subprocess.run's own timeout does.
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=PROCESS_TIMEOUT
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
     except FileNotFoundError:
         finish_failure(cur, job, None, "mdr-process not found", base_url, log_file, status)
         return True
+
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=PROCESS_TIMEOUT)
     except subprocess.TimeoutExpired:
+        timed_out = True
+        signals = kill_process_group(proc.pid, status)
+        # The pipes are still open on any survivor; collect what was written.
+        try:
+            out, err = proc.communicate(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+
+    if timed_out:
+        limit = format_hm(timedelta(seconds=PROCESS_TIMEOUT))
+        detail = (
+            f"KILLED for exceeding the {limit} time limit "
+            f"(PROCESS_TIMEOUT={PROCESS_TIMEOUT}s). "
+            f"Sent {signals} to the process group, so mdr-process and any "
+            f"gocmd/gmx/blastp children it started were terminated. "
+            f"Whatever it was doing was left unfinished and needs a human."
+        )
+        if log_tail := tail_file(log_file):
+            detail += f"\n\nLast {ERROR_LINES} lines of debug log:\n{log_tail}"
+
         finish_failure(
-            cur,
-            job,
-            None,
-            f"timed out after {PROCESS_TIMEOUT} seconds",
-            base_url,
-            log_file,
-            status,
+            cur, job, None, detail, base_url, log_file, status, killed=True
         )
         return True
 
@@ -276,7 +306,7 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
         finish_success(cur, job, base_url, status)
         return True
 
-    err = (proc.stderr or proc.stdout or "").strip()
+    err = (err or out or "").strip()
     detail = err or "no error output"
     if log_tail := tail_file(log_file):
         detail += f"\n\nLast {ERROR_LINES} lines of debug log:\n{log_tail}"
@@ -290,20 +320,129 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
 
 
 # --------------------------------------------------
+def kill_process_group(pid: int, status) -> str:
+    """Signal a whole process group dead, escalating SIGTERM -> SIGKILL
+
+    Returns a description of what was actually sent, for the failure notice.
+
+    The group is the point: mdr-process shells out to gocmd, gmx, blastp and
+    python helpers, and signalling only the direct child leaves those running as
+    orphans -- still holding CPU, RAM and IRODS connections while the queue
+    moves on. This is safe only because the child was started with
+    start_new_session; in this worker's own group it would kill the worker.
+    """
+
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return "nothing (process had already exited)"
+
+    sent = []
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not live_group_members(pgid):
+            break
+
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            break
+
+        sent.append(sig.name)
+        status(f"sent {sig.name} to process group {pgid}")
+
+        deadline = time.monotonic() + KILL_GRACE
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            if not live_group_members(pgid):
+                break
+
+    if not sent:
+        return "nothing (group had already exited)"
+
+    if remaining := live_group_members(pgid):
+        return f"{' then '.join(sent)} (pids {remaining} survived)"
+
+    return " then ".join(sent)
+
+
+# --------------------------------------------------
+def live_group_members(pgid: int) -> list:
+    """PIDs in this process group that have not exited
+
+    Zombies are excluded deliberately. A killed child stays a zombie until its
+    parent reaps it, and kill(pid, 0) succeeds on a zombie -- so testing
+    liveness that way never sees the group go away, which would burn the whole
+    grace period and escalate to SIGKILL every time.
+    """
+
+    members = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+
+        try:
+            # "pid (comm) state ppid pgrp ..." -- comm can contain spaces and
+            # parens, so split after the last ") ".
+            with open(f"/proc/{entry}/stat") as fh:
+                fields = fh.read().rsplit(") ", 1)[1].split()
+            state, this_pgid = fields[0], int(fields[2])
+        except (OSError, IndexError, ValueError):
+            continue  # exited while we looked, or not readable
+
+        if this_pgid == pgid and state != "Z":
+            members.append(int(entry))
+
+    return members
+
+
+# --------------------------------------------------
+def format_hm(elapsed: Optional[timedelta]) -> Optional[str]:
+    """Render a duration as hours and minutes, or None if it is unknown
+
+    Postgres does the subtraction, so this only formats. Anything under a
+    minute becomes "<1m" rather than "0m", which would read as instant.
+    """
+
+    if elapsed is None:
+        return None
+
+    total = int(elapsed.total_seconds())
+    if total < 60:
+        return "<1m"
+
+    hours, minutes = divmod(total // 60, 60)
+
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+# --------------------------------------------------
 def finish_success(cur, job, base_url: str, status) -> None:
     """Mark a job succeeded and post a Slack notice"""
 
     ticket_id = job["ticket_id"]
+    # Let Postgres subtract the two timestamps it just wrote: the elapsed time
+    # then comes from one clock, and no second query can see a torn state.
+    # started_at is null only if a job somehow finished without being claimed,
+    # so the duration is omitted rather than faked.
     cur.execute(
         """
         update md_process_job
         set    status = 'succeeded', exit_code = 0, finished_at = now()
         where  id = %s
+        returning finished_at - started_at as elapsed
         """,
         (job["id"],),
     )
-    status(f"Job {job['id']} (ticket {ticket_id}) SUCCEEDED")
-    send_slack_message(f"Ticket {ticket_id} processing SUCCEEDED", base_url)
+    row = cur.fetchone()
+    took = format_hm(row["elapsed"] if row else None)
+
+    msg = f"Ticket {ticket_id} processing SUCCEEDED"
+    if took:
+        msg += f" in {took}"
+
+    status(f"Job {job['id']} (ticket {ticket_id}) SUCCEEDED"
+           + (f" in {took}" if took else ""))
+    send_slack_message(msg, base_url)
 
 
 # --------------------------------------------------
@@ -359,23 +498,45 @@ def requeue_for_retry(cur, job, exit_code: Optional[int], detail: str, status) -
 
 # --------------------------------------------------
 def finish_failure(
-    cur, job, exit_code: Optional[int], detail: str, base_url: str, log_file: str, status
+    cur,
+    job,
+    exit_code: Optional[int],
+    detail: str,
+    base_url: str,
+    log_file: str,
+    status,
+    killed: bool = False,
 ) -> None:
-    """Mark a job failed (terminal, no retry) and post a Slack notice for a human"""
+    """Mark a job failed (terminal, no retry) and post a Slack notice for a human
+
+    `killed` says the worker stopped the job itself for running too long, rather
+    than the job failing on its own. The notice leads with that, because the two
+    need different responses: a KILLED job may have left half-written state
+    behind, where a FAILED one stopped where mdr-process chose to.
+    """
 
     ticket_id = job["ticket_id"]
+    # Same RETURNING trick as finish_success: how long it ran before failing is
+    # triage information -- a job that died in seconds points somewhere quite
+    # different from one that burned four hours first.
     cur.execute(
         """
         update md_process_job
         set    status = 'failed', exit_code = %s, last_error = %s, finished_at = now()
         where  id = %s
+        returning finished_at - started_at as elapsed
         """,
         (exit_code, detail, job["id"]),
     )
-    status(f"Job {job['id']} (ticket {ticket_id}) FAILED: {detail}")
-    exit_note = f" (exit {exit_code})" if exit_code is not None else ""
+    row = cur.fetchone()
+    took = format_hm(row["elapsed"] if row else None)
+    after = f" after {took}" if took else ""
+
+    verb = "KILLED (exceeded time limit)" if killed else "FAILED"
+    status(f"Job {job['id']} (ticket {ticket_id}) {verb}{after}: {detail}")
+    exit_note = "" if killed or exit_code is None else f" (exit {exit_code})"
     send_slack_message(
-        f"Ticket {ticket_id} processing FAILED{exit_note}\n"
+        f"Ticket {ticket_id} processing {verb}{exit_note}{after}\n"
         f"```\n{detail}\n```\nFull debug log: {log_file}",
         base_url,
     )

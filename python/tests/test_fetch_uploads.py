@@ -12,14 +12,23 @@ FETCH_LIVE_TEST=1.
 import hashlib
 import os
 import re
+import signal
+import subprocess
 import sys
+import time
 import pytest
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import fetch_uploads as fup  # noqa: E402
-from drain_process_queue import is_retryable_irods_error  # noqa: E402
+from drain_process_queue import (  # noqa: E402
+    format_hm,
+    is_retryable_irods_error,
+    kill_process_group,
+    live_group_members,
+)
 
 
 def make_object(tmp_path: Path, name: str, content: bytes) -> fup.RemoteObject:
@@ -135,6 +144,94 @@ def test_irods_outage_message_stays_retryable(monkeypatch):
         fup.run_gocmd(["/a/one.xtc"], "/local/dest")
 
     assert is_retryable_irods_error(str(excinfo.value))
+
+
+# -------------------------------------------------- kill_process_group
+def test_kill_process_group_reaps_grandchildren():
+    """A timeout must not leave gocmd/gmx/blastp running.
+
+    mdr-process shells out to helpers, so killing only the direct child orphans
+    them -- they keep holding CPU and IRODS connections after the queue has moved
+    on. Stands in for that tree with a shell that backgrounds two sleeps.
+    """
+
+    proc = subprocess.Popen(
+        ["sh", "-c", "sleep 60 & sleep 60 & wait"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        time.sleep(1.0)
+        pgid = os.getpgid(proc.pid)
+        assert len(live_group_members(pgid)) >= 3, "tree did not start"
+
+        kill_process_group(proc.pid, lambda _msg: None)
+
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+        assert live_group_members(pgid) == [], "helpers survived the kill"
+    finally:
+        for pid in live_group_members(os.getpgid(proc.pid)) if proc.poll() is None else []:
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_kill_process_group_tolerates_an_already_dead_process():
+    """A process that exits between the timeout and the kill is not an error."""
+
+    proc = subprocess.Popen(["true"], start_new_session=True)
+    proc.wait()
+
+    assert "already" in kill_process_group(proc.pid, lambda _msg: None)
+
+
+def test_live_group_members_excludes_zombies():
+    """Zombies must not count as alive, or the grace period never ends.
+
+    kill(pid, 0) succeeds on a zombie, so a naive liveness check would wait out
+    the full grace and escalate to SIGKILL on every timeout.
+    """
+
+    proc = subprocess.Popen(["true"], start_new_session=True)
+    time.sleep(0.5)  # exited, but not yet reaped -> zombie
+
+    pgid = os.getpgid(proc.pid)
+    assert proc.pid not in live_group_members(pgid)
+
+    proc.wait()
+
+
+# -------------------------------------------------- format_hm
+def test_format_hm_renders_hours_and_minutes():
+    """The success notice reports how long processing took."""
+
+    assert format_hm(timedelta(minutes=35)) == "35m"
+    assert format_hm(timedelta(hours=1)) == "1h 0m"
+    assert format_hm(timedelta(hours=2, minutes=15)) == "2h 15m"
+    assert format_hm(timedelta(hours=12, minutes=34)) == "12h 34m"
+
+    # Real durations arrive as intervals with microseconds, not whole seconds.
+    assert format_hm(timedelta(seconds=1847.259664)) == "30m"
+
+
+def test_format_hm_handles_edges():
+    """Sub-minute reads as "<1m", and an unknown duration is omitted entirely.
+
+    started_at is null only if a job finished without being claimed; the notice
+    then says nothing about timing rather than claiming it took no time.
+    """
+
+    assert format_hm(None) is None
+    assert format_hm(timedelta(0)) == "<1m"
+    assert format_hm(timedelta(seconds=59.9)) == "<1m"
+    assert format_hm(timedelta(seconds=60)) == "1m"
+
+    # Hours accumulate past a day rather than rolling into days.
+    assert format_hm(timedelta(days=1, hours=2, minutes=5)) == "26h 5m"
 
 
 # -------------------------------------------------- fetch_part
