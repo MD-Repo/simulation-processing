@@ -14,25 +14,29 @@ fetch took. Fitting the per-file times against size gives
 
     time ~= 10.2s fixed + size / 24.6 MB/s
 
-i.e. the link is fine; the handshakes are the bill. Two changes follow:
+i.e. the link is fine; the handshakes are the bill. Three changes follow:
 
   1. One "gocmd get" per landing directory, passing every wanted object as a
      source, instead of one per file. 2,257 handshakes -> 200.
   2. Landing directories are fetched concurrently (--threads).
+  3. A batch of landing directories shares a single invocation, passing each
+     as a collection. An extra collection inside an existing call costs ~3s
+     against ~11s to start a new one, so 200 invocations become ~8.
 
-A worker owns a landing directory end to end: it looks the directory up in
-iRODS, reads the manifest, then fetches and verifies the files. Resolving a
-directory costs ~3s of session calls (mostly reading the manifest), so on a
-200-part ticket that is ~10 minutes -- too much to leave on the main thread
-while the workers wait. An iRODSSession cannot be shared across threads, so
-each worker keeps its own for the life of the run (see SessionPool); only
-the ticket directory and ticket.json, which need no iRODS at all, are
-prepared up front.
+A worker owns a batch end to end: it looks each directory up in iRODS, reads
+the manifests, then fetches the whole batch and verifies each directory
+against its own manifest. Resolving a directory costs ~3s of session calls
+(mostly reading the manifest), so on a 200-part ticket that is ~10 minutes --
+too much to leave on the main thread while the workers wait. An iRODSSession
+cannot be shared across threads, so each worker keeps its own for the life of
+the run (see SessionPool); only the ticket directory and ticket.json, which
+need no iRODS at all, are prepared up front.
 """
 
 import argparse
 import humanize
 import json
+import math
 import os
 import psycopg2
 import psycopg2.extras
@@ -140,6 +144,13 @@ SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
 # it is here so that a pathological submission cannot build a command line
 # long enough to hit ARG_MAX.
 MAX_OBJECTS_PER_CALL = 100
+
+# Cap on how many landing directories share one "gocmd get". A batch is
+# all-or-nothing on its first attempt and reports nothing until it finishes,
+# so this trades a little of the saving for progress visibility and blast
+# radius. Measured: one invocation costs ~11s of handshake, each extra
+# collection inside it ~3s.
+MAX_COLLECTIONS_PER_CALL = 25
 
 
 # --------------------------------------------------
@@ -301,13 +312,14 @@ def main() -> None:
         print(f"Nothing to fetch, see '{args.out_dir}'")
         return
 
+    batches = make_batches(refs, args)
     print(
-        f"\nFetching {len(refs)} landing director(ies) "
-        f"using {args.threads} thread(s)"
+        f"\nFetching {len(refs)} landing director(ies) in {len(batches)} "
+        f"batch(es) using {args.threads} thread(s)"
     )
 
-    # Each worker resolves its own part and then fetches it, so the iRODS
-    # lookups for one part overlap the transfers of another. Resolving a
+    # Each worker resolves its own parts and then fetches them, so the iRODS
+    # lookups for one batch overlap the transfers of another. Resolving a
     # part costs ~3s of session calls, which is why it is not left on the
     # main thread: 200 parts would be ~10 minutes of dead time.
     start = datetime.now()
@@ -317,7 +329,8 @@ def main() -> None:
     try:
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
             futures = {
-                pool.submit(process_part, ref, args, sessions): ref for ref in refs
+                pool.submit(process_batch, batch, args, sessions): batch
+                for batch in batches
             }
             for future in as_completed(futures):
                 try:
@@ -449,20 +462,118 @@ def prepare_ticket(ticket: Ticket, args: Args, ticket_num: int) -> List[PartRef]
 
 
 # --------------------------------------------------
-def process_part(ref: PartRef, args: Args, sessions: SessionPool) -> PartResult:
-    """Resolve one part and fetch it
+def make_batches(refs: List[PartRef], args: Args) -> List[List[PartRef]]:
+    """Group parts so that one "gocmd get" can serve several of them
 
-    The whole life of a part on one worker thread, so its iRODS lookups
-    overlap another part's transfers.
+    A gocmd invocation costs ~11s of connect/auth before it moves a byte,
+    while an extra collection inside an existing invocation costs ~3s, so
+    the fewer invocations the better -- up to a point: a batch is
+    all-or-nothing on its first attempt and a long one delays any report of
+    progress.
+
+    Batches never span tickets. gocmd names the local directory after the
+    collection's LAST path component, so two collections sharing a basename
+    land on top of each other; landing directory names are unique within a
+    ticket but nothing guarantees that across tickets.
     """
 
-    part, output = resolve_part(sessions.get(), ref, args)
-    if part is None:
+    by_ticket: dict = {}
+    for ref in refs:
+        by_ticket.setdefault(ref.ticket_id, []).append(ref)
+
+    batches = []
+    for ticket_refs in by_ticket.values():
+        # Aim for one batch per worker, capped so a single failure cannot
+        # take an unbounded amount of work down with it.
+        per_batch = max(1, math.ceil(len(ticket_refs) / max(1, args.threads)))
+        per_batch = min(per_batch, MAX_COLLECTIONS_PER_CALL)
+        batches.extend(chunked(ticket_refs, per_batch))
+
+    return batches
+
+
+# --------------------------------------------------
+def process_batch(
+    batch: List[PartRef], args: Args, sessions: SessionPool
+) -> PartResult:
+    """Resolve a batch of parts and fetch them
+
+    The whole life of these parts on one worker thread, so their iRODS
+    lookups overlap another batch's transfers.
+    """
+
+    session = sessions.get()
+    output: List[str] = []
+    parts: List[Part] = []
+    for ref in batch:
+        part, messages = resolve_part(session, ref, args)
+        output.extend(messages)
+        if part is not None:
+            parts.append(part)
+
+    if not parts:
         return PartResult(output=output, bytes_fetched=0)
 
-    result = fetch_part(part)
+    result = fetch_parts(parts, args)
 
     return PartResult(output=output + result.output, bytes_fetched=result.bytes_fetched)
+
+
+# --------------------------------------------------
+def fetch_parts(parts: List[Part], args: Args) -> PartResult:
+    """Fetch several landing directories, then verify each against its manifest
+
+    One "gocmd get" takes every collection at once, trading N connect
+    handshakes for one. Two cases fall back to fetching each part on its
+    own, naming its objects explicitly:
+
+      - a --pattern is in play, since a collection get cannot filter
+      - two collections in the batch share a basename, which gocmd merges
+        into one local directory (measured: three collections named
+        "original" produced one directory holding 7 of the 15 files)
+
+    Whatever fails verification is retried per part, so one bad landing
+    directory does not condemn the rest of the batch.
+    """
+
+    ticket_dirs = {os.path.dirname(part.dest_dir) for part in parts}
+    names = [os.path.basename(part.dest_dir) for part in parts]
+
+    if args.pattern or len(ticket_dirs) != 1 or len(set(names)) != len(names):
+        output = [f"    fetching {len(parts)} part(s) individually"]
+        total = 0
+        for part in parts:
+            result = fetch_part(part)
+            output.extend(result.output)
+            total += result.bytes_fetched
+        return PartResult(output=output, bytes_fetched=total)
+
+    start = datetime.now()
+    dest = ticket_dirs.pop()
+    size = sum(obj.size for part in parts for obj in part.objects)
+    output = [
+        f"    fetching {len(parts)} landing dir(s), "
+        f"{humanize.naturalsize(size)}, in one gocmd call"
+    ]
+
+    run_gocmd([part.landing_dir for part in parts], dest)
+
+    # Verify each part against its own manifest and re-fetch only the
+    # stragglers; fetch_part re-runs the same verify/retry cycle for one
+    # part, so a partial batch costs one extra invocation per bad part.
+    fetched = 0
+    for part in parts:
+        if any(needs_fetch(part.dest_dir, obj) for obj in part.objects):
+            output.append(
+                f"    {os.path.basename(part.dest_dir)}: unverified, refetching"
+            )
+            result = fetch_part(part)
+            output.extend(result.output)
+        fetched += sum(obj.size for obj in part.objects)
+
+    output.append(f"    batch done in {humanize.precisedelta(datetime.now() - start)}")
+
+    return PartResult(output=output, bytes_fetched=fetched)
 
 
 # --------------------------------------------------

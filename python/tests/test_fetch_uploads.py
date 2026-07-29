@@ -11,6 +11,7 @@ FETCH_LIVE_TEST=1.
 
 import hashlib
 import os
+import re
 import sys
 import pytest
 from pathlib import Path
@@ -291,24 +292,181 @@ def test_resolve_part_rejects_malformed_irods_ticket(tmp_path):
     assert "Invalid IRODS ticket" in "\n".join(output)
 
 
-def test_process_part_skips_fetch_when_unresolvable(tmp_path, monkeypatch):
-    """An unresolvable part is reported, not fetched, and is not an error."""
+def test_process_batch_skips_fetch_when_nothing_resolves(tmp_path, monkeypatch):
+    """Unresolvable parts are reported, not fetched, and are not an error."""
 
     called = []
-    monkeypatch.setattr(fup, "fetch_part", lambda part: called.append(part))
-    ref = fup.PartRef(
-        ticket_id=1728, part_num=3, irods_ticket="bad", ticket_dir=str(tmp_path)
-    )
+    monkeypatch.setattr(fup, "fetch_parts", lambda parts, args: called.append(parts))
+    batch = [
+        fup.PartRef(
+            ticket_id=1728, part_num=n, irods_ticket="bad", ticket_dir=str(tmp_path)
+        )
+        for n in (1, 2)
+    ]
 
     class Pool:
         def get(self):
             return None
 
-    result = fup.process_part(ref, args=None, sessions=Pool())
+    result = fup.process_batch(batch, args=None, sessions=Pool())
 
     assert called == []
     assert result.bytes_fetched == 0
-    assert "Invalid IRODS ticket" in "\n".join(result.output)
+    assert result.output.count("  Ticket 1728 part 1: Invalid IRODS ticket 'bad'") == 1
+
+
+# -------------------------------------------------- batching
+def make_args(threads=8, pattern=None):
+    return fup.Args(
+        out_dir="/out",
+        server="prod",
+        irods_env="/env.json",
+        landing_dirs=[],
+        ticket_ids=[],
+        pattern=pattern,
+        threads=threads,
+    )
+
+
+def make_ref(ticket_id, part_num, ticket_dir="/land/ticket-1"):
+    return fup.PartRef(
+        ticket_id=ticket_id,
+        part_num=part_num,
+        irods_ticket=f"tok:/iplant/landing/L{part_num}",
+        ticket_dir=ticket_dir,
+    )
+
+
+def test_batches_aim_for_one_per_worker():
+    refs = [make_ref(1728, n) for n in range(200)]
+    batches = fup.make_batches(refs, make_args(threads=8))
+
+    assert len(batches) == 8
+    assert sum(len(b) for b in batches) == 200
+    assert max(len(b) for b in batches) == 25
+
+
+def test_batches_are_capped():
+    """A huge ticket on few threads must not become one enormous batch."""
+
+    refs = [make_ref(1728, n) for n in range(300)]
+    batches = fup.make_batches(refs, make_args(threads=2))
+
+    assert max(len(b) for b in batches) == fup.MAX_COLLECTIONS_PER_CALL
+
+
+def test_batches_never_span_tickets():
+    """gocmd names local dirs by basename; only within a ticket are they unique."""
+
+    refs = [make_ref(1728, n, "/land/ticket-1728") for n in range(4)]
+    refs += [make_ref(1729, n, "/land/ticket-1729") for n in range(4)]
+    batches = fup.make_batches(refs, make_args(threads=1))
+
+    for batch in batches:
+        assert len({ref.ticket_id for ref in batch}) == 1
+
+
+# -------------------------------------------------- fetch_parts
+def make_resolved(tmp_path, name, objects, ticket_dir=None):
+    ticket_dir = ticket_dir or str(tmp_path / "ticket-1728")
+    dest = os.path.join(ticket_dir, name)
+    os.makedirs(dest, exist_ok=True)
+    return fup.Part(
+        ticket_id=1728,
+        part_num=1,
+        landing_dir=f"/iplant/landing/{name}",
+        dest_dir=dest,
+        objects=list(objects),
+    )
+
+
+def test_fetch_parts_uses_one_call_for_the_whole_batch(tmp_path, monkeypatch):
+    parts = []
+    for name in ("L1", "L2", "L3"):
+        obj = make_object(tmp_path, f"{name}.xtc", b"data")
+        parts.append(make_resolved(tmp_path, name, [obj]))
+
+    calls = []
+
+    def fake_gocmd(paths, dest):
+        calls.append((list(paths), dest))
+        for part in parts:
+            Path(part.dest_dir, f"{os.path.basename(part.dest_dir)}.xtc").write_bytes(
+                b"data"
+            )
+
+    monkeypatch.setattr(fup, "run_gocmd", fake_gocmd)
+    result = fup.fetch_parts(parts, make_args())
+
+    assert len(calls) == 1, "three landing dirs should cost one gocmd call"
+    assert calls[0][0] == [p.landing_dir for p in parts]
+    assert result.bytes_fetched == 12
+
+
+def test_fetch_parts_falls_back_when_basenames_collide(tmp_path, monkeypatch):
+    """gocmd merges same-named collections; 15 files became 7 when measured."""
+
+    obj = make_object(tmp_path, "a.xtc", b"data")
+    parts = [
+        make_resolved(tmp_path, "same", [obj], str(tmp_path / "t1")),
+        make_resolved(tmp_path, "same", [obj], str(tmp_path / "t2")),
+    ]
+    per_part = []
+    monkeypatch.setattr(
+        fup,
+        "fetch_part",
+        lambda part: per_part.append(part)
+        or fup.PartResult(output=[], bytes_fetched=4),
+    )
+    monkeypatch.setattr(
+        fup, "run_gocmd", lambda *a: pytest.fail("must not batch colliding names")
+    )
+
+    result = fup.fetch_parts(parts, make_args())
+
+    assert len(per_part) == 2
+    assert result.bytes_fetched == 8
+
+
+def test_fetch_parts_falls_back_with_a_pattern(tmp_path, monkeypatch):
+    """A collection get cannot filter, so --pattern must name objects."""
+
+    obj = make_object(tmp_path, "a.xtc", b"data")
+    parts = [make_resolved(tmp_path, "L1", [obj])]
+    monkeypatch.setattr(
+        fup, "fetch_part", lambda part: fup.PartResult(output=[], bytes_fetched=4)
+    )
+    monkeypatch.setattr(
+        fup, "run_gocmd", lambda *a: pytest.fail("must not batch with a pattern")
+    )
+
+    fup.fetch_parts(parts, make_args(pattern=re.compile(r"\.xtc$")))
+
+
+def test_fetch_parts_refetches_only_the_unverified_part(tmp_path, monkeypatch):
+    """One bad landing dir must not condemn the rest of the batch."""
+
+    parts = []
+    for name in ("good", "bad"):
+        obj = make_object(tmp_path, f"{name}.xtc", b"data")
+        parts.append(make_resolved(tmp_path, name, [obj]))
+
+    def fake_gocmd(paths, dest):
+        # Only "good" lands correctly; "bad" arrives corrupt.
+        Path(parts[0].dest_dir, "good.xtc").write_bytes(b"data")
+        Path(parts[1].dest_dir, "bad.xtc").write_bytes(b"XXXX")
+
+    retried = []
+    monkeypatch.setattr(fup, "run_gocmd", fake_gocmd)
+    monkeypatch.setattr(
+        fup,
+        "fetch_part",
+        lambda part: retried.append(part) or fup.PartResult(output=[], bytes_fetched=4),
+    )
+
+    fup.fetch_parts(parts, make_args())
+
+    assert [p.dest_dir for p in retried] == [parts[1].dest_dir]
 
 
 # -------------------------------------------------- live
