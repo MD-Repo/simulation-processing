@@ -13,7 +13,6 @@ import psycopg2
 import psycopg2.extras
 import ssl
 import sys
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from irods.session import iRODSSession
 from typing import List, NamedTuple, Optional
@@ -21,18 +20,7 @@ from typing import List, NamedTuple, Optional
 from common import FRONTEND_BASE_URLS, send_slack_message
 
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
-MAX_DAYS_OLD = 7
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
-
-# Tables with a FK to md_ticket, per the Django models (Simulation,
-# SimulationUploadInstance, ProcessJob). Postgres reports only the first
-# constraint a delete violates, so all of them have to be checked to decide
-# whether a ticket is really unreferenced. Keep in sync with the models.
-TICKET_REFERENCES = (
-    ("md_simulation", "md_repo_ticket_id", "simulation"),
-    ("md_upload_instance", "ticket_id", "upload instance"),
-    ("md_process_job", "ticket_id", "process job"),
-)
 
 
 class Args(NamedTuple):
@@ -41,7 +29,6 @@ class Args(NamedTuple):
     landing_id: Optional[str]
     server: str
     dry_run: bool
-    reap: bool
     verbose: bool
 
 
@@ -73,14 +60,6 @@ def get_args() -> Args:
         action="store_true",
     )
 
-    parser.add_argument(
-        "--reap",
-        help="Delete abandoned tickets and their IRODS collections "
-        f"(incomplete and >= {MAX_DAYS_OLD} days old). Off by default: the "
-        "deletion is irreversible, so a routine scan never performs it",
-        action="store_true",
-    )
-
     parser.add_argument("--verbose", help="Verbose", action="store_true")
 
     args = parser.parse_args()
@@ -89,7 +68,6 @@ def get_args() -> Args:
         landing_id=args.landing_id,
         server=args.server,
         dry_run=args.dry_run,
-        reap=args.reap,
         verbose=args.verbose or args.dry_run,
     )
 
@@ -151,7 +129,6 @@ def main() -> None:
                     args.server,
                     base_url,
                     args.dry_run,
-                    args.reap,
                     status,
                 )
             except Exception as e:
@@ -194,26 +171,6 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
 
 
 # --------------------------------------------------
-def ticket_dependents(cur, ticket_id: int) -> str:
-    """Describe rows referencing this ticket, or "" if it is unreferenced
-
-    Deleting a ticket here is raw SQL, so it gets none of the on_delete
-    behaviour the Django models declare -- that is emulated by the ORM, not by
-    the database (the constraints carry no ON DELETE clause). A raw delete of a
-    referenced ticket therefore just raises ForeignKeyViolation.
-    """
-
-    counts = []
-    for table, col, label in TICKET_REFERENCES:
-        cur.execute(f"select count(*) from {table} where {col} = %s", (ticket_id,))
-        n = cur.fetchone()[0]
-        if n:
-            counts.append(f"{n} {label}{'s' if n > 1 else ''}")
-
-    return ", ".join(counts)
-
-
-# --------------------------------------------------
 def process_ticket(
     cur,
     session,
@@ -221,14 +178,9 @@ def process_ticket(
     server: str,
     base_url: str,
     dry_run: bool,
-    reap: bool,
     status,
 ) -> None:
     """Check a single ticket's IRODS collections and act on its status"""
-
-    created = ticket["created_at"]
-    now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now(timezone.utc)
-    days_old = (now - created).days
 
     upload_complete = []
     landing_dirs: List[str] = []
@@ -296,41 +248,6 @@ def process_ticket(
                 (ticket["id"], server),
             )
             status(f"Enqueued mdr-process job for ticket {ticket['id']}")
-
-    if not is_complete and days_old >= MAX_DAYS_OLD:
-        # The reap is for abandoned uploads. A ticket with rows hanging off it
-        # produced real data despite never getting its completion marker, so it
-        # isn't abandoned -- leave it (and its IRODS collections) alone.
-        dependents = ticket_dependents(cur, ticket["id"])
-        if dependents:
-            status(
-                f"Ticket {ticket['id']} is {days_old} days old and incomplete "
-                f"but has {dependents}: SKIP (not abandoned)"
-            )
-        elif not reap:
-            # Age alone is a poor abandonment signal: a large bulk submission
-            # still in flight looks exactly like an abandoned one, and the
-            # deletion takes the IRODS collections with it. Report and move on
-            # unless deletion was asked for explicitly.
-            status(
-                f"Ticket {ticket['id']} is {days_old} days old and incomplete: "
-                "SKIP (pass --reap to delete)"
-            )
-        elif dry_run:
-            status(
-                f"DRY RUN: ticket {ticket['id']} is {days_old} days old and "
-                "incomplete: would DELETE"
-            )
-        else:
-            status(
-                f"Ticket {ticket['id']} is {days_old} days old and incomplete: DELETE"
-            )
-            # Resolved here rather than during the scan above: the probe no
-            # longer fetches collection objects, and the reap is rare.
-            for landing_dir in landing_dirs:
-                if session.collections.exists(landing_dir):
-                    session.collections.get(landing_dir).remove()
-            cur.execute("delete from md_ticket where id = %s", (ticket["id"],))
 
 
 # --------------------------------------------------
