@@ -182,33 +182,40 @@ def process_ticket(
 ) -> None:
     """Check a single ticket's IRODS collections and act on its status"""
 
-    upload_complete = []
     landing_dirs: List[str] = []
+    missing_marker = False
 
     irods_tickets = ticket["irods_tickets"]
     if irods_tickets:
         for irods_ticket in irods_tickets.split(";"):
             matches = TICKET_RE.search(irods_ticket)
-            if matches:
-                _landing_id, landing_dir = matches.groups()
-                landing_dirs.append(landing_dir)
-
-                # Probe for the one marker file rather than listing the
-                # collection. Listing pulled metadata for every object just to
-                # test one name, at three round trips per landing; this is one.
-                # A missing collection makes the probe False, same as before.
-                # Measured on prod: 0.78s -> 0.135s per landing, and the scan
-                # walks >12,000 of them per pass.
-                upload_complete.append(
-                    session.data_objects.exists(
-                        f"{landing_dir}/{SUBMISSION_COMPLETE}"
-                    )
-                )
-            else:
+            if not matches:
                 status(f"Unknown IRODS ticket format: {irods_ticket}")
+                continue
 
-    # all([]) == True !
-    is_complete = bool(upload_complete) and all(upload_complete)
+            _landing_id, landing_dir = matches.groups()
+            landing_dirs.append(landing_dir)
+
+            # Probe for the one marker file rather than listing the
+            # collection. Listing pulled metadata for every object just to
+            # test one name, at three round trips per landing; this is one.
+            # A missing collection makes the probe False, same as before.
+            # Measured on prod: 0.78s -> 0.135s per landing, and the scan
+            # walks >12,000 of them per pass.
+            if not session.data_objects.exists(
+                f"{landing_dir}/{SUBMISSION_COMPLETE}"
+            ):
+                # One missing marker already settles the ticket, so stop
+                # probing: an incomplete 200-landing ticket costs 1 probe
+                # instead of 200. Nothing is lost by not finishing -- the
+                # ticket stays unnotified and is re-scanned every pass until
+                # it completes, and "landing_dirs" is only read below on the
+                # complete path.
+                missing_marker = True
+                break
+
+    # An empty ticket is not complete: all([]) would have said it was.
+    is_complete = bool(landing_dirs) and not missing_marker
 
     if is_complete:
         num_simulations = len(landing_dirs)
