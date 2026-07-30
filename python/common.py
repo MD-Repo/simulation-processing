@@ -33,5 +33,16 @@ def send_slack_message(
             timeout=10,
         )
         resp.raise_for_status()
+
+        # Slack answers 200 with {"ok": false} for a rejected post -- a renamed
+        # or archived channel, the bot removed from it, a rotated token. Status
+        # alone therefore reports success for a message nobody received, which
+        # would silently disable every alert here. Raise into the handler below
+        # so it prints like any other send failure.
+        body = resp.json()
+        if not body.get("ok"):
+            raise RuntimeError(
+                f"Slack rejected the post: {body.get('error', 'unknown')}"
+            )
     except Exception as e:
         print(f'Unable to send Slack message "{message}": {e}')
