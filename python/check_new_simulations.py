@@ -77,7 +77,12 @@ def main() -> None:
     """Make a jazz noise here"""
 
     args = get_args()
-    load_dotenv()
+    # Name the .env beside this file rather than leaning on bare load_dotenv(),
+    # which resolves from the *calling file* (find_dotenv defaults to
+    # usecwd=False) and therefore already works from any cwd. This changes no
+    # behavior today; it stops that subtlety from being load-bearing when the
+    # cron line drops its "cd", and matches purge_processed_landings.py.
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
     def status(msg: str) -> None:
         if args.verbose:

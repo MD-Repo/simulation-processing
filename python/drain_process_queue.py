@@ -38,6 +38,12 @@ PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
 KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
 ERROR_LINES = 20  # tail of mdr-process output to include in a failure notice
 MAX_RETRY_ATTEMPTS = 5  # requeue this many times before treating it as terminal
+# Per-ticket mdr-process logs, under <root>/<server>. Absolute and outside the
+# repo: these used to default to a relative "logs", which meant the right thing
+# only while the cron line still had a "cd" in front of it, and which put ~160
+# MB of debug log inside the *public* simulation-processing checkout. A run
+# started from anywhere now lands in the same place.
+TICKET_LOG_ROOT = "/opt/mdrepo/logs/tickets"
 
 
 class Args(NamedTuple):
@@ -71,9 +77,10 @@ def get_args() -> Args:
 
     parser.add_argument(
         "--log-dir",
-        help="Directory for mdr-process logs",
+        help=f"Directory for mdr-process logs "
+        f"(default: {TICKET_LOG_ROOT}/<server>)",
         metavar="DIR",
-        default="logs",
+        default=None,
     )
 
     parser.add_argument(
@@ -107,9 +114,13 @@ def get_args() -> Args:
         os.environ.get("TMPDIR", "/tmp"), f"drain_process_queue-{args.server}.lock"
     )
 
+    # Server-scoped, mirroring lock_file above: prod and staging ticket logs
+    # would otherwise collide in one directory. run_job creates it if missing.
+    log_dir = args.log_dir or os.path.join(TICKET_LOG_ROOT, args.server)
+
     return Args(
         server=args.server,
-        log_dir=args.log_dir,
+        log_dir=log_dir,
         lock_file=lock_file,
         max_jobs=args.max_jobs,
         dry_run=args.dry_run,
@@ -176,12 +187,19 @@ def main() -> None:
 
 # --------------------------------------------------
 def load_env() -> None:
-    """Load .env (optional dependency, mirrors check_new_simulations.py)"""
+    """Load .env (optional dependency, mirrors check_new_simulations.py)
+
+    Names the .env beside this file rather than leaning on bare load_dotenv(),
+    which resolves from the *calling file* (find_dotenv defaults to
+    usecwd=False) and therefore already works from any cwd. This changes no
+    behavior today; it stops that subtlety from being load-bearing when the
+    cron line drops its "cd", and matches purge_processed_landings.py.
+    """
 
     try:
         from dotenv import load_dotenv
 
-        load_dotenv()
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     except ImportError:
         pass
 
@@ -238,9 +256,23 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
     server = job["server"]
 
     os.makedirs(log_dir, exist_ok=True)
-    # Include the server: ticket IDs are per-database, so prod and staging can
-    # share a ticket id and would otherwise clobber each other's log.
-    log_file = os.path.join(log_dir, f"ticket-{ticket_id}-{server}.log")
+    # No server in the filename: log_dir is already TICKET_LOG_ROOT/<server>, so
+    # the directory is what keeps prod and staging apart. Ticket IDs are
+    # per-database and can collide across servers, which is why that separation
+    # has to exist somewhere -- it just does not need to be in both places.
+    log_file = os.path.join(log_dir, f"ticket-{ticket_id}.log")
+
+    # Record the path now, not in the terminal update. The column existed from
+    # the start but nothing ever wrote it, so every row read null and the log
+    # could only be found by reconstructing the path by hand -- which stopped
+    # working the moment these files moved. Writing it here means a job KILLED
+    # at PROCESS_TIMEOUT, or one that dies before finish_failure runs, still
+    # says where its log is; the terminal updates would leave exactly those
+    # rows blank.
+    cur.execute(
+        "update md_process_job set log_file = %s where id = %s",
+        (log_file, job["id"]),
+    )
 
     # "-l debug" writes the log to --log-file, leaving the failure on stderr
     cmd = [

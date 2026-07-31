@@ -677,11 +677,12 @@ def main() -> None:
     """Make a jazz noise here"""
 
     args = get_args()
-    # Beside this file, not relative to the cwd: bare load_dotenv() searches
-    # upward from wherever it was invoked, so under cron (cwd = $HOME) it finds
-    # nothing and the run dies on a missing DSN. Absolute here means the cron
-    # line needs no "cd", and with no "cd" there is nothing that can fail
-    # before the redirect binds and get mailed into the void.
+    # Name the .env beside this file rather than leaning on bare load_dotenv().
+    # Not because the cwd would break it -- find_dotenv() defaults to
+    # usecwd=False and walks up from the *calling file*, so a bare call already
+    # resolves here from any cwd. It falls back to the cwd only in a REPL,
+    # under a debugger, or in a frozen build. Being explicit just keeps that
+    # subtlety from being load-bearing when the cron line drops its "cd".
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
     # Bail if another run for this server is already going. Taken for dry runs
