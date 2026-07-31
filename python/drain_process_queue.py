@@ -32,18 +32,12 @@ import time
 from datetime import timedelta
 from typing import NamedTuple, Optional
 
-from common import FRONTEND_BASE_URLS, send_slack_message, stamp
+from common import FRONTEND_BASE_URLS, TICKET_LOG_ROOT, send_slack_message, stamp
 
 PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
 KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
 ERROR_LINES = 20  # tail of mdr-process output to include in a failure notice
 MAX_RETRY_ATTEMPTS = 5  # requeue this many times before treating it as terminal
-# Per-ticket mdr-process logs, under <root>/<server>. Absolute and outside the
-# repo: these used to default to a relative "logs", which meant the right thing
-# only while the cron line still had a "cd" in front of it, and which put ~160
-# MB of debug log inside the *public* simulation-processing checkout. A run
-# started from anywhere now lands in the same place.
-TICKET_LOG_ROOT = "/opt/mdrepo/logs/tickets"
 
 
 class Args(NamedTuple):

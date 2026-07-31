@@ -10,6 +10,17 @@ FRONTEND_BASE_URLS = {
     "prod": "https://mdrepo.org",
 }
 
+# Per-ticket mdr-process logs, under <root>/<server>. Absolute and outside the
+# repo: these used to default to a relative "logs", which meant the right thing
+# only while the cron line still had a "cd" in front of it, and which put ~165
+# MB of debug log inside the *public* simulation-processing checkout.
+#
+# Shared here rather than owned by the drain, because prune_ticket_logs.py has
+# to agree with it exactly -- it deletes from this directory, so a second
+# definition that drifted would either miss the files or point somewhere it
+# has no business deleting from.
+TICKET_LOG_ROOT = "/opt/mdrepo/logs/tickets"
+
 
 # --------------------------------------------------
 def stamp() -> str:
