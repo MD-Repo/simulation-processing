@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from irods.session import iRODSSession
 from typing import List, NamedTuple, Optional
 
-from common import FRONTEND_BASE_URLS, send_slack_message
+from common import FRONTEND_BASE_URLS, send_slack_message, stamp
 
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
@@ -86,7 +86,7 @@ def main() -> None:
 
     def status(msg: str) -> None:
         if args.verbose:
-            print(msg)
+            print(f"{stamp()} {msg}", flush=True)
 
     if args.dry_run:
         status("DRY RUN: no changes will be made")

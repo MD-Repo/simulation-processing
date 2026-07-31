@@ -32,7 +32,7 @@ import time
 from datetime import timedelta
 from typing import NamedTuple, Optional
 
-from common import FRONTEND_BASE_URLS, send_slack_message
+from common import FRONTEND_BASE_URLS, send_slack_message, stamp
 
 PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
 KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
@@ -137,7 +137,7 @@ def main() -> None:
 
     def status(msg: str) -> None:
         if args.verbose:
-            print(msg)
+            print(f"{stamp()} {msg}", flush=True)
 
     if args.dry_run:
         status("DRY RUN: no jobs will be claimed or run")
@@ -173,7 +173,14 @@ def main() -> None:
     while args.max_jobs is None or processed < args.max_jobs:
         job = claim_job(cur, args.server)
         if job is None:
-            status("No more pending jobs")
+            # Only worth saying if this tick had already done something. This
+            # runs every minute and the queue is empty most of them, so an
+            # unconditional line here is ~1,440 a day reporting that nothing
+            # happened -- the same noise the purge avoids by only notifying on
+            # a run that did something, and cron_notify by staying silent on
+            # success. A log nobody reads fails at the one job it has.
+            if processed:
+                status("No more pending jobs")
             break
 
         keep_draining = run_job(cur, job, base_url, args.log_dir, status)
@@ -182,7 +189,10 @@ def main() -> None:
             status("Job requeued for retry; stopping this drain tick")
             break
 
-    status(f"FINISHED drain_process_queue ({processed} job(s))")
+    # Same reasoning: an idle tick leaves the log untouched, so what is in it
+    # is always a job that actually ran.
+    if processed:
+        status(f"FINISHED drain_process_queue ({processed} job(s))")
 
 
 # --------------------------------------------------

@@ -57,7 +57,7 @@ from dotenv import load_dotenv
 from irods.exception import NetworkException
 from irods.session import iRODSSession
 
-from common import FRONTEND_BASE_URLS, send_slack_message
+from common import FRONTEND_BASE_URLS, send_slack_message, stamp
 
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 # Where push_sim_files.py puts the permanent copy. local_file_path in the file
@@ -261,6 +261,25 @@ def get_args() -> Args:
         verify_only=args.verify_only,
         skip_verify=args.skip_verify,
     )
+
+
+# --------------------------------------------------
+def say(msg: str) -> None:
+    """Print one timestamped line
+
+    Nearly every line here is an event with a duration attached: a removal
+    that took 40 seconds, a per-ticket verify, a pass that ran for hours.
+    Without a clock in the file the only way to recover a rate is to count
+    lines and compare against the file's mtime, which is exactly what had to
+    be done to work out what the 2026-07-31 run managed before it died.
+
+    Indented detail lines and the end-of-run summary deliberately do not go
+    through this: the first are continuations of the line above, and the
+    second all print within the same instant, so stamping each would add
+    noise rather than information.
+    """
+
+    print(f"{stamp()} {msg}", flush=True)
 
 
 # --------------------------------------------------
@@ -601,8 +620,8 @@ def purge_ticket(sessions: SessionPool, cand: Candidate, args: Args) -> Dict[str
             done += 1
             if args.delete and result["present"]:
                 note = " STALLED" if result["stalled"] else ""
-                print(f"    [{cand.ticket_id}] {done}/{total} "
-                      f"{landing_dir.rsplit('/', 1)[-1]}{note}", flush=True)
+                say(f"    [{cand.ticket_id}] {done}/{total} "
+                    f"{landing_dir.rsplit('/', 1)[-1]}{note}")
 
         return result
 
@@ -664,7 +683,7 @@ def notify(args: Args, message: str) -> None:
     one thing a failure alert cannot afford.
     """
 
-    print(message, flush=True)
+    say(message)
 
     if not args.delete or args.verify_only:
         return
@@ -691,7 +710,7 @@ def main() -> None:
     # round trips to a remote catalog.
     lock_fd = acquire_lock(args.lock_file)
     if lock_fd is None:
-        print(f"Another run holds {args.lock_file}, exiting")
+        say(f"Another run holds {args.lock_file}, exiting")
         sys.exit(0)
 
     env_key = "PRODUCTION_DSN" if args.server == "prod" else "STAGING_DSN"
@@ -708,7 +727,7 @@ def main() -> None:
     candidates = find_candidates(cur, args)
 
     if not candidates:
-        print("No tickets are eligible")
+        say("No tickets are eligible")
         sys.exit(0)
 
     if args.limit:
@@ -722,9 +741,9 @@ def main() -> None:
         mode = "DRY RUN (pass --delete to remove)"
 
     trash = "" if args.force or args.verify_only else " to trash"
-    print(f"{mode}{trash if args.delete else ''}: "
-          f"{len(candidates)} eligible ticket(s) on {args.server}, "
-          f"{args.threads} thread(s)\n", flush=True)
+    say(f"{mode}{trash if args.delete else ''}: "
+        f"{len(candidates)} eligible ticket(s) on {args.server}, "
+        f"{args.threads} thread(s)\n")
 
     totals = {"present": 0, "freed": 0, "removed": 0, "stalled": 0,
               "tickets": 0, "skipped": 0, "unverified": 0, "verified": 0,
@@ -744,8 +763,8 @@ def main() -> None:
                 problems, unchecked = verify_permanent(cur, sessions, cand, args)
                 if problems:
                     totals["unverified"] += 1
-                    print(f"ticket {cand.ticket_id}: NOT VERIFIED, refusing to "
-                          f"delete ({len(problems)} problem(s))", flush=True)
+                    say(f"ticket {cand.ticket_id}: NOT VERIFIED, refusing to "
+                        f"delete ({len(problems)} problem(s))")
                     for p in problems[:5]:
                         print(f"    {p}", flush=True)
                     if len(problems) > 5:
@@ -758,9 +777,9 @@ def main() -> None:
                     # one such probe killed the 2026-07-31 pass 20 tickets in.
                     # The ticket stays eligible, so the next pass retries it.
                     totals["unchecked"] += 1
-                    print(f"ticket {cand.ticket_id}: NOT CHECKED, skipping "
-                          f"({len(unchecked)} file(s) unreachable after "
-                          f"{PROBE_ATTEMPTS} attempts)", flush=True)
+                    say(f"ticket {cand.ticket_id}: NOT CHECKED, skipping "
+                        f"({len(unchecked)} file(s) unreachable after "
+                        f"{PROBE_ATTEMPTS} attempts)")
                     for u in unchecked[:5]:
                         print(f"    {u}", flush=True)
                     if len(unchecked) > 5:
@@ -770,13 +789,13 @@ def main() -> None:
                 totals["verified"] += 1
 
             if args.verify_only:
-                print(f"ticket {cand.ticket_id}: verified", flush=True)
+                say(f"ticket {cand.ticket_id}: verified")
                 continue
 
             result = purge_ticket(sessions, cand, args)
 
             if not result["present"]:
-                print(f"ticket {cand.ticket_id}: landings already gone", flush=True)
+                say(f"ticket {cand.ticket_id}: landings already gone")
                 continue
 
             totals["present"] += result["present"]
@@ -789,7 +808,7 @@ def main() -> None:
             note = "" if cand.has_job else "  [no process job -- pre-queue]"
             if result["stalled"]:
                 note += f"  [{result['stalled']} STALLED, re-run to retry]"
-            print(
+            say(
                 f"ticket {cand.ticket_id}: {cand.num_sims} sims, "
                 f"{verb} {result['present']} of {len(cand.landing_dirs)} "
                 f"landing(s), {human(result['freed'])}{note}"

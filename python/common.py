@@ -1,6 +1,7 @@
 """Shared helpers for the simulation-processing scanner and queue worker."""
 
 import os
+from datetime import datetime, timezone
 
 import requests
 
@@ -8,6 +9,26 @@ FRONTEND_BASE_URLS = {
     "staging": "https://staging.mdrepo.org",
     "prod": "https://mdrepo.org",
 }
+
+
+# --------------------------------------------------
+def stamp() -> str:
+    """UTC timestamp for a log line
+
+    A cron log with no clock in it cannot answer the first question anyone
+    asks of it -- when did this happen, and how long did it take. A scanner
+    pass takes tens of seconds and runs every 5 minutes, so without this there
+    is no telling a slow pass from a stuck one.
+
+    The format matches what mdr-process writes into the per-ticket logs, so a
+    ticket's own log and the drain line that started it read the same way.
+
+    UTC, not local: everything else here (Postgres timestamps, IRODS, the
+    mdr-process logs) is UTC, and a log that mixes the two is worse than one
+    that picks the less friendly zone.
+    """
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --------------------------------------------------
