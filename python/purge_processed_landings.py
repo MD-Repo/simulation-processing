@@ -45,10 +45,11 @@ import signal
 import ssl
 import sys
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
@@ -65,6 +66,13 @@ RELEASE_ROOT = "/iplant/home/shared/mdrepo/{server}/release"
 # Removing one landing normally takes seconds; an IRODS call has blocked here
 # for over half an hour under load. Bound it so one stall cannot wedge a run.
 REMOVE_TIMEOUT = 300  # seconds
+# A read probe that gets no answer is transient far more often than not: the
+# 2026-07-31 cron pass died on one, 20 tickets in, having removed 3,833
+# collections. Ride out a blip rather than losing the run. Kept small on
+# purpose -- this is not meant to wait out an outage, which should stop the
+# run and leave the remaining tickets for the next pass.
+PROBE_ATTEMPTS = 3
+PROBE_BACKOFF = 2  # seconds, multiplied by the attempt just failed
 
 
 class Args(NamedTuple):
@@ -363,6 +371,28 @@ class SessionPool:
 
         return session
 
+    def discard(self) -> None:
+        """Drop this thread's session so the next get() builds a fresh one
+
+        A session that has just raised on the wire may be holding a dead
+        connection, and it is cached for the life of the run -- so without
+        this, one network blip can poison every later call on that thread.
+        """
+
+        session = getattr(self._local, "session", None)
+        if session is None:
+            return
+
+        self._local.session = None
+        with self._lock:
+            if session in self._sessions:
+                self._sessions.remove(session)
+
+        try:
+            session.cleanup()
+        except Exception:
+            pass
+
     def close(self) -> None:
         with self._lock:
             for session in self._sessions:
@@ -371,6 +401,26 @@ class SessionPool:
                 except Exception:
                     pass
             self._sessions = []
+
+
+# --------------------------------------------------
+def probe(sessions: SessionPool, func: Callable, *args):
+    """Run one IRODS read probe, riding out a transient network error
+
+    Re-raises the last error once the attempts are spent rather than returning
+    a default, because the right reading of an unanswered probe depends on the
+    caller and none of them may treat it as good news: under --force, taking
+    "could not check" for "verified" deletes the only other copy of the data.
+    """
+
+    for attempt in range(1, PROBE_ATTEMPTS + 1):
+        try:
+            return func(sessions.get(), *args)
+        except (TimeoutError, NetworkException):
+            sessions.discard()
+            if attempt == PROBE_ATTEMPTS:
+                raise
+            time.sleep(PROBE_BACKOFF * attempt)
 
 
 # --------------------------------------------------
@@ -409,7 +459,7 @@ def remove_landing(sessions: SessionPool, landing_dir: str, args: Args) -> Dict:
 # --------------------------------------------------
 def verify_permanent(
     cur, sessions: SessionPool, cand: Candidate, args: Args
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     """Check this ticket's permanent copies exist before deleting the landings
 
     Eligibility is a Postgres fact -- is_placeholder = false, which mdr-process
@@ -425,6 +475,13 @@ def verify_permanent(
     unverified. --verify-files raises that (0 checks every file). A sample
     catches a ticket that never pushed or a release collection that has gone
     missing; it will not catch one absent file among thousands.
+
+    Returns (problems, unchecked), which the caller must keep apart. A problem
+    is an answer from IRODS that the data is wrong or gone -- the safety net
+    firing. An unchecked file is no answer at all, which is evidence about the
+    network and none whatsoever about the data. Reporting the second as the
+    first cries wolf on a healthy ticket; treating it as verified deletes on a
+    guess.
     """
 
     cur.execute(
@@ -450,7 +507,7 @@ def verify_permanent(
 
     if not by_sim:
         # Eligible, but nothing to verify against: refuse rather than guess.
-        return [f"ticket {cand.ticket_id}: no file rows, cannot verify"]
+        return ([f"ticket {cand.ticket_id}: no file rows, cannot verify"], [])
 
     sample = []
     for files in by_sim.values():
@@ -461,10 +518,7 @@ def verify_permanent(
 
     root = RELEASE_ROOT.format(server=args.server)
 
-    def check(item) -> Optional[str]:
-        path, size = item
-        remote = f"{root}/{path}"
-        session = sessions.get()
+    def look(session, remote: str, size: Optional[int]) -> Optional[str]:
         if not session.data_objects.exists(remote):
             return f"MISSING {remote}"
         if size is not None:
@@ -473,13 +527,28 @@ def verify_permanent(
                 return f"SIZE {remote} want={size} got={actual}"
         return None
 
+    def check(item) -> Optional[Tuple[str, str]]:
+        path, size = item
+        remote = f"{root}/{path}"
+
+        try:
+            problem = probe(sessions, look, remote, size)
+        except (TimeoutError, NetworkException) as e:
+            return ("unchecked",
+                    f"UNREACHABLE {remote}: {type(e).__name__}: {e}")
+
+        return ("problem", problem) if problem else None
+
     if args.threads == 1:
         results = [check(i) for i in sample]
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
             results = list(pool.map(check, sample))
 
-    return [r for r in results if r]
+    found = [r for r in results if r]
+
+    return ([m for kind, m in found if kind == "problem"],
+            [m for kind, m in found if kind == "unchecked"])
 
 
 # --------------------------------------------------
@@ -494,12 +563,21 @@ def already_purged(sessions: SessionPool, cand: Candidate) -> bool:
     interrupted run leaves a purged prefix and a present tail. Testing only the
     first would skip that tail permanently. A collection stranded in the middle
     by a stall is still possible, hence --full-scan.
+
+    An unanswered probe reads as "not purged", which costs a verify pass that
+    will meet the same outage and skip the ticket properly. The other way round
+    would quietly drop a ticket from the run on a network blip.
     """
 
-    session = sessions.get()
     ends = {cand.landing_dirs[0], cand.landing_dirs[-1]}
 
-    return not any(session.collections.exists(d) for d in ends)
+    try:
+        return not any(
+            probe(sessions, lambda s, d: s.collections.exists(d), d)
+            for d in ends
+        )
+    except (TimeoutError, NetworkException):
+        return False
 
 
 # --------------------------------------------------
@@ -648,7 +726,8 @@ def main() -> None:
           f"{args.threads} thread(s)\n", flush=True)
 
     totals = {"present": 0, "freed": 0, "removed": 0, "stalled": 0,
-              "tickets": 0, "skipped": 0, "unverified": 0, "verified": 0}
+              "tickets": 0, "skipped": 0, "unverified": 0, "verified": 0,
+              "unchecked": 0}
     sessions = SessionPool(args.irods_env, REMOVE_TIMEOUT)
 
     try:
@@ -661,7 +740,7 @@ def main() -> None:
             # up front: a ticket can become eligible mid-pass and would then be
             # deleted having never been checked, which --force makes permanent.
             if not args.skip_verify:
-                problems = verify_permanent(cur, sessions, cand, args)
+                problems, unchecked = verify_permanent(cur, sessions, cand, args)
                 if problems:
                     totals["unverified"] += 1
                     print(f"ticket {cand.ticket_id}: NOT VERIFIED, refusing to "
@@ -671,6 +750,22 @@ def main() -> None:
                     if len(problems) > 5:
                         print(f"    ... and {len(problems) - 5} more", flush=True)
                     continue
+
+                if unchecked:
+                    # IRODS did not answer, which says nothing about the data.
+                    # Skip this ticket and carry on rather than abort the run:
+                    # one such probe killed the 2026-07-31 pass 20 tickets in.
+                    # The ticket stays eligible, so the next pass retries it.
+                    totals["unchecked"] += 1
+                    print(f"ticket {cand.ticket_id}: NOT CHECKED, skipping "
+                          f"({len(unchecked)} file(s) unreachable after "
+                          f"{PROBE_ATTEMPTS} attempts)", flush=True)
+                    for u in unchecked[:5]:
+                        print(f"    {u}", flush=True)
+                    if len(unchecked) > 5:
+                        print(f"    ... and {len(unchecked) - 5} more", flush=True)
+                    continue
+
                 totals["verified"] += 1
 
             if args.verify_only:
@@ -723,6 +818,15 @@ def main() -> None:
         print(f"Verified {totals['verified']} ticket(s) against permanent "
               f"storage first")
 
+    if totals["unchecked"]:
+        # Deliberately not a non-zero exit, unlike a refusal. This is the
+        # transient case and it self-heals on the next pass, the Slack summary
+        # already carries it, and the exit code is nobody's signal here -- if
+        # this job is ever wrapped in cron_notify.py, exiting 1 would just
+        # duplicate an alert the script has already sent.
+        print(f"Skipped {totals['unchecked']} ticket(s) IRODS did not answer "
+              f"for; they stay eligible and the next run retries them")
+
     if totals["unverified"]:
         # Non-zero exit, and say it out loud: this is the safety net firing.
         notify(args, f"Landing purge ({args.server}): REFUSED "
@@ -733,14 +837,19 @@ def main() -> None:
         sys.exit(1)
 
     # Only report a run that did something. A nightly "nothing to do" would
-    # train the channel to be ignored.
-    if totals["removed"] or totals["stalled"]:
+    # train the channel to be ignored. An unreachable ticket counts as
+    # something: it is the one outcome where the run looks clean and silently
+    # did less than it was asked to.
+    if totals["removed"] or totals["stalled"] or totals["unchecked"]:
         summary = (f"Landing purge ({args.server}): removed "
                    f"{totals['removed']} landing collection(s) across "
                    f"{totals['tickets']} ticket(s), {human(totals['freed'])}")
         if totals["stalled"]:
             summary += (f"; {totals['stalled']} collection(s) stalled past "
                         f"{REMOVE_TIMEOUT}s and will be retried next run")
+        if totals["unchecked"]:
+            summary += (f"; skipped {totals['unchecked']} ticket(s) IRODS did "
+                        f"not answer for, retried next run")
         notify(args, summary)
 
     if totals["stalled"]:
