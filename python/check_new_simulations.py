@@ -14,6 +14,7 @@ import psycopg2.extras
 import ssl
 import sys
 from dotenv import load_dotenv
+from irods.exception import DoesNotExist
 from irods.session import iRODSSession
 from typing import List, NamedTuple, Optional
 
@@ -176,6 +177,37 @@ def find_unprocessed_tickets(cur, landing_id: Optional[str]) -> List[dict]:
 
 
 # --------------------------------------------------
+def upload_complete(session, landing_dir: str) -> bool:
+    """Whether this landing's completion marker is present *and* non-empty
+
+    The size test is not belt-and-braces. Tickets 1501 and 1505 (yang,
+    2026-07-01) transferred all 52 of their files and then wrote a **0-byte**
+    `mdrepo-submission.completed.json` -- the truncated-object failure that
+    also bit ticket 1355, where a dead transfer left an object that `exists()`
+    reported as present. The old Django scanner tested only for existence, so
+    it called both uploads complete and notified on them; the manifest is the
+    file that says what was uploaded, so an empty one cannot be processed at
+    all. Nothing here could have distinguished that from a real upload.
+
+    Reading the size is free: `data_objects.exists()` is itself implemented as
+    `get()` inside a try, so this is the same single round trip, and `get()`
+    returns catalog metadata without transferring the object.
+
+    `DoesNotExist` is the shared base of `DataObjectDoesNotExist` (no marker)
+    and `CollectionDoesNotExist` (no landing at all). Both mean the same thing
+    here -- not complete -- and both must be caught, since `get()` raises the
+    collection error before it ever looks for the object.
+    """
+
+    try:
+        marker = session.data_objects.get(f"{landing_dir}/{SUBMISSION_COMPLETE}")
+    except DoesNotExist:
+        return False
+
+    return marker.size > 0
+
+
+# --------------------------------------------------
 def process_ticket(
     cur,
     session,
@@ -207,9 +239,7 @@ def process_ticket(
             # A missing collection makes the probe False, same as before.
             # Measured on prod: 0.78s -> 0.135s per landing, and the scan
             # walks >12,000 of them per pass.
-            if not session.data_objects.exists(
-                f"{landing_dir}/{SUBMISSION_COMPLETE}"
-            ):
+            if not upload_complete(session, landing_dir):
                 # One missing marker already settles the ticket, so stop
                 # probing: an incomplete 200-landing ticket costs 1 probe
                 # instead of 200. Nothing is lost by not finishing -- the
