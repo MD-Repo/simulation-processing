@@ -649,64 +649,80 @@ def main() -> None:
             return
 
         archive_name = started.strftime(ARCHIVE_TEMPLATE)
+        failures = []
+
+        # Swift first, and each destination inside its own try. The two have
+        # failed independently -- Swift holds a 2026-07-08 dump IRODS never
+        # received, and on 2026-08-05 CyVerse writes stalled while Swift ran at
+        # ~51 MB/s -- so letting one abort the other would mean a CyVerse
+        # outage costs us the copy that WAS reachable. The run still exits
+        # non-zero, so the night is reported as failed either way; what changes
+        # is that the backup exists somewhere while we deal with it.
+        if args.no_swift:
+            status("Skipping the Swift copy (--no-swift)")
+        else:
+            try:
+                swift_targets = [(dump_path, dump_name), (latest_path, LATEST_NAME)]
+                if not args.no_archive:
+                    # The month prefix itself, not a looser "mdrepo.20" -- that
+                    # also matches the day-20 rotation slot.
+                    existing = swift_names(
+                        args.swift_container, started.strftime(ARCHIVE_MONTH_PREFIX)
+                    )
+                    if needs_month_archive(existing, started):
+                        status(f"First Swift backup of {started:%B %Y}: also "
+                               f"archiving as {archive_name}")
+                        swift_targets.append((dump_path, archive_name))
+                    else:
+                        status(f"{started:%B %Y} is already archived in Swift")
+
+                for path, name in swift_targets:
+                    upload_to_swift(path, args.swift_container, name, size, status)
+            except Exception as e:
+                status(f"SWIFT FAILED: {e}")
+                failures.append(f"Swift: {e}")
 
         if args.no_irods:
             status("Skipping the IRODS copy (--no-irods)")
         else:
-            problems = []
-            with irods_session() as session:
-                names = [o.name for o in
-                         session.collections.get(args.collection).data_objects]
-                irods_targets = [dump_path, latest_path]
-                if args.no_archive:
-                    pass
-                elif needs_month_archive(names, started):
-                    status(f"First IRODS backup of {started:%B %Y}: also "
-                           f"archiving as {archive_name}")
-                    archive_path = os.path.join(args.work_dir, archive_name)
-                    shutil.copyfile(dump_path, archive_path)
-                    irods_targets.append(archive_path)
-                else:
-                    status(f"{started:%B %Y} is already archived in IRODS")
+            try:
+                problems = []
+                with irods_session() as session:
+                    names = [o.name for o in
+                             session.collections.get(args.collection).data_objects]
+                    irods_targets = [dump_path, latest_path]
+                    if args.no_archive:
+                        pass
+                    elif needs_month_archive(names, started):
+                        status(f"First IRODS backup of {started:%B %Y}: also "
+                               f"archiving as {archive_name}")
+                        archive_path = os.path.join(args.work_dir, archive_name)
+                        shutil.copyfile(dump_path, archive_path)
+                        irods_targets.append(archive_path)
+                    else:
+                        status(f"{started:%B %Y} is already archived in IRODS")
 
-                # The day slot goes first on purpose: if it fails, latest is
-                # left holding yesterday's good dump rather than a broken
-                # write. That is not hypothetical -- an upload interrupted
-                # during the 2026-08-05 CyVerse outage left latest with a
-                # 0-byte replica and no usable copy. The month's archive goes
-                # last: it is the copy nothing depends on for a restore.
-                for path in irods_targets:
-                    name = os.path.basename(path)
-                    put_to_irods(path, args.collection, args.put_timeout, status)
-                    remote = f"{args.collection}/{name}"
-                    problems += [f"{name}: {p}" for p in
-                                 check_replicas(session, remote, size, status)]
-                    stamp_metadata(session, remote, size, started)
+                    # The day slot goes first on purpose: if it fails, latest is
+                    # left holding yesterday's good dump rather than a broken
+                    # write. That is not hypothetical -- an upload interrupted
+                    # during the 2026-08-05 CyVerse outage left latest with a
+                    # 0-byte replica and no usable copy. The month's archive goes
+                    # last: it is the copy nothing depends on for a restore.
+                    for path in irods_targets:
+                        name = os.path.basename(path)
+                        put_to_irods(path, args.collection, args.put_timeout, status)
+                        remote = f"{args.collection}/{name}"
+                        problems += [f"{name}: {p}" for p in
+                                     check_replicas(session, remote, size, status)]
+                        stamp_metadata(session, remote, size, started)
 
-            if problems:
-                raise RuntimeError(
-                    "IRODS copies did not verify:\n  " + "\n  ".join(problems)
-                )
-
-        if args.no_swift:
-            status("Skipping the Swift copy (--no-swift)")
-        else:
-            swift_targets = [(dump_path, dump_name), (latest_path, LATEST_NAME)]
-            if not args.no_archive:
-                # The month prefix itself, not a looser "mdrepo.20" -- that
-                # also matches the day-20 rotation slot.
-                existing = swift_names(
-                    args.swift_container, started.strftime(ARCHIVE_MONTH_PREFIX)
-                )
-                if needs_month_archive(existing, started):
-                    status(f"First Swift backup of {started:%B %Y}: also "
-                           f"archiving as {archive_name}")
-                    swift_targets.append((dump_path, archive_name))
-                else:
-                    status(f"{started:%B %Y} is already archived in Swift")
-
-            for path, name in swift_targets:
-                upload_to_swift(path, args.swift_container, name, size, status)
+                if problems:
+                    raise RuntimeError(
+                        "copies did not verify:\n  " + "\n  ".join(problems)
+                    )
+            except Exception as e:
+                status(f"IRODS FAILED: {e}")
+                failures.append(f"IRODS: {e}")
 
     finally:
         if not args.keep_local:
@@ -716,6 +732,14 @@ def main() -> None:
                     os.remove(path)
 
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+
+    if failures:
+        status(
+            f"FAILED backup_database ({len(failures)} of the destinations): "
+            + "; ".join(failures)
+        )
+        sys.exit(1)
+
     status(f"FINISHED backup_database ({size:,} bytes in {elapsed:.0f}s)")
 
 
