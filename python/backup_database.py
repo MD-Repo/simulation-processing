@@ -147,6 +147,7 @@ class Args(NamedTuple):
     swift_container: str
     no_swift: bool
     no_irods: bool
+    put_timeout: int
     keep_local: bool
     verify_only: bool
     dry_run: bool
@@ -208,6 +209,14 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--put-timeout",
+        help="Seconds a single IRODS put may make no progress before it is killed",
+        metavar="INT",
+        type=int,
+        default=1800,
+    )
+
+    parser.add_argument(
         "--no-irods",
         help="Skip the IRODS copy (its writes go down; Swift's do not)",
         action="store_true",
@@ -252,6 +261,7 @@ def get_args() -> Args:
         swift_container=args.swift_container or SWIFT_CONTAINERS[args.server],
         no_swift=args.no_swift,
         no_irods=args.no_irods,
+        put_timeout=args.put_timeout,
         keep_local=args.keep_local,
         verify_only=args.verify_only,
         dry_run=args.dry_run,
@@ -356,30 +366,47 @@ def verify_gzip(path: str) -> None:
 
 
 # --------------------------------------------------
-def put_to_irods(local: str, collection: str, status) -> None:
+def put_to_irods(local: str, collection: str, timeout: int, status) -> None:
     """Upload with gocmd, verifying the checksum on the way in
 
     gocmd rather than python-irodsclient because it is what the rest of the
     pipeline uses for bulk transfer and it is markedly faster on a file this
     size. -k makes it verify the checksum after transfer; --retry survives the
     kind of transient CyVerse error the scanner sees regularly.
+
+    The timeout is the important part. A gocmd put has no internal bound, and
+    on 2026-08-05 CyVerse writes stalled such that a put neither progressed nor
+    failed -- one ran over an hour moving ~11 KB/s with no data connections
+    open. Unbounded, that is the worst failure mode this job has: it holds the
+    flock so the next night's run exits, and it never exits, so cron_notify
+    never sees a non-zero status and never says anything. A hang would look
+    exactly like a healthy silent night, indefinitely.
     """
 
     name = os.path.basename(local)
     status(f"Uploading {name} to {collection}")
 
-    proc = subprocess.run(
-        [
-            "gocmd", "put", "-f", "-k",
-            "--retry", "3",
-            "--retry_interval", "30",
-            local,
-            collection + "/",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "gocmd", "put", "-f", "-k",
+                "--retry", "3",
+                "--retry_interval", "30",
+                local,
+                collection + "/",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"gocmd put of {name} made no progress in {timeout}s and was "
+            "killed. The target may be left with a stale or 0-byte replica "
+            "that blocks the next attempt with SYS_INTERNAL_ERR (-154000); "
+            "unlink it before retrying."
+        )
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -578,7 +605,7 @@ def main() -> None:
                 # 0-byte replica and no usable copy.
                 for path in (dump_path, latest_path):
                     name = os.path.basename(path)
-                    put_to_irods(path, args.collection, status)
+                    put_to_irods(path, args.collection, args.put_timeout, status)
                     remote = f"{args.collection}/{name}"
                     problems += [f"{name}: {p}" for p in
                                  check_replicas(session, remote, size, status)]
