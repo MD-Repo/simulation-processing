@@ -49,7 +49,15 @@ WHAT IS FIXED HERE
    (BACKUP_TIME_AVU) so "when was this actually written" has an answer that
    does not depend on the catalog's mtime. --verify-only reports it.
 
-5. Failures are visible. The old job wrote /var/log/db-backup.log on a host
+5. The two destinations are checked independently, because they have failed
+   independently. Swift's copy of 2026-07-08 exists, is 187,065,941 bytes and
+   is stamped 00:00:34; IRODS still holds a June 8 dump in that slot. So the
+   dump ran and the Swift upload worked while the IRODS put silently did not,
+   and for a month nothing knew. Swift is also the destination whose listing
+   can be trusted -- correct timestamps, no replicas -- which is how the IRODS
+   timestamp problem was confirmed rather than merely suspected.
+
+6. Failures are visible. The old job wrote /var/log/db-backup.log on a host
    nobody watches and mailed cron output into a void. This exits non-zero and
    the cron line wraps it in cron_notify.py, which is what puts it in Slack.
    Deliberately no send_slack_message() call in here: one alert per failure,
@@ -77,7 +85,7 @@ import ssl
 import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple
 
 from dotenv import load_dotenv
 from irods.session import iRODSSession
@@ -99,6 +107,20 @@ IRODS_COLLECTIONS = {
 }
 
 DSN_KEYS = {"prod": "PRODUCTION_DSN", "staging": "STAGING_DSN"}
+
+# Jetstream Swift, the second destination -- and currently the healthier of the
+# two: its object listing is complete and its timestamps are trustworthy, which
+# is what made the IRODS timestamp problem legible at all.
+#
+# The ansible version had a single JETSTREAM_BACKUP_DIR set per deployment in
+# that deployment's terraform.tfvars, which works only because each deployment
+# backed up its own database from its own host. One host backing up both
+# databases needs the mapping instead. These are container names, not secrets,
+# so they live here rather than in .env; --swift-container overrides.
+SWIFT_CONTAINERS = {
+    "prod": "mdrepo_db_backups",
+    "staging": "mdrepo_staging_db_backups",
+}
 
 # The PG 14 client, matching the server; see the module docstring.
 DEFAULT_PG_DUMP = "/usr/lib/postgresql/14/bin/pg_dump"
@@ -122,8 +144,9 @@ class Args(NamedTuple):
     work_dir: str
     collection: str
     pg_dump: str
-    swift_container: Optional[str]
+    swift_container: str
     no_swift: bool
+    no_irods: bool
     keep_local: bool
     verify_only: bool
     dry_run: bool
@@ -173,7 +196,7 @@ def get_args() -> Args:
 
     parser.add_argument(
         "--swift-container",
-        help="Swift container (default: $JETSTREAM_BACKUP_DIR)",
+        help="Swift container (default: per --server)",
         metavar="STR",
         default=None,
     )
@@ -181,6 +204,12 @@ def get_args() -> Args:
     parser.add_argument(
         "--no-swift",
         help="Skip the Swift copy instead of failing when it cannot be made",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--no-irods",
+        help="Skip the IRODS copy (its writes go down; Swift's do not)",
         action="store_true",
     )
 
@@ -212,13 +241,17 @@ def get_args() -> Args:
 
     args = parser.parse_args()
 
+    if args.no_swift and args.no_irods:
+        parser.error("--no-swift and --no-irods together leave nowhere to put it")
+
     return Args(
         server=args.server,
         work_dir=args.work_dir,
         collection=args.collection or IRODS_COLLECTIONS[args.server],
         pg_dump=args.pg_dump,
-        swift_container=args.swift_container,
+        swift_container=args.swift_container or SWIFT_CONTAINERS[args.server],
         no_swift=args.no_swift,
+        no_irods=args.no_irods,
         keep_local=args.keep_local,
         verify_only=args.verify_only,
         dry_run=args.dry_run,
@@ -533,33 +566,34 @@ def main() -> None:
             status("DRY RUN: not uploading")
             return
 
-        problems = []
-        with irods_session() as session:
-            for path in (dump_path, latest_path):
-                name = os.path.basename(path)
-                put_to_irods(path, args.collection, status)
-                remote = f"{args.collection}/{name}"
-                problems += [f"{name}: {p}" for p in
-                             check_replicas(session, remote, size, status)]
-                stamp_metadata(session, remote, size, started)
+        if args.no_irods:
+            status("Skipping the IRODS copy (--no-irods)")
+        else:
+            problems = []
+            with irods_session() as session:
+                # The day slot goes first on purpose: if it fails, latest is
+                # left holding yesterday's good dump rather than a broken
+                # write. That is not hypothetical -- an upload interrupted
+                # during the 2026-08-05 CyVerse outage left latest with a
+                # 0-byte replica and no usable copy.
+                for path in (dump_path, latest_path):
+                    name = os.path.basename(path)
+                    put_to_irods(path, args.collection, status)
+                    remote = f"{args.collection}/{name}"
+                    problems += [f"{name}: {p}" for p in
+                                 check_replicas(session, remote, size, status)]
+                    stamp_metadata(session, remote, size, started)
 
-        if problems:
-            raise RuntimeError(
-                "IRODS copies did not verify:\n  " + "\n  ".join(problems)
-            )
+            if problems:
+                raise RuntimeError(
+                    "IRODS copies did not verify:\n  " + "\n  ".join(problems)
+                )
 
-        container = args.swift_container or os.environ.get("JETSTREAM_BACKUP_DIR")
         if args.no_swift:
-            status("Skipping Swift upload (--no-swift)")
-        elif not container:
-            raise RuntimeError(
-                "No Swift container: set JETSTREAM_BACKUP_DIR (and the OS_* "
-                "credentials) in .env, or pass --no-swift to accept a "
-                "single-destination backup"
-            )
+            status("Skipping the Swift copy (--no-swift)")
         else:
             for path, name in ((dump_path, dump_name), (latest_path, LATEST_NAME)):
-                upload_to_swift(path, container, name, size, status)
+                upload_to_swift(path, args.swift_container, name, size, status)
 
     finally:
         if not args.keep_local:
