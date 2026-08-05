@@ -131,6 +131,28 @@ DEFAULT_WORK_DIR = "/opt/mdrepo/backups"
 # separates "the dump ended" from "the dump stopped".
 COMPLETE_MARKER = b"PostgreSQL database dump complete"
 
+# The monthly archive: the first backup of each calendar month is ALSO stored
+# under a full date, mdrepo.YYYY-MM-DD.sql.gz, and nothing ever overwrites it.
+#
+# The rotation is 31 slots reused every month, so a dump survives at most ~31
+# days: the July 6 dump is overwritten on August 6, and by the end of a month
+# every trace of the previous one is gone. That is fine for "restore what broke
+# last night" and useless for "what did this table look like in June". The two
+# digits also cannot be widened -- mdrepo.32.sql.gz is not a day -- so the
+# archive is a separate name space rather than a longer rotation.
+#
+# The trigger is "no archive exists for this month yet" rather than "today is
+# the 1st", because the 1st can fail: 2026-08-05 produced no backup at all in
+# either destination. Under this rule the month's archive is simply its first
+# *successful* backup. Each destination is checked separately, since the two
+# have failed independently before.
+#
+# It grows without bound by design: twelve objects a year, ~0.5 GB each and
+# rising. Against a 10 TiB Swift quota holding 9.5 GB today that is decades of
+# headroom, but it is deliberate accumulation, not a leak.
+ARCHIVE_TEMPLATE = "mdrepo.%Y-%m-%d.sql.gz"
+ARCHIVE_MONTH_PREFIX = "mdrepo.%Y-%m"
+
 # Our own upload timestamp, because the catalog's mtime lies here.
 BACKUP_TIME_AVU = "mdrepo_backup_time"
 BACKUP_BYTES_AVU = "mdrepo_backup_bytes"
@@ -147,6 +169,7 @@ class Args(NamedTuple):
     swift_container: str
     no_swift: bool
     no_irods: bool
+    no_archive: bool
     put_timeout: int
     keep_local: bool
     verify_only: bool
@@ -209,6 +232,12 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--no-archive",
+        help="Skip the once-a-month dated snapshot",
+        action="store_true",
+    )
+
+    parser.add_argument(
         "--put-timeout",
         help="Seconds a single IRODS put may make no progress before it is killed",
         metavar="INT",
@@ -261,6 +290,7 @@ def get_args() -> Args:
         swift_container=args.swift_container or SWIFT_CONTAINERS[args.server],
         no_swift=args.no_swift,
         no_irods=args.no_irods,
+        no_archive=args.no_archive,
         put_timeout=args.put_timeout,
         keep_local=args.keep_local,
         verify_only=args.verify_only,
@@ -469,6 +499,31 @@ def stamp_metadata(session, path: str, size: int, when: datetime) -> None:
 
 
 # --------------------------------------------------
+def swift_names(container: str, prefix: str) -> List[str]:
+    """Object names in `container` starting with `prefix`"""
+
+    proc = subprocess.run(
+        ["swift", "list", container, "--prefix", prefix],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"swift list of {container} failed: {proc.stdout.strip()}")
+
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+# --------------------------------------------------
+def needs_month_archive(existing: List[str], when: datetime) -> bool:
+    """True if this month has no archived snapshot yet
+
+    Kept separate from the listing so the rule can be read at a glance: the
+    month is archived if nothing already carries this month's prefix.
+    """
+
+    return not any(n.startswith(when.strftime(ARCHIVE_MONTH_PREFIX)) for n in existing)
+
+
+# --------------------------------------------------
 def upload_to_swift(local: str, container: str, name: str, size: int, status) -> None:
     """Copy to Jetstream Swift and confirm the stored length
 
@@ -593,17 +648,34 @@ def main() -> None:
             status("DRY RUN: not uploading")
             return
 
+        archive_name = started.strftime(ARCHIVE_TEMPLATE)
+
         if args.no_irods:
             status("Skipping the IRODS copy (--no-irods)")
         else:
             problems = []
             with irods_session() as session:
+                names = [o.name for o in
+                         session.collections.get(args.collection).data_objects]
+                irods_targets = [dump_path, latest_path]
+                if args.no_archive:
+                    pass
+                elif needs_month_archive(names, started):
+                    status(f"First IRODS backup of {started:%B %Y}: also "
+                           f"archiving as {archive_name}")
+                    archive_path = os.path.join(args.work_dir, archive_name)
+                    shutil.copyfile(dump_path, archive_path)
+                    irods_targets.append(archive_path)
+                else:
+                    status(f"{started:%B %Y} is already archived in IRODS")
+
                 # The day slot goes first on purpose: if it fails, latest is
                 # left holding yesterday's good dump rather than a broken
                 # write. That is not hypothetical -- an upload interrupted
                 # during the 2026-08-05 CyVerse outage left latest with a
-                # 0-byte replica and no usable copy.
-                for path in (dump_path, latest_path):
+                # 0-byte replica and no usable copy. The month's archive goes
+                # last: it is the copy nothing depends on for a restore.
+                for path in irods_targets:
                     name = os.path.basename(path)
                     put_to_irods(path, args.collection, args.put_timeout, status)
                     remote = f"{args.collection}/{name}"
@@ -619,12 +691,27 @@ def main() -> None:
         if args.no_swift:
             status("Skipping the Swift copy (--no-swift)")
         else:
-            for path, name in ((dump_path, dump_name), (latest_path, LATEST_NAME)):
+            swift_targets = [(dump_path, dump_name), (latest_path, LATEST_NAME)]
+            if not args.no_archive:
+                # The month prefix itself, not a looser "mdrepo.20" -- that
+                # also matches the day-20 rotation slot.
+                existing = swift_names(
+                    args.swift_container, started.strftime(ARCHIVE_MONTH_PREFIX)
+                )
+                if needs_month_archive(existing, started):
+                    status(f"First Swift backup of {started:%B %Y}: also "
+                           f"archiving as {archive_name}")
+                    swift_targets.append((dump_path, archive_name))
+                else:
+                    status(f"{started:%B %Y} is already archived in Swift")
+
+            for path, name in swift_targets:
                 upload_to_swift(path, args.swift_container, name, size, status)
 
     finally:
         if not args.keep_local:
-            for path in (dump_path, latest_path):
+            for path in (dump_path, latest_path,
+                         os.path.join(args.work_dir, started.strftime(ARCHIVE_TEMPLATE))):
                 if os.path.exists(path):
                     os.remove(path)
 
