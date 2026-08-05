@@ -21,6 +21,14 @@ FRONTEND_BASE_URLS = {
 # has no business deleting from.
 TICKET_LOG_ROOT = "/opt/mdrepo/logs/tickets"
 
+# Small JSON files remembering what a cron job did last time, one per job. Not
+# under /opt/mdrepo/logs: logrotate owns that directory, and a rotated state
+# file is a forgotten state file. Not under /tmp either -- Ubuntu clears it on
+# boot, which would silently re-arm every alert. Nothing here is precious (the
+# worst a lost file costs is one duplicate Slack message), but losing it should
+# take a deliberate act rather than a reboot.
+CRON_STATE_ROOT = "/opt/mdrepo/state"
+
 
 # --------------------------------------------------
 def stamp() -> str:
@@ -45,13 +53,27 @@ def stamp() -> str:
 # --------------------------------------------------
 def send_slack_message(
     message: str, base_url: str, channel: str = "mdrepo-alerts"
-) -> None:
-    """Post a message to Slack (best-effort, mirrors slack_messages.send_message)"""
+) -> bool:
+    """Post a message to Slack (best-effort, mirrors slack_messages.send_message)
+
+    Returns True only when Slack confirmed the post, False otherwise. It still
+    never raises: the purge and the drain must not die over a Slack outage, so
+    a caller that does not care can keep ignoring the result.
+
+    The return value exists for callers that record having alerted. Without it
+    they can only record that send_slack_message was *called*, which is not the
+    same thing -- a failed post prints and returns, so a state file written on
+    "we tried" marks an alert as delivered when it only reached a log nobody is
+    watching. Any deduplication built on that turns a Slack outage into
+    permanent silence for whatever broke during it, which is strictly worse
+    than no deduplication at all. See cron_notify.py, the one caller that
+    depends on this.
+    """
 
     token = os.getenv("SLACK_TOKEN")
     if not token:
         print(f'No SLACK_TOKEN, not sending Slack message "{message}"')
-        return
+        return False
 
     try:
         resp = requests.post(
@@ -78,3 +100,6 @@ def send_slack_message(
             )
     except Exception as e:
         print(f'Unable to send Slack message "{message}": {e}')
+        return False
+
+    return True
