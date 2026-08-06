@@ -279,17 +279,48 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
     )
 
     # "-l debug" writes the log to --log-file, leaving the failure on stderr
+    #
+    # --num-threads 4 is a STOPGAP for the IRODS connection count, added
+    # 2026-08-06. It is a global flag, so it must precede "ticket".
+    #
+    # mdr-process sizes its rayon pool from num_cpus, which is 32 here, and
+    # runs one landing per thread end to end -- including the push, where each
+    # push_sim_files.py opens its own main IRODS session plus --threads (4)
+    # clones, about 10 TCP connections apiece. 32 landings x ~10 was ~320
+    # connections to CyVerse from this host alone. On 2026-08-06 ticket 2019
+    # ran that way for 3h41m and every one of its 161 pushes failed: not a
+    # congestion problem that resolves itself, a congestion collapse. It left
+    # 2,576 zero-byte objects and no successful upload.
+    #
+    # 4 landings x ~10 is ~40 connections, which is a budget CyVerse has never
+    # objected to.
+    #
+    # --blast-num-threads 8 pays back most of what the cap costs. That flag is
+    # threads WITHIN each blastp (-num_threads), orthogonal to the pool, so
+    # 4 x 8 = 32 keeps every core busy on BLAST where 4 x 2 would leave 24
+    # idle. It does not fully compensate -- blastp-fast is sublinear in
+    # threads -- and trajectory conversion has no equivalent knob, since gmx is
+    # driven by cpptraj_gmx_traj_manipulation.py and picks its own thread
+    # count. Expect that stage to be the one that gets slower.
+    #
+    # The real fix is a semaphore around run_push in mdr-process, gating only
+    # the IRODS step so the CPU stages stay full-width. When that ships, drop
+    # both flags from here rather than leaving two throttles fighting.
     cmd = [
         "mdr-process",
         "-l",
         "debug",
         "--log-file",
         log_file,
+        "--num-threads",
+        "4",
         "ticket",
         "--ticket-id",
         str(ticket_id),
         "--server",
         server,
+        "--blast-num-threads",
+        "8",
     ]
     status(f"Job {job['id']} (ticket {ticket_id}): running {' '.join(cmd)}")
 
