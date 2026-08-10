@@ -287,18 +287,52 @@ def main() -> None:
                     local_size = os.path.getsize(local_path)
                     human_size = humanize.naturalsize(local_size)
 
-                    # Check if we can skip
+                    # Check if we can skip.
+                    #
+                    # On the MD5, not the size (changed 2026-08-10). Size is not
+                    # an identity: a tar pads to 10,240-byte blocks, so a
+                    # regenerated tar with different content routinely lands on
+                    # the byte-exact size of the one already in IRODS. Directory
+                    # 10gs did exactly that -- four tars (178M-366M) rebuilt on
+                    # 08-10 matched the sizes of objects written 2026-07-23, so
+                    # all four were skipped as "already uploaded", no bytes
+                    # moved, and the run failed post-upload verification with
+                    # complete: false. The smaller files in the same push were
+                    # byte-identical to July's and so were genuinely fine, which
+                    # is what made it look like a size-threshold problem.
+                    #
+                    # chksum() forces a server-side hash rather than trusting the
+                    # catalog, matching verify_irods() below -- catalog metadata
+                    # on this zone has been demonstrably stale (see the replica
+                    # divergence in the DB backups). That costs server time on a
+                    # re-run, but only for objects that already exist: a first
+                    # push finds nothing remote and pays none of it.
                     basename = os.path.basename(local_path)
                     remote_path = os.path.join(irods_dir, basename)
+                    local_md5 = files["meta"].get(local_path, {}).get("md5", "")
                     remote_size = 0
+                    remote_md5 = ""
                     if session.data_objects.exists(remote_path):
                         obj = session.data_objects.get(remote_path)
                         remote_size = obj.size
+                        chksum = obj.chksum() or ""
+                        remote_md5 = chksum.split(":", 1)[-1].strip().lower()
 
-                    if local_size == remote_size:
+                    # Fall back to the old size test only when a checksum is
+                    # genuinely unavailable on one side, so a manifest without
+                    # an md5 behaves as it did before rather than re-uploading
+                    # everything.
+                    if local_md5 and remote_md5:
+                        can_skip = remote_md5 == local_md5.strip().lower()
+                        reason = "md5 differs"
+                    else:
+                        can_skip = local_size == remote_size
+                        reason = "size differs, no md5 to compare"
+
+                    if can_skip:
                         print(f" {local_path} [{human_size}] (already uploaded)")
                     else:
-                        print(f" {local_path} [{human_size}] (queued)")
+                        print(f" {local_path} [{human_size}] (queued: {reason})")
                         upload.append(local_path)
                         upload_size += local_size
 
