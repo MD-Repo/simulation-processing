@@ -79,11 +79,13 @@ import argparse
 import errno
 import fcntl
 import gzip
+import hashlib
 import os
 import shutil
 import ssl
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import List, NamedTuple
 
@@ -157,6 +159,16 @@ ARCHIVE_MONTH_PREFIX = "mdrepo.%Y-%m"
 BACKUP_TIME_AVU = "mdrepo_backup_time"
 BACKUP_BYTES_AVU = "mdrepo_backup_bytes"
 BACKUP_HOST_AVU = "mdrepo_backup_host"
+
+# taccRes replication is asynchronous and slow. Measured 2026-08-10 on a fresh
+# put of mdrepo.10.sql.gz (558 MB): the primary landed in 39s and corral4 did
+# not exist at all until t+300s. Checking once immediately after the put -- what
+# this script used to do -- therefore reads a half-replicated object every time
+# and can only ever report a false failure or a false pass, depending on which
+# side of the race it lands on.
+EXPECTED_REPLICAS = 2
+REPLICA_WAIT_SECONDS = 900
+REPLICA_POLL_SECONDS = 30
 
 
 class Args(NamedTuple):
@@ -396,6 +408,55 @@ def verify_gzip(path: str) -> None:
 
 
 # --------------------------------------------------
+def file_md5(path: str) -> str:
+    """MD5 of a local file, lowercase hex
+
+    The zone hashes with MD5 (see `gocmd env`), so this compares directly to a
+    replica's registered checksum. ~2s for a 500 MB dump, against the ~40s the
+    upload itself takes.
+    """
+
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest().lower()
+
+
+# --------------------------------------------------
+def remove_existing(session, remote: str, status) -> None:
+    """Unlink the target so the put creates a new object rather than replacing
+
+    This is the fix for the divergence in the module docstring, and the evidence
+    for it is a controlled pair measured 2026-08-10 in this very collection. An
+    object *created* once and never overwritten (mdrepo.2026-08-01.sql.gz) holds
+    two replicas with identical checksums. Every object written by *overwriting*
+    an existing one (latest, mdrepo.09, mdrepo.10) held a corral4 replica with
+    the correct size, a different checksum, and a `Good` status flag -- so a
+    stale copy sat beside a fresh one and the catalog called both good. Deleting
+    mdrepo.10.sql.gz and re-putting the identical bytes produced two matching
+    `Good` replicas, on the same host and account, minutes later.
+
+    Ken has hit the same class of bug for years, with gocmd and with the
+    iCommands before it: overwriting a longer object with a shorter one can
+    leave the tail of the old file in place. Note what that does to a size
+    check -- the result keeps the *old, larger* size, so size equality is
+    exactly the wrong test for whether an overwrite worked.
+
+    Unlinking to trash rather than --force: it is recoverable for the ~30-40
+    days CyVerse keeps trash, and this runs after the Swift upload has already
+    verified, so at no point is there only one copy of the dump.
+    """
+
+    if not session.data_objects.exists(remote):
+        return
+
+    status(f"Removing existing {os.path.basename(remote)} before upload")
+    session.data_objects.unlink(remote)
+
+
+# --------------------------------------------------
 def put_to_irods(local: str, collection: str, timeout: int, status) -> None:
     """Upload with gocmd, verifying the checksum on the way in
 
@@ -446,21 +507,59 @@ def put_to_irods(local: str, collection: str, timeout: int, status) -> None:
 
 
 # --------------------------------------------------
-def check_replicas(session, path: str, expected: int, status) -> List[str]:
-    """Return a list of complaints about the stored object; empty means good
+def wait_for_replicas(session, path: str, status):
+    """Poll until every replica exists and is good, or the wait runs out
 
-    Both halves matter. The object's own size catches a put that died partway
-    -- which is not hypothetical: an interrupted upload on 2026-08-05 left
-    mdrepo.05.sql.gz as a 0-byte replica. The per-replica check catches the
-    divergence described in the module docstring, where a stale copy sits
-    beside a fresh one and both claim to be good.
+    Returns the object either way -- a timeout is not raised here, because the
+    caller's checks produce a far better message than "timed out" would. See
+    REPLICA_WAIT_SECONDS for why this exists at all.
     """
 
-    obj = session.data_objects.get(path)
+    deadline = time.monotonic() + REPLICA_WAIT_SECONDS
+    while True:
+        obj = session.data_objects.get(path)
+        settled = len(obj.replicas) >= EXPECTED_REPLICAS and all(
+            int(r.status) == 1 for r in obj.replicas
+        )
+        if settled or time.monotonic() >= deadline:
+            return obj
+
+        status(
+            f"{os.path.basename(path)}: {len(obj.replicas)} of "
+            f"{EXPECTED_REPLICAS} replica(s) so far, waiting"
+        )
+        time.sleep(REPLICA_POLL_SECONDS)
+
+
+# --------------------------------------------------
+def check_replicas(session, path: str, expected: int, expected_md5: str,
+                   status) -> List[str]:
+    """Return a list of complaints about the stored object; empty means good
+
+    On the checksum, not the size. A size test cannot see the two failures this
+    is here to catch: an overwrite that leaves a stale replica of the *same*
+    length (measured on mdrepo.09 and mdrepo.10, 2026-08-10 -- corral4 reported
+    the correct size with a different checksum and a `Good` flag), and the
+    tail-of-the-old-file overwrite described in remove_existing(), which by
+    construction preserves the old size. Size is kept as a separate complaint
+    only because it names the failure more precisely when both are wrong.
+
+    The object's own size still catches a put that died partway -- not
+    hypothetical: an interrupted upload on 2026-08-05 left mdrepo.05.sql.gz as
+    a 0-byte replica.
+    """
+
+    obj = wait_for_replicas(session, path, status)
     problems = []
 
     if obj.size != expected:
         problems.append(f"object size {obj.size:,} != local {expected:,}")
+
+    if len(obj.replicas) < EXPECTED_REPLICAS:
+        problems.append(
+            f"only {len(obj.replicas)} replica(s) after "
+            f"{REPLICA_WAIT_SECONDS}s, expected {EXPECTED_REPLICAS}"
+        )
 
     for repl in obj.replicas:
         where = f"replica {repl.number} on {repl.resource_name}"
@@ -469,10 +568,20 @@ def check_replicas(session, path: str, expected: int, status) -> List[str]:
         if repl.size != expected:
             problems.append(f"{where} size {repl.size:,} != local {expected:,}")
 
+        # A replica with no registered checksum is not evidence of anything, so
+        # say so rather than passing it silently.
+        got = (repl.checksum or "").split(":", 1)[-1].strip().lower()
+        if not got:
+            problems.append(f"{where} has no registered checksum")
+        elif got != expected_md5:
+            problems.append(f"{where} md5 {got} != local {expected_md5}")
+
     status(
         f"{os.path.basename(path)}: {len(obj.replicas)} replica(s), "
         + ", ".join(
-            f"#{r.number} {r.size:,} on {r.resource_name} (status {r.status})"
+            f"#{r.number} {r.size:,} on {r.resource_name} "
+            f"(status {r.status}, md5 "
+            f"{(r.checksum or '-').split(':', 1)[-1][:8]})"
             for r in obj.replicas
         )
     )
@@ -708,12 +817,21 @@ def main() -> None:
                     # during the 2026-08-05 CyVerse outage left latest with a
                     # 0-byte replica and no usable copy. The month's archive goes
                     # last: it is the copy nothing depends on for a restore.
+                    # One hash of the local dump, reused for every target: the
+                    # slot, latest and the month's archive are copies of the
+                    # same bytes.
+                    expected_md5 = file_md5(dump_path)
+
                     for path in irods_targets:
                         name = os.path.basename(path)
-                        put_to_irods(path, args.collection, args.put_timeout, status)
                         remote = f"{args.collection}/{name}"
-                        problems += [f"{name}: {p}" for p in
-                                     check_replicas(session, remote, size, status)]
+                        remove_existing(session, remote, status)
+                        put_to_irods(path, args.collection, args.put_timeout, status)
+                        problems += [
+                            f"{name}: {p}" for p in
+                            check_replicas(session, remote, size, expected_md5,
+                                           status)
+                        ]
                         stamp_metadata(session, remote, size, started)
 
                 if problems:
