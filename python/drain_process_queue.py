@@ -527,12 +527,26 @@ def is_retryable_irods_error(detail: str) -> bool:
         uncaught traceback -- ending up on stderr with "NetworkException" in
         it.
     Either way, that text is what ends up here as the captured stderr/log tail.
+
+    EXEC_CMD_ERROR (iRODS -344000) was added 2026-08-10. It arrives on the
+    *read* side -- python-irodsclient raising it out of read_file() during
+    _download, and gocmd printing it as
+    'iRODS Error (code: \'-344000\', message: "EXEC_CMD_ERROR")' -- so both
+    spellings are covered by the one lowercased substring. Ticket 2042 hit it
+    48 seconds after ticket 2041 finished a complete run, and the scanner
+    probed iRODS throughout without an error, so it is transient rather than a
+    property of the ticket. It was terminal before this: the job went straight
+    to 'failed' with num_attempts = 0 and nothing would ever pick it up again.
+    The cost of being wrong is bounded and small -- this fires during the fetch,
+    before any BLAST or gmx work, so a genuinely broken ticket burns five
+    sub-minute attempts and then goes terminal as it does today.
     """
 
     lowered = detail.lower()
     return (
         "failed to establish a connection to irods server" in lowered
         or "networkexception" in lowered
+        or "exec_cmd_error" in lowered
     )
 
 
