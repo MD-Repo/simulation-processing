@@ -696,7 +696,27 @@ def fetch_manifest(
             os.remove(local_completed)
 
         if retry == 0:
-            session.data_objects.get(irods_completed, local_completed)
+            # Guarded because a *raising* get bypasses this whole loop
+            # otherwise: the try below covers only the parse, so until
+            # 2026-08-10 the documented gocmd fallback engaged only when the
+            # download succeeded and produced a corrupt file. An exception --
+            # EXEC_CMD_ERROR, a NetworkException -- propagated out of here,
+            # out of resolve_part and out of process_batch, failing every
+            # landing in the ticket over one unreadable manifest. Ticket 2042
+            # died that way six times between 16:17 and 17:21; all 200 of its
+            # manifests read cleanly an hour later.
+            #
+            # Catching broadly on purpose. The point is not to enumerate the
+            # errors iRODS can raise -- we have been surprised three times now
+            # -- but to reach the retry, which uses gocmd. That is a different
+            # client library, so it can succeed where python-irodsclient
+            # fails, and a manifest is small enough that retrying costs
+            # nothing.
+            try:
+                session.data_objects.get(irods_completed, local_completed)
+            except Exception as e:
+                output.append(f"    Retry {retry}: session get failed: {e}")
+                continue
         else:
             cmd = f"gocmd get {irods_completed} {local_completed}"
             rv, out = getstatusoutput(cmd)
