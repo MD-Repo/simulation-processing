@@ -306,7 +306,7 @@ TIME_AXIS_MARKER = "[mdrepo] source_has_time_axis="
 
 
 # --------------------------------------------------
-def run_cpptraj(cppin, label, capture=True):
+def run_cpptraj(cppin, label, capture=True, fatal=True):
     """Run cpptraj on an input file, recording any failure
 
     Returns (returncode, combined output). Replaces the os.system calls this
@@ -321,6 +321,15 @@ def run_cpptraj(cppin, label, capture=True):
     report. It is echoed to our stdout regardless, because it is the only
     diagnosis of a conversion failure and mdr-process quotes our stdout into
     the error it raises.
+
+    `fatal=False` for the steps that have a designed fallback, and this
+    distinction matters: the frame0 and conf extractions feed a parmed load
+    guarded by `if os.path.isfile(...)` inside a try/except that explicitly
+    tolerates the file being absent, and the conf path prefers the submitter's
+    own coordinate file anyway. Those two were the calls previously sent to
+    /dev/null with their status ignored, so treating them as fatal now would
+    start failing directories that recover today. A non-fatal failure is still
+    warned about; it just does not condemn the run.
     """
 
     result = subprocess.run(
@@ -335,8 +344,11 @@ def run_cpptraj(cppin, label, capture=True):
             print(out, end="" if out.endswith("\n") else "\n")
 
     if result.returncode != 0:
-        CPPTRAJ_FAILURES.append(f"{label} (exit {result.returncode})")
         warn(f"cpptraj {label} failed with exit code {result.returncode}")
+        if fatal:
+            CPPTRAJ_FAILURES.append(f"{label} (exit {result.returncode})")
+        else:
+            warn(f"cpptraj {label} has a fallback; continuing")
 
     return result.returncode, out
 
@@ -594,7 +606,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     # This output used to go to /dev/null. It is the only place the source
     # trajectory is read before conversion rewrites its timing, so it is the
     # one chance to see whether it carries a time axis at all.
-    _, frame0_out = run_cpptraj(cppin_frame0, "frame0 extraction")
+    _, frame0_out = run_cpptraj(cppin_frame0, "frame0 extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
 
     # Load structure with parmed for .gro file generation
@@ -758,7 +770,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {coordinate_file} 1 1\n")
         f.write(f"trajout {traj_pdb} pdb\n")
         f.write("run\n")
-    _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction")
+    _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
     fix_pdb_element_symbols(traj_pdb)
 
@@ -816,7 +828,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {coordinate_file}\n")
         f.write(f"trajout {conf_pdb} pdb onlyframes 1\n")
         f.write("run\n")
-    run_cpptraj(cppin_conf, "conf extraction")
+    run_cpptraj(cppin_conf, "conf extraction", fatal=False)
     fix_pdb_element_symbols(conf_pdb)
 
     # Load full structure with parmed for .gro generation
