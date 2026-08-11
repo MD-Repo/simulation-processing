@@ -264,6 +264,22 @@ def main():
     else:
         sys.exit("Unable to detect format")
 
+    # A cpptraj failure now fails the run. Until 2026-08-11 it did not: every
+    # call site warned and carried on, and this function returned normally, so
+    # the script exited 0 having printed both "cpptraj full failed with exit
+    # code 256" and "trajectory processing completed" (ticket 2175). The only
+    # thing that caught it was mdr-process separately checking that the
+    # expected outputs exist -- a check any other caller would have to
+    # duplicate. The "completed" lines above are left as they were, because
+    # they describe reaching the end of a workflow, not its success; this is
+    # the verdict.
+    if CPPTRAJ_FAILURES:
+        sys.exit(
+            "cpptraj failed during processing: "
+            + "; ".join(CPPTRAJ_FAILURES)
+            + " -- see the cpptraj output above for the reason"
+        )
+
 
 # --------------------------------------------------
 def verbose(msg):
@@ -273,6 +289,109 @@ def verbose(msg):
 # --------------------------------------------------
 def warn(msg):
     print(f"[!] {msg}", file=sys.stderr)
+
+
+# Every cpptraj failure seen during this run. main() exits non-zero if this is
+# non-empty. Before 2026-08-11 a failing cpptraj only produced a warn() and the
+# script still exited 0 -- ticket 2175's log shows "cpptraj full failed with
+# exit code 256" followed by "trajectory processing completed", and the only
+# reason it was caught at all is that mdr-process separately checks the
+# expected output files exist ("Command succeeded but failed to create ...").
+# Anything downstream that did not verify outputs would have read it as success.
+CPPTRAJ_FAILURES = []
+
+# One machine-readable line for mdr-process, emitted exactly once per run. See
+# report_time_axis() for the values and why "unknown" is not treated as absent.
+TIME_AXIS_MARKER = "[mdrepo] source_has_time_axis="
+
+
+# --------------------------------------------------
+def run_cpptraj(cppin, label, capture=True):
+    """Run cpptraj on an input file, recording any failure
+
+    Returns (returncode, combined output). Replaces the os.system calls this
+    script used to make, for two reasons beyond capturing the text:
+
+    os.system returns a *wait status*, not an exit code, which is why the old
+    log line read "failed with exit code 256" for what was really exit code 1.
+    And a failure recorded here makes the whole run exit non-zero at the end,
+    rather than warning into a log nobody reads.
+
+    Output is captured by default so callers can parse cpptraj's own trajin
+    report. It is echoed to our stdout regardless, because it is the only
+    diagnosis of a conversion failure and mdr-process quotes our stdout into
+    the error it raises.
+    """
+
+    result = subprocess.run(
+        ["cpptraj", "-i", cppin],
+        capture_output=capture,
+        text=True,
+    )
+    out = ""
+    if capture:
+        out = (result.stdout or "") + (result.stderr or "")
+        if out.strip():
+            print(out, end="" if out.endswith("\n") else "\n")
+
+    if result.returncode != 0:
+        CPPTRAJ_FAILURES.append(f"{label} (exit {result.returncode})")
+        warn(f"cpptraj {label} failed with exit code {result.returncode}")
+
+    return result.returncode, out
+
+
+# --------------------------------------------------
+def trajectory_has_time_axis(cpptraj_output):
+    """Whether cpptraj reported a `time` variable in the trajectory it read
+
+    cpptraj's trajin report enumerates exactly what a file holds, e.g.
+
+        '..._0.nc' is a NetCDF AMBER trajectory with coordinates, box, ...
+
+    for MDR00048669's trajectory -- no `time` -- against `with coordinates,
+    time, box` for one that has it. That report is free: the command already
+    runs, and this only reads what it printed.
+
+    Returns True, False, or None when no such line was found (a format whose
+    report we cannot parse, which must not be mistaken for "no time axis").
+    """
+
+    for line in cpptraj_output.splitlines():
+        if " is a " in line and " with " in line:
+            contents = line.split(" with ", 1)[1]
+            # The real line continues past the contents list with the parm and
+            # box, e.g. "... with coordinates, box, Parm foo.prmtop (Truncated
+            # octahedron box) (reading 1 of 5614)". Cut at " Parm " so a file
+            # or path that happens to contain "time" cannot be read as a time
+            # variable -- a false positive there would silently restore the
+            # fabricated spacing this whole change exists to stop.
+            contents = contents.split(" Parm ", 1)[0]
+            # Split on periods as well as commas: some formats end the list
+            # with a period ("with coordinates, time."), which would otherwise
+            # leave the last field as "time." and never match.
+            fields = [f.strip() for f in contents.replace(".", ",").split(",")]
+            return "time" in fields
+    return None
+
+
+# --------------------------------------------------
+def report_time_axis(has_time):
+    """Emit the one marker line mdr-process reads
+
+    `false` is a positive finding: cpptraj read the file and said it carries no
+    time. That is the case worth acting on -- conversion to XTC stamps
+    cpptraj's default 1 ps/frame onto the output, so by the time anything
+    measures the converted file the fabricated spacing is indistinguishable
+    from a real one.
+
+    `unknown` means we could not tell, and mdr-process treats it as today's
+    behaviour rather than as absence. Reporting absence we did not establish
+    would fail directories over a parsing gap.
+    """
+
+    value = {True: "true", False: "false", None: "unknown"}[has_time]
+    print(f"{TIME_AXIS_MARKER}{value}")
 
 
 # --------------------------------------------------
@@ -353,9 +472,8 @@ def process_stripped_trajectory(
         f.write("rotate x -90\n")
         f.write(f"trajout {ref_pdb} pdb\n")
         f.write("run\n")
-    rv = os.system(f"cpptraj -i {cppin_ref}")
+    rv, _ = run_cpptraj(cppin_ref, f"{prefix} reference")
     if rv != 0:
-        warn(f"cpptraj {prefix} reference failed with exit code {rv}")
         return None, None, None
     fix_pdb_element_symbols(ref_pdb)
 
@@ -374,9 +492,8 @@ def process_stripped_trajectory(
         f.write(f"trajout {output_xtc} xtc\n")
         f.write(f"trajout {output_pdb} pdb onlyframes 1\n")
         f.write("run\n")
-    rv = os.system(f"cpptraj -i {cppin_traj}")
+    rv, _ = run_cpptraj(cppin_traj, prefix)
     if rv != 0:
-        warn(f"cpptraj {prefix} failed with exit code {rv}")
         return None, None, None
     fix_pdb_element_symbols(output_pdb)
 
@@ -474,7 +591,11 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
         f.write(f"trajin {trajectory_file} 1 1\n")
         f.write(f"trajout {traj_pdb} pdb\n")
         f.write("run\n")
-    os.system(f"cpptraj -i {cppin_frame0} > /dev/null 2>&1")
+    # This output used to go to /dev/null. It is the only place the source
+    # trajectory is read before conversion rewrites its timing, so it is the
+    # one chance to see whether it carries a time axis at all.
+    _, frame0_out = run_cpptraj(cppin_frame0, "frame0 extraction")
+    report_time_axis(trajectory_has_time_axis(frame0_out))
 
     # Load structure with parmed for .gro file generation
     structure = None
@@ -517,9 +638,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             # f.write(f"trajout {full_cif} cif onlyframes 1\n")
             f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
             f.write("run\n")
-        rv = os.system(f"cpptraj -i {cppin_full}")
-        if rv != 0:
-            warn(f"cpptraj full failed with exit code {rv}")
+        run_cpptraj(cppin_full, "full")
     else:
         verbose("Full trajectory files already exist, skipping...")
 
@@ -639,9 +758,8 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {coordinate_file} 1 1\n")
         f.write(f"trajout {traj_pdb} pdb\n")
         f.write("run\n")
-    rv = os.system(f"cpptraj -i {cppin_frame0}")
-    if rv != 0:
-        warn(f"cpptraj frame extraction failed with exit code {rv}")
+    _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction")
+    report_time_axis(trajectory_has_time_axis(frame0_out))
     fix_pdb_element_symbols(traj_pdb)
 
     # Load with pytraj to check box and lipids
@@ -698,7 +816,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {coordinate_file}\n")
         f.write(f"trajout {conf_pdb} pdb onlyframes 1\n")
         f.write("run\n")
-    os.system(f"cpptraj -i {cppin_conf} > /dev/null 2>&1")
+    run_cpptraj(cppin_conf, "conf extraction")
     fix_pdb_element_symbols(conf_pdb)
 
     # Load full structure with parmed for .gro generation
@@ -763,9 +881,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajout {full_xtc} xtc\n")
             f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
             f.write("run\n")
-        rv = os.system(f"cpptraj -i {cppin_full}")
-        if rv != 0:
-            warn(f"cpptraj full failed with exit code {rv}")
+        run_cpptraj(cppin_full, "full")
         fix_pdb_element_symbols(full_pdb)
     elif not trajectory_file:
         verbose("No trajectory file provided, skipping full trajectory generation...")
