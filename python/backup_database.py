@@ -532,7 +532,7 @@ def wait_for_replicas(session, path: str, status):
 
 
 # --------------------------------------------------
-def check_replicas(session, path: str, expected: int, expected_md5: str,
+def check_replicas(session, path: str, expected_size: int, expected_md5: str,
                    status) -> List[str]:
     """Return a list of complaints about the stored object; empty means good
 
@@ -552,8 +552,8 @@ def check_replicas(session, path: str, expected: int, expected_md5: str,
     obj = wait_for_replicas(session, path, status)
     problems = []
 
-    if obj.size != expected:
-        problems.append(f"object size {obj.size:,} != local {expected:,}")
+    if obj.size != expected_size:
+        problems.append(f"object size {obj.size:,} != local {expected_size:,}")
 
     if len(obj.replicas) < EXPECTED_REPLICAS:
         problems.append(
@@ -565,8 +565,8 @@ def check_replicas(session, path: str, expected: int, expected_md5: str,
         where = f"replica {repl.number} on {repl.resource_name}"
         if int(repl.status) != 1:
             problems.append(f"{where} is not good (status {repl.status})")
-        if repl.size != expected:
-            problems.append(f"{where} size {repl.size:,} != local {expected:,}")
+        if repl.size != expected_size:
+            problems.append(f"{where} size {repl.size:,} != local {expected_size:,}")
 
         # A replica with no registered checksum is not evidence of anything, so
         # say so rather than passing it silently.
