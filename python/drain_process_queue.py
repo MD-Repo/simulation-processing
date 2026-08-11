@@ -32,7 +32,13 @@ import time
 from datetime import timedelta
 from typing import NamedTuple, Optional
 
-from common import FRONTEND_BASE_URLS, TICKET_LOG_ROOT, send_slack_message, stamp
+from common import (
+    EX_TEMPFAIL,
+    FRONTEND_BASE_URLS,
+    TICKET_LOG_ROOT,
+    send_slack_message,
+    stamp,
+)
 
 PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
 KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
@@ -47,6 +53,9 @@ class Args(NamedTuple):
     log_dir: str
     lock_file: str
     max_jobs: Optional[int]
+    canary: bool
+    canary_timeout: int
+    irods_env: str
     dry_run: bool
     verbose: bool
 
@@ -94,6 +103,31 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--canary",
+        help="Prove IRODS will take a write before claiming a job; hold the "
+        "queue and exit 75 if it will not",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--canary-timeout",
+        help="Hard limit for the canary, in seconds",
+        metavar="INT",
+        type=int,
+        default=180,
+    )
+
+    parser.add_argument(
+        "--irods-env",
+        help="IRODS environment file (only used with --canary)",
+        metavar="FILE",
+        default=os.environ.get(
+            "IRODS_ENVIRONMENT_FILE",
+            os.path.expanduser("~/.irods/irods_environment.json"),
+        ),
+    )
+
+    parser.add_argument(
         "--dry-run",
         help="Claim nothing and run nothing; just report pending count "
         "(implies --verbose)",
@@ -117,6 +151,9 @@ def get_args() -> Args:
         log_dir=log_dir,
         lock_file=lock_file,
         max_jobs=args.max_jobs,
+        canary=args.canary,
+        canary_timeout=args.canary_timeout,
+        irods_env=args.irods_env,
         dry_run=args.dry_run,
         verbose=args.verbose or args.dry_run,
     )
@@ -163,6 +200,9 @@ def main() -> None:
         status(f"DRY RUN: {cur.fetchone()[0]} pending job(s) for {args.server}")
         sys.exit(0)
 
+    if args.canary and not run_write_canary(cur, args, status):
+        sys.exit(EX_TEMPFAIL)
+
     processed = 0
     while args.max_jobs is None or processed < args.max_jobs:
         job = claim_job(cur, args.server)
@@ -187,6 +227,76 @@ def main() -> None:
     # is always a job that actually ran.
     if processed:
         status(f"FINISHED drain_process_queue ({processed} job(s))")
+
+
+# --------------------------------------------------
+def run_write_canary(cur, args: Args, status) -> bool:
+    """Confirm IRODS will take a write before any job is claimed
+
+    Returns True to proceed (healthy, or nothing to do), False to hold.
+
+    **Why here, between the lock and the claim.** mdr-process fetches,
+    converts and BLASTs for most of a run before it pushes anything, so a
+    write outage is otherwise discovered at the end of the most expensive part
+    -- ~2h of gmx and blastp thrown away per ticket, repeatedly, for as long as
+    the zone is down. Checking after the lock means this only runs on a tick
+    that is actually about to work: a tick arriving while a 2h job is running
+    exits at the flock and never reaches here, so the real rate is about one
+    canary per ticket, not one per minute.
+
+    **Only when there is work.** The queue is empty most minutes and a canary
+    on an idle tick would be ~1,440 pointless 5 MiB writes a day, which is the
+    noise this file avoids everywhere else.
+
+    **Holding, not failing.** A failed canary leaves every job 'pending' and
+    claims nothing, so no ticket is marked failed and no retry budget is spent
+    for something that is not the ticket's fault. The scanner keeps banking
+    new work meanwhile. That is the same mitigation as commenting out the cron
+    line, applied automatically and released automatically.
+
+    **Exit 75 rather than a Slack message of its own.** cron_notify.py already
+    wraps this line and owns alert thresholds, repeat suppression and the
+    recovery message; a non-zero exit escalates to #mdrepo-alerts after 3
+    consecutive ticks, i.e. ~3 minutes, and says so with the tail of this
+    output. A second notifier here would double-report and would need its own
+    state machine to avoid flooding a multi-hour outage.
+    """
+
+    # Imported here rather than at module scope so that a broken or missing
+    # python-irodsclient degrades to "the canary cannot run" instead of "the
+    # drain cannot start". The drain not starting is a total processing outage;
+    # this feature is not worth that risk.
+    from irods_write_canary import run_canary
+
+    cur.execute(
+        "select count(*) from md_process_job where status = 'pending' "
+        "and server = %s",
+        (args.server,),
+    )
+    pending = cur.fetchone()[0]
+    if not pending:
+        return True
+
+    result = run_canary(
+        server=args.server,
+        irods_env=args.irods_env,
+        timeout=args.canary_timeout,
+        status=status,
+    )
+
+    if result.ok:
+        status(f"IRODS write canary OK in {result.elapsed:.1f}s")
+        return True
+
+    # Unconditional, not status(): this is the whole point of the check, and
+    # cron_notify quotes the tail of this output into the Slack alert.
+    print(
+        f"{stamp()} IRODS write canary FAILED after {result.elapsed:.1f}s: "
+        f"{result.detail} -- holding {pending} pending job(s) for "
+        f"{args.server}, claiming nothing",
+        flush=True,
+    )
+    return False
 
 
 # --------------------------------------------------

@@ -29,6 +29,19 @@ TICKET_LOG_ROOT = "/opt/mdrepo/logs/tickets"
 # take a deliberate act rather than a reboot.
 CRON_STATE_ROOT = "/opt/mdrepo/state"
 
+# "Temporary failure" from sysexits.h. Means the work was not attempted and
+# nothing is wrong with the work itself -- the environment would not cooperate,
+# so try again later. The drain exits this when the IRODS write canary fails,
+# holding the queue rather than failing tickets.
+#
+# Shared here rather than defined in both places for the same reason as
+# TICKET_LOG_ROOT above: drain_process_queue.py exits with it and
+# irods_write_canary.py exits with it, they have to agree, and the drain
+# deliberately does not import the canary at module scope (that would pull in
+# python-irodsclient and make a missing client library stop the drain from
+# starting at all).
+EX_TEMPFAIL = 75
+
 
 # --------------------------------------------------
 def stamp() -> str:
