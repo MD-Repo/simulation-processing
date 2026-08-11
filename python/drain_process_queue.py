@@ -13,10 +13,20 @@ Purpose: Drain the md_process_job queue: run "mdr-process ticket" for each
          "Failed to establish a connection to iRODS server") -- fetch_uploads.py
          is the first thing "mdr-process ticket" runs, before anything is
          mutated, so it is safe to requeue. The job goes back to 'pending' and
-         bumps num_attempts, up to MAX_RETRY_ATTEMPTS; the next cron tick
-         retries it. To avoid hammering iRODS by immediately reclaiming the
-         same job in this same tick, a requeue stops this invocation's drain
-         loop -- the next attempt waits for the next cron minute.
+         bumps num_attempts, up to MAX_RETRY_ATTEMPTS.
+
+         Retries back off exponentially -- 5, 20, 80 then 180 minutes, ~4.75h
+         to exhaust the budget (RETRY_BACKOFF_* below). Before 2026-08-11 they
+         did not: a requeued row kept its created_at and so returned to the
+         head of the queue, was re-claimed on the very next tick, and burned
+         all five attempts in five minutes against transients lasting an hour
+         or more.
+
+         With --canary the drain also proves IRODS will accept a write before
+         claiming anything, so a write outage holds the queue without spending
+         attempts at all. The backoff is what covers the other half: the retry
+         fires on FETCH failures, which are reads, and reads and writes here
+         have failed independently in both directions.
 """
 
 import argparse
@@ -44,6 +54,48 @@ PROCESS_TIMEOUT = 60 * 60 * 12  # seconds
 KILL_GRACE = 10  # seconds to let a signalled process group exit before escalating
 ERROR_LINES = 20  # tail of mdr-process output to include in a failure notice
 MAX_RETRY_ATTEMPTS = 5  # requeue this many times before treating it as terminal
+
+# Exponential backoff between retries, in minutes: 5, 20, 80, then capped at
+# 180. A job therefore takes ~4.75h to exhaust its 5 attempts instead of the
+# ~5 minutes it took before 2026-08-11.
+#
+# WHY IT WAS FIVE MINUTES: this drain runs every minute and a requeued row
+# keeps its original created_at, so it went straight back to the head of the
+# queue and was re-claimed on the very next tick. Measured on ticket 2042:
+# attempts 2-5 fired at 17:17, 17:18, 17:19, 17:20 and it was terminal by
+# 17:21, against a transient that lasted about an hour.
+#
+# WHY THESE NUMBERS: the faults this has to survive are the ones on record --
+# ~1h (the 08-10 read fault) and 4.5h (the 08-04 CyVerse outage). 5+20+80+180
+# spans 4.75h, so both fit, and the 180 cap means a recovered zone is retried
+# within 3h at worst rather than after an ever-doubling wait.
+#
+# WHY THIS IS NOT MADE REDUNDANT BY THE WRITE CANARY (41): the canary gates
+# every claim, including re-claims, so a *write* outage now holds the queue
+# without spending attempts at all. But the retry exists for FETCH failures,
+# which are reads, and reads and writes here have failed independently in both
+# directions -- writes were dead for a month with reads healthy (07-07 to
+# 08-07), and on 08-10 reads failed while writes were fine. A write canary
+# passes green through exactly the fault that consumes this budget.
+RETRY_BACKOFF_BASE_MIN = 5
+RETRY_BACKOFF_FACTOR = 4
+RETRY_BACKOFF_CAP_MIN = 180
+
+# When a requeued job becomes claimable again. Defined once and interpolated
+# into BOTH claim_job and requeue_for_retry: the claim decides eligibility with
+# it and the requeue reports the next attempt time with it, so a change to the
+# curve cannot leave the log saying one thing while the queue does another.
+# Only integers from the constants above are interpolated.
+#
+# greatest(num_attempts - 1, 0) so the first retry waits one base interval
+# rather than a fraction of one, and so a hand-edited row with num_attempts = 0
+# cannot produce a negative exponent.
+RETRY_ELIGIBLE_AT_SQL = (
+    f"finished_at + (interval '1 minute' * least("
+    f"{RETRY_BACKOFF_BASE_MIN} * "
+    f"power({RETRY_BACKOFF_FACTOR}, greatest(num_attempts - 1, 0)), "
+    f"{RETRY_BACKOFF_CAP_MIN}))"
+)
 
 
 class Args(NamedTuple):
@@ -338,14 +390,22 @@ def claim_job(cur, server: str):
     """Atomically claim the oldest pending job, or None if the queue is empty"""
 
     # FOR UPDATE SKIP LOCKED lets multiple workers coexist without contention.
+    #
+    # finished_at is null for a job that has never run, and is set by
+    # requeue_for_retry to the moment the last attempt ended -- so the second
+    # clause is "this retry has waited long enough". Skipping a backed-off row
+    # also means a ticket stuck on a transient stops monopolising the queue
+    # head: order by created_at would otherwise re-offer it ahead of every
+    # newer ticket, every tick, for as long as it kept failing.
     cur.execute(
-        """
+        f"""
         update md_process_job
         set    status = 'running', started_at = now()
         where  id = (
             select id
             from   md_process_job
             where  status = 'pending' and server = %s
+              and  (finished_at is null or {RETRY_ELIGIBLE_AT_SQL} <= now())
             order  by created_at
             for update skip locked
             limit  1
@@ -672,18 +732,42 @@ def requeue_for_retry(cur, job, exit_code: Optional[int], detail: str, status) -
 
     ticket_id = job["ticket_id"]
     next_attempt = job["num_attempts"] + 1
+
+    # finished_at = now() rather than null, which is what paces the retry.
+    #
+    # It IS an overload -- on a 'pending' row this means "when the previous
+    # attempt ended", not "when the job finished" -- and it is deliberate: a
+    # dedicated retry_after column would be cleaner but needs a migration, and
+    # finished_at is unambiguous here because nothing else ever sets it on a
+    # pending row (finish_success and finish_failure both leave a terminal
+    # status). started_at stays null, so "is it running" is still readable.
+    #
+    # RETURNING computes the next eligible time with the same expression
+    # claim_job filters on, and RETURNING sees post-update values, so the line
+    # logged below is the queue's actual decision rather than a restatement of
+    # it.
     cur.execute(
-        """
+        f"""
         update md_process_job
         set    status = 'pending', num_attempts = %s, exit_code = %s,
-               last_error = %s, started_at = null, finished_at = null
+               last_error = %s, started_at = null, finished_at = now()
         where  id = %s
+        returning {RETRY_ELIGIBLE_AT_SQL} as eligible_at
         """,
         (next_attempt, exit_code, detail, job["id"]),
     )
+
+    row = cur.fetchone()
+    eligible_at = row["eligible_at"] if row else None
+    when = (
+        f"; next attempt not before {eligible_at:%Y-%m-%dT%H:%M:%SZ}"
+        if eligible_at
+        else ""
+    )
+
     status(
         f"Job {job['id']} (ticket {ticket_id}) hit a retryable iRODS connection "
-        f"error (attempt {next_attempt}/{MAX_RETRY_ATTEMPTS}); requeued"
+        f"error (attempt {next_attempt}/{MAX_RETRY_ATTEMPTS}); requeued{when}"
     )
 
 
