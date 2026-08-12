@@ -95,11 +95,18 @@ def main() -> None:
 
         vals_max = max(vals)
         if vals_max > max_allowed:
-            print(
-                f"Trajectory {type_} val {vals_max} greater than {max_allowed}",
-                file=sys.stderr,
+            # Exit non-zero rather than returning. Refusing to write is the
+            # right call -- a value this far out means the trajectory is
+            # garbage, not that the ceiling is wrong -- but returning made the
+            # script exit 0, so the caller could only infer the refusal from a
+            # missing output file and reported "Failed to create
+            # rmsd_rmsf.json" while this explanation went to a discarded
+            # stderr. mdr-process already surfaces stderr on a non-zero exit
+            # (process.rs, get_rmsd_rmsf), so this line is what puts the reason
+            # into the ticket log and last_error.
+            sys.exit(
+                f"Trajectory {type_} val {vals_max} greater than {max_allowed}"
             )
-            return
 
     out_fh = open(args.out_file, "wt")
     json.dump({"rmsd": rmsd_values, "rmsf": rmsf_values}, out_fh)
