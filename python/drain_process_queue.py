@@ -507,7 +507,16 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
             start_new_session=True,
         )
     except FileNotFoundError:
-        finish_failure(cur, job, None, "mdr-process not found", base_url, log_file, status)
+        finish_failure(
+            cur,
+            job,
+            None,
+            "mdr-process not found",
+            base_url,
+            log_file,
+            status,
+            summary="mdr-process not found on PATH.",
+        )
         return True
 
     timed_out = False
@@ -535,7 +544,21 @@ def run_job(cur, job, base_url: str, log_dir: str, status) -> bool:
             detail += f"\n\nLast {ERROR_LINES} lines of debug log:\n{log_tail}"
 
         finish_failure(
-            cur, job, None, detail, base_url, log_file, status, killed=True
+            cur,
+            job,
+            None,
+            detail,
+            base_url,
+            log_file,
+            status,
+            killed=True,
+            # Worth one line in the channel rather than a click: a killed job
+            # may have left half-written state, which changes what a human does
+            # next. The rest of the explanation is in last_error.
+            summary=(
+                f"Exceeded the {limit} time limit and was terminated; "
+                f"it may have left half-written state."
+            ),
         )
         return True
 
@@ -781,6 +804,7 @@ def finish_failure(
     log_file: str,
     status,
     killed: bool = False,
+    summary: str = "",
 ) -> None:
     """Mark a job failed (terminal, no retry) and post a Slack notice for a human
 
@@ -788,6 +812,18 @@ def finish_failure(
     than the job failing on its own. The notice leads with that, because the two
     need different responses: a KILLED job may have left half-written state
     behind, where a FAILED one stopped where mdr-process chose to.
+
+    `detail` is the full text -- mdr-process's own error plus the tail of the
+    debug log -- and it still goes to `last_error`, which is what the admin page
+    renders and what is worth having in the database.
+
+    `summary` is the at-most-one-line version for Slack, and is usually empty.
+    The Slack notice deliberately carries NO debug output (changed 2026-08-11 at
+    Ken's request): it links to the job in the admin UI and names the log file
+    instead. A twenty-line traceback in a chat channel is unreadable, pushes
+    other alerts off the screen, and duplicates what the admin page shows
+    better. The alert's job is to say which ticket broke and roughly why -- the
+    diagnosis lives one click away.
     """
 
     ticket_id = job["ticket_id"]
@@ -808,13 +844,19 @@ def finish_failure(
     after = f" after {took}" if took else ""
 
     verb = "KILLED (exceeded time limit)" if killed else "FAILED"
+    # The log line keeps the full detail: it goes to a file, not a chat channel.
     status(f"Job {job['id']} (ticket {ticket_id}) {verb}{after}: {detail}")
     exit_note = "" if killed or exit_code is None else f" (exit {exit_code})"
-    send_slack_message(
-        f"Ticket {ticket_id} processing {verb}{exit_note}{after}\n"
-        f"```\n{detail}\n```\nFull debug log: {log_file}",
-        base_url,
-    )
+
+    # Route confirmed against the built Elm bundle, which routes
+    # ["admin","process-job","view",<id>] -- not guessed from the module name.
+    job_url = f"{base_url}/admin/process-job/view/{job['id']}"
+    lines = [f"Ticket {ticket_id} processing {verb}{exit_note}{after}"]
+    if summary:
+        lines.append(summary)
+    lines.append(f"Details: {job_url}")
+    lines.append(f"Debug log: {log_file}")
+    send_slack_message("\n".join(lines), base_url)
 
 
 # --------------------------------------------------
