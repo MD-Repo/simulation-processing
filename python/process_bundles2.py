@@ -118,6 +118,7 @@ class Args(NamedTuple):
     work_dir: str
     log_dir: str
     irods_env: str
+    num_threads: int
     smiles_table: str
     fix_smiles: str
     keep_local: bool
@@ -189,6 +190,19 @@ def get_args() -> Args:
             "IRODS_ENVIRONMENT_FILE",
             os.path.expanduser("~/.irods/irods_environment.json"),
         ),
+    )
+
+    parser.add_argument(
+        "--num-threads",
+        help="Passed to mdr-process as a global --num-threads. It defaults to "
+        "num_cpus (32 here), which is how one invocation came to hold ~320 "
+        "IRODS connections and collapse (MDR-33); the drain's ticket line has "
+        "been pinned at 4 ever since. A bundle pushes once rather than per "
+        "landing, so the connection count was never the danger here -- the "
+        "CPU was, against everything else sharing this box",
+        metavar="INT",
+        type=int,
+        default=4,
     )
 
     parser.add_argument(
@@ -270,6 +284,7 @@ def get_args() -> Args:
         work_dir=args.work_dir,
         log_dir=log_dir,
         irods_env=args.irods_env,
+        num_threads=args.num_threads,
         smiles_table=args.smiles_table,
         fix_smiles=args.fix_smiles,
         keep_local=args.keep_local,
@@ -376,7 +391,8 @@ def process_one(session, args, name, record, status, notify) -> str:
 
     log_file = os.path.join(args.log_dir, f"{name}.log")
     returncode, detail = run_mdr_process(
-        local_dir, args.server, log_file, args.dry_run, status
+        local_dir, args.server, log_file, args.dry_run, status,
+        args.num_threads,
     )
 
     if args.dry_run:
@@ -619,7 +635,8 @@ def fetch_bundle(name: str, work_dir: str, status) -> Fetched:
 
 # --------------------------------------------------
 def run_mdr_process(
-    local_dir: str, server: str, log_file: str, dry_run: bool, status
+    local_dir: str, server: str, log_file: str, dry_run: bool, status,
+    num_threads: int = 4,
 ) -> Tuple[Optional[int], str]:
     """Run "mdr-process process" on a local directory.
 
@@ -636,6 +653,10 @@ def run_mdr_process(
         "debug",
         "--log-file",
         log_file,
+        # Global, so it must precede the subcommand -- same shape as the
+        # drain's "mdr-process --num-threads 4 ticket ...".
+        "--num-threads",
+        str(num_threads),
         "process",
         local_dir,
         "--server",
