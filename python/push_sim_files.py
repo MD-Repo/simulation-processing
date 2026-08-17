@@ -437,7 +437,12 @@ def main() -> None:
 
             verified = present and remote_md5 == target["expected_md5"].lower()
             if not verified:
-                why = "md5 mismatch" if present else "missing"
+                if not present:
+                    why = "missing"
+                elif remote_md5 is None:
+                    why = "no checksum available"
+                else:
+                    why = "md5 mismatch"
                 print(
                     f" NOT VERIFIED [{target['location']}] {target['dest']} ({why})"
                 )
@@ -494,8 +499,18 @@ def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelt
     basename = os.path.basename(local_path)
     remote_path = os.path.join(irods_dir, basename)
 
-    # Files over 32M are transferred with multiple threads automatically
-    options = {kw.FORCE_FLAG_KW: ""}
+    # Files over 32M are transferred with multiple threads automatically.
+    #
+    # REG_CHKSUM_KW makes the server hash the bytes as it writes them and
+    # register the result in the catalog. That is what lets verify_irods()
+    # read a checksum back as plain metadata instead of calling chksum(),
+    # which asks the server to resolve a resource hierarchy and re-read the
+    # whole object -- the RPC that raised HIERARCHY_ERROR on 46 groups across
+    # the 08-12 and 08-14 merge runs. Without this, a put registers no
+    # checksum at all, so there is nothing for verification to fall back on.
+    # It is also the cheaper of the two: hashing during the write replaces a
+    # second full read of every file, which matters at 10G per full.tar.
+    options = {kw.FORCE_FLAG_KW: "", kw.REG_CHKSUM_KW: ""}
 
     for attempt in range(1, NUM_RETRIES + 1):
         if ABORT.is_set():
@@ -567,8 +582,10 @@ def get_files(args: Args) -> Dict[str, List[str]]:
 # --------------------------------------------------
 def verify_irods(session, remote_path: str, expected_size: int):
     """Return (present, md5) for an IRODS object. `present` requires the remote
-    size to match the local file; `md5` is the object's server-side checksum
-    (the zone hashes with MD5, so this compares to our manifest directly)."""
+    size to match the local file; `md5` is the object's MD5 as IRODS has it (the
+    zone hashes with MD5, so this compares to our manifest directly). A `md5` of
+    None means the object is there but could not be checksummed -- the caller
+    treats that as unverified, never as a pass."""
 
     if not session.data_objects.exists(remote_path):
         return (False, None)
@@ -577,9 +594,27 @@ def verify_irods(session, remote_path: str, expected_size: int):
     if obj.size != expected_size:
         return (False, None)
 
-    # chksum() forces server-side computation and returns it. MD5-scheme
-    # checksums come back as bare hex; strip any "md5:" prefix defensively.
-    chksum = obj.chksum() or ""
+    # Read the checksum the catalog already holds. put_file() registers it at
+    # upload time, so this is the normal path, and it is a metadata lookup: no
+    # hierarchy to resolve, nothing to re-read. MD5-scheme checksums come back
+    # as bare hex; strip any "md5:" prefix defensively.
+    chksum = obj.checksum or ""
+
+    if not chksum:
+        # Nothing registered -- an object uploaded before REG_CHKSUM_KW, or by
+        # something other than this script. Forcing a computation is the only
+        # way left to get an answer, and it is exactly the call that returned
+        # HIERARCHY_ERROR on 46 merge groups. It stays behind a fallback, and
+        # its failure is contained: one unverifiable file is a NOT VERIFIED
+        # line and a simulation left a placeholder, which a later push clears.
+        # Letting it propagate killed the whole verification pass instead, and
+        # with it the run -- so nothing was recorded about the other files.
+        try:
+            chksum = obj.chksum() or ""
+        except Exception as err:
+            print(f" could not checksum {remote_path}: {err}")
+            return (True, None)
+
     return (True, chksum.split(":", 1)[-1].strip().lower())
 
 
