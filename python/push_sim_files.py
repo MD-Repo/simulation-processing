@@ -26,6 +26,20 @@ from subprocess import getstatusoutput
 
 # Attempts per file before giving up
 NUM_RETRIES = 3
+# Nothing bounded a whole invocation of this script. The socket read is
+# bounded (python-irodsclient defaults connection_timeout to 120s) and one
+# file is bounded by NUM_RETRIES, so the worst case for a single file is about
+# six minutes -- yet on 2026-08-18 two of ticket 2243's landings sat in here
+# for 1h51m against a degraded IRODS, between them consuming 3 seconds of CPU
+# and holding two of mdr-process's four worker slots the entire time. They had
+# to be killed by hand before the ticket could finish. A landing that is
+# working takes about two minutes, so an hour is thirty times the headroom a
+# healthy push needs and still cuts a wedged one loose the same shift.
+PUSH_TIMEOUT = 3600  # seconds
+# What the graceful abort gets before the process leaves anyway. The wedged
+# case is exactly the one where waiting for transfer threads to wind down is
+# itself what hangs, so the deadline cannot depend on them cooperating.
+ABORT_GRACE = 120  # seconds
 
 # Serializes output from the upload threads
 PRINT_LOCK = threading.Lock()
@@ -46,6 +60,7 @@ class Args(NamedTuple):
     out_file: Optional[str]
     remove_processed_dir: bool
     threads: int
+    timeout: int
 
 
 # --------------------------------------------------
@@ -130,6 +145,16 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--timeout",
+        help="Seconds before the whole push gives up. Bounds the invocation, "
+        "which neither the socket timeout nor the per-file retries do "
+        "(0 disables)",
+        metavar="INT",
+        type=int,
+        default=PUSH_TIMEOUT,
+    )
+
+    parser.add_argument(
         "--remove-processed-dir",
         help="Remove existing 'processed' dir",
         action="store_true",
@@ -156,6 +181,7 @@ def get_args() -> Args:
         out_file=args.out_file,
         remove_processed_dir=args.remove_processed_dir,
         threads=args.threads,
+        timeout=args.timeout,
     )
 
 
@@ -164,6 +190,13 @@ def main() -> None:
     """Make a jazz noise here"""
 
     args = get_args()
+
+    # Arm the wall-clock deadline before anything can block. SIGALRM is
+    # delivered to the main thread, which is where this runs and where the
+    # 2026-08-18 hang was parked waiting on its worker pool.
+    if args.timeout:
+        signal.signal(signal.SIGALRM, deadline_reached)
+        signal.alarm(args.timeout)
 
     env = dotenv_values()
 
@@ -479,6 +512,37 @@ def main() -> None:
     if errors:
         print("Upload errors:\n" + "\n".join(errors))
     print("Done")
+
+
+# --------------------------------------------------
+def hard_exit(_signum, _frame) -> None:
+    """Leave immediately, without waiting on transfer threads"""
+
+    print(
+        f"Deadline exceeded and {ABORT_GRACE}s of grace elapsed; exiting",
+        file=sys.stderr,
+        flush=True,
+    )
+    # os._exit rather than sys.exit: the threads this is escaping from are
+    # not daemons, so a normal exit would block on the join that is stuck.
+    os._exit(1)
+
+
+# --------------------------------------------------
+def deadline_reached(_signum, _frame) -> None:
+    """Abort on the wall-clock deadline, then leave whether or not it works
+
+    Reuses the abort path a terminating signal takes, so a timeout winds the
+    transfers down the same way a SIGTERM does, and falls back to leaving
+    outright after ABORT_GRACE -- the same two-stage shape abort_uploads uses
+    for a second signal, and for the same reason.
+    """
+
+    signal.signal(signal.SIGALRM, hard_exit)
+    signal.alarm(ABORT_GRACE)
+    ABORT.set()
+    abort_parallel_transfers()
+    print("Push deadline reached; aborting uploads", file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------
