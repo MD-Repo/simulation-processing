@@ -11,13 +11,23 @@ successfully kept its landing copy forever: 16,241 collections were sitting
 under the prod landing area, on the order of a terabyte, all of it already
 imported and pushed.
 
-The unit is the landing directory, not the ticket. Each one answers for itself
-from two independent signals that have to agree: `md_upload_instance.
+The unit is the landing directory, not the ticket. Each one answers for itself,
+and there are three answers: delete it having verified it, delete it because a
+person said to, or hold it for a human. The first needs two independent signals
+that have to agree: `md_upload_instance.
 successful`, which is the pipeline's opinion of its own run, and
 `is_placeholder = false` on the simulation it produced, which `mdr-process`
 clears only after verifying the push by MD5 and presence. Age is never
 consulted, and abandonment is never inferred -- a landing that fails either
 test is held for a human, however old it is.
+
+The second answer is md_upload_instance.is_abandoned, which an administrator
+sets to say a landing will never be reprocessed. It is deleted without
+verification, because an abandoned landing characteristically produced no
+simulation and so has no permanent copy to check -- there is nothing to verify
+and never will be. That weakens the safety net on purpose, for the one case
+where the net cannot apply, so those deletions are counted and reported apart
+from the verified ones rather than blended into the same number.
 
 The landing is the unit because it is the only granularity at which
 verification and deletion are the same thing. Deleting per ticket while
@@ -151,6 +161,9 @@ class Landing(NamedTuple):
     irods_dir: Optional[str]
     local_dir: Optional[str]
     sim_id: Optional[int]
+    # Deleted on a person's say-so rather than on evidence, so it skips the
+    # verification every other landing must pass -- see find_candidates.
+    abandoned: bool = False
 
 
 class Candidate(NamedTuple):
@@ -451,6 +464,20 @@ def find_candidates(cur, args: Args) -> List[Candidate]:
     A landing collection with no upload instance at all is never eligible: it
     produced no simulation, so nothing about it was ever verified. Those are
     held for a human, which is what the abandonment flag is for.
+
+    **Three states, not two.** `md_upload_instance.is_abandoned` is set by an
+    administrator to say this landing will never be reprocessed -- resent by
+    the submitter, superseded, or simply given up on. It is deleted on that
+    say-so and *without* verification, because there is nothing to verify
+    against: an abandoned landing characteristically produced no simulation, so
+    no permanent copy exists and none ever will. That is a real weakening of
+    the safety net, so it is reported loudly rather than folded in with the
+    verified deletions, and it is never reachable by inference -- `successful =
+    false` does not imply it, since "failed once" is not "abandoned" when the
+    queue may yet retry.
+
+    Eligible wins over abandoned where both are true. A landing that imported
+    and pushed cleanly can be verified, so it is, whatever the flag says.
     """
 
     where = [
@@ -470,6 +497,7 @@ def find_candidates(cur, args: Args) -> List[Candidate]:
                u.landing_id,
                u.simulation_id,
                u.successful,
+               u.is_abandoned,
                s.is_placeholder,
                t.irods_tickets,
                exists (select 1 from md_process_job j
@@ -500,7 +528,7 @@ def find_candidates(cur, args: Args) -> List[Candidate]:
             and row["is_placeholder"] is False
         )
 
-        if not eligible:
+        if not eligible and not row["is_abandoned"]:
             ticket["held"] += 1
             continue
 
@@ -511,13 +539,17 @@ def find_candidates(cur, args: Args) -> List[Candidate]:
                 local_dir=local_dir_for(args, row["ticket_id"],
                                         row["landing_id"]),
                 sim_id=row["simulation_id"],
+                abandoned=not eligible,
             )
         )
 
     return [
         Candidate(
             ticket_id=ticket_id,
-            num_sims=len(info["landings"]),
+            # Landings, not simulations: an abandoned landing characteristically
+            # has none, so counting rows here would overstate it by exactly the
+            # landings that have nothing to count.
+            num_sims=len([l for l in info["landings"] if l.sim_id is not None]),
             has_job=info["has_job"],
             landings=info["landings"],
             held=info["held"],
@@ -740,8 +772,18 @@ def verify_permanent(
     """
 
     # Verify exactly the simulations whose landings we are about to delete,
-    # not the ticket's other ones, which we are not touching.
-    sim_ids = [l.sim_id for l in cand.landings]
+    # not the ticket's other ones, which we are not touching. Abandoned
+    # landings are excluded by definition: they have no permanent copy to
+    # check, which is the whole reason they need a person's decision.
+    sim_ids = [l.sim_id for l in cand.landings
+               if l.sim_id is not None and not l.abandoned]
+
+    if not sim_ids:
+        # Every landing here is abandoned, so there is nothing to verify and
+        # nothing to refuse. Returning the ticket-level "no file rows" refusal
+        # would be wrong: that means "we cannot check what we should be able to
+        # check", and this is "there was never anything to check".
+        return ({}, {})
 
     cur.execute(
         """
@@ -1109,7 +1151,7 @@ def main() -> None:
     totals = dict(EMPTY)
     totals.update({"tickets": 0, "skipped": 0, "unverified": 0, "verified": 0,
                    "unchecked": 0, "held_unverified": 0, "held_unchecked": 0,
-                   "reaped": 0, "in_flight": 0})
+                   "reaped": 0, "in_flight": 0, "abandoned": 0})
     sessions = SessionPool(args.irods_env, REMOVE_TIMEOUT)
 
     try:
@@ -1181,6 +1223,21 @@ def main() -> None:
                     f"({len(cand.landings)} landing(s))")
                 continue
 
+            abandoned = [l for l in cand.landings if l.abandoned]
+            if abandoned:
+                # Said before the deletion, not after, and this ordering is the
+                # point rather than a nicety: it is the one path that deletes
+                # without having verified anything, so a run that dies partway
+                # must already have named what it was about to take on trust.
+                verb = "Deleting" if args.delete else "Would delete"
+                say(f"ticket {cand.ticket_id}: {verb} "
+                    f"{len(abandoned)} ABANDONED landing(s) WITHOUT "
+                    f"verification, on an administrator's decision")
+                for l in abandoned[:5]:
+                    print(f"    {l.landing_id}", flush=True)
+                if len(abandoned) > 5:
+                    print(f"    ... and {len(abandoned) - 5} more", flush=True)
+
             result = purge_ticket(sessions, cand, args)
 
             if not (result["present"] or result["local_present"]):
@@ -1190,6 +1247,10 @@ def main() -> None:
             for key in result:
                 totals[key] += result[key]
             totals["tickets"] += 1
+            # Counted here rather than where it is announced: the announcement
+            # is about what we are prepared to do, and has to come first, but
+            # the summary should only claim what was actually there to delete.
+            totals["abandoned"] += len(abandoned)
 
             reaped = reap_ticket_dir(cand, args)
             totals["reaped"] += reaped
@@ -1240,6 +1301,11 @@ def main() -> None:
             f"local landing director(ies), {human(totals['local_freed'])} on "
             f"{args.local_root}"
         )
+
+    if totals["abandoned"]:
+        print(f"Deleted {totals['abandoned']} abandoned landing(s) without "
+              f"verification, on an administrator's decision "
+              f"(md_upload_instance.is_abandoned)")
 
     if totals["in_flight"]:
         print(f"Skipped {totals['in_flight']} ticket(s) with a job in flight; "
@@ -1300,6 +1366,9 @@ def main() -> None:
         if totals["held_unverified"] or totals["held_unchecked"]:
             summary += (f"; held {totals['held_unverified']} unverified and "
                         f"{totals['held_unchecked']} unreachable landing(s)")
+        if totals["abandoned"]:
+            summary += (f"; {totals['abandoned']} abandoned landing(s) deleted "
+                        f"UNVERIFIED on an administrator's decision")
         if totals["local_failed"]:
             summary += f"; {totals['local_failed']} local removal(s) failed"
         if totals["stalled"]:
