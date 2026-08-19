@@ -60,6 +60,7 @@ class Args(NamedTuple):
     server: str
     irods_env: str
     landing_dirs: List[str]
+    only_landings: List[str]
     ticket_ids: List[str]
     pattern: Optional[re.Pattern]
     threads: int
@@ -187,6 +188,22 @@ def get_args() -> Args:
         nargs="*",
     )
 
+    # Distinct from --landing-dir above, which selects whole TICKETS by
+    # matching md_ticket.irods_tickets. This selects landing directories
+    # *within* the tickets already chosen, by the collection's basename --
+    # the same string as md_upload_instance.landing_id and the local
+    # sub-directory name, which is why a caller can name one without
+    # consulting IRODS first. Fetching one landing of a 200-landing ticket
+    # otherwise means fetching all 200.
+    parser.add_argument(
+        "-L",
+        "--only-landing",
+        help="Only fetch these landing director(ies), by name, from the "
+        "ticket(s) selected above",
+        metavar="STR",
+        nargs="*",
+    )
+
     parser.add_argument(
         "-t",
         "--ticket-id",
@@ -272,6 +289,7 @@ def get_args() -> Args:
         out_dir=args.out_dir,
         irods_env=args.irods_env,
         landing_dirs=args.landing_dir or [],
+        only_landings=args.only_landing or [],
         ticket_ids=ticket_ids,
         pattern=pattern,
         threads=args.threads,
@@ -307,6 +325,20 @@ def main() -> None:
     refs = []
     for ticket_num, ticket in enumerate(tickets, start=1):
         refs.extend(prepare_ticket(ticket, args, ticket_num))
+
+    # A landing named on the command line that no selected ticket contains is
+    # a mistake worth stopping for -- a typo, or the wrong ticket. Reporting it
+    # as "nothing to fetch" reads like the work was already done.
+    if args.only_landings:
+        found = {landing_name(ref.irods_ticket) for ref in refs}
+        missing = [name for name in args.only_landings if name not in found]
+        if missing:
+            sys.exit(
+                "Not in ticket(s) {}: {}".format(
+                    ", ".join(str(t.ticket_id) for t in tickets),
+                    ", ".join(missing),
+                )
+            )
 
     if not refs:
         print(f"Nothing to fetch, see '{args.out_dir}'")
@@ -408,6 +440,18 @@ class SessionPool:
 
 
 # --------------------------------------------------
+def landing_name(irods_ticket: str) -> str:
+    """The landing directory's name, from one entry of md_ticket.irods_tickets
+
+    The entry is "<token>:<collection path>", so this is the collection's
+    basename -- which is verbatim md_upload_instance.landing_id and the local
+    sub-directory name. Same split as resolve_part uses on the same field.
+    """
+
+    return os.path.basename(irods_ticket.split(":")[1].rstrip("/"))
+
+
+# --------------------------------------------------
 def prepare_ticket(ticket: Ticket, args: Args, ticket_num: int) -> List[PartRef]:
     """Set up a ticket's directory and split it into parts to be claimed
 
@@ -417,6 +461,22 @@ def prepare_ticket(ticket: Ticket, args: Args, ticket_num: int) -> List[PartRef]
     """
 
     irods_tickets = ticket.irods_tickets.split(";")
+
+    # Number the parts from the ticket's FULL list before any filtering, so a
+    # landing keeps the same part number whether or not it was asked for by
+    # name -- otherwise the same directory appears as a different part in two
+    # logs. Selecting nothing here returns before the filesystem is touched,
+    # so naming one ticket's landing does not leave empty ticket-NNNN shells
+    # behind for every other ticket on the command line.
+    wanted = set(args.only_landings)
+    selected = [
+        (irods_num, irods_ticket)
+        for irods_num, irods_ticket in enumerate(irods_tickets, start=1)
+        if not wanted or landing_name(irods_ticket) in wanted
+    ]
+    if not selected:
+        return []
+
     created = ticket.created_at
     created_by = f"{ticket.first_name} {ticket.last_name} ({ticket.email})"
     ticket_dir = os.path.join(args.out_dir, f"ticket-{ticket.ticket_id}")
@@ -431,7 +491,8 @@ def prepare_ticket(ticket: Ticket, args: Args, ticket_num: int) -> List[PartRef]
                 f" Created by: {created_by}",
                 f" Token     : {ticket.token}",
                 f" Directory : {ticket_dir}",
-                f" Num parts : {len(irods_tickets)}",
+                f" Num parts : {len(selected)}"
+                + (f" of {len(irods_tickets)} (--only-landing)" if wanted else ""),
             ]
         )
     )
@@ -457,7 +518,7 @@ def prepare_ticket(ticket: Ticket, args: Args, ticket_num: int) -> List[PartRef]
             irods_ticket=irods_ticket,
             ticket_dir=ticket_dir,
         )
-        for irods_num, irods_ticket in enumerate(irods_tickets, start=1)
+        for irods_num, irods_ticket in selected
     ]
 
 
