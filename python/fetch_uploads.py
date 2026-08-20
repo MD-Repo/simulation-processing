@@ -157,6 +157,18 @@ MAX_OBJECTS_PER_CALL = 100
 # single file for half the connections -- worth it while CyVerse's global
 # 500-connection ceiling, shared across all of their users, is the binding
 # constraint rather than our bandwidth.
+#
+# That measurement is a GET, on md-postprocess, against a congested server, and
+# it does not generalise. The same reasoning was applied to the upload side in
+# 37e5ae8 and was wrong there: e4363b9 reverted push_sim_files.py after
+# num_threads=1 slowed the 18k backlog to near-sequential. This line was part of
+# 37e5ae8 too and was NOT reverted -- it survives because it is a download, not
+# because anyone re-measured it.
+#
+# For contrast, gocmd PUT was measured on md-process-2 2026-08-20 (300 MB,
+# alternated) and rises monotonically with threads: 5.7 MB/s at 1, 7.8 at 2,
+# 9.3 at 3, 10.3 at the default 5. On that host 1 is the worst available
+# setting for uploads, costing 45%. Nobody has yet measured gocmd GET here.
 GOCMD_THREADS_PER_FILE = 1
 
 # Cap on how many landing directories share one "gocmd get". A batch is
