@@ -419,6 +419,7 @@ def make_args(threads=8, pattern=None):
         server="prod",
         irods_env="/env.json",
         landing_dirs=[],
+        only_landings=[],
         ticket_ids=[],
         pattern=pattern,
         threads=threads,
