@@ -26,6 +26,18 @@ from subprocess import getstatusoutput
 
 # Attempts per file before giving up
 NUM_RETRIES = 3
+
+# Threads python-irodsclient may use for ONE transfer, and so how many IRODS
+# connections one transfer costs. It defaults to 3 for anything over 32 MB,
+# which with --threads 4 means a dozen or more connections for four files.
+#
+# One is not a throughput sacrifice. Measured 2026-08-20 on two release
+# objects, alternating thread counts to rule out drift: 3 threads took 24.2s
+# and 24.8s, single-stream 12.8s and 13.7s. Single was never slower and
+# usually about 1.8x faster -- the parallel path appears to hurt against a
+# saturated server, and CyVerse's 500-connection ceiling is global across all
+# of their users, not ours alone.
+TRANSFER_THREADS = 1
 # Nothing bounded a whole invocation of this script. The socket read is
 # bounded (python-irodsclient defaults connection_timeout to 120s) and one
 # file is bounded by NUM_RETRIES, so the worst case for a single file is about
@@ -584,7 +596,12 @@ def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelt
         session = sessions.get()
         try:
             start = dt.now()
-            session.data_objects.put(local_path, remote_path, **options)
+            session.data_objects.put(
+                local_path,
+                remote_path,
+                num_threads=TRANSFER_THREADS,
+                **options,
+            )
             return dt.now() - start
         except Exception as e:
             # A failed transfer can leave a connection mid-protocol, so drop

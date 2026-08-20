@@ -146,6 +146,19 @@ SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
 # long enough to hit ARG_MAX.
 MAX_OBJECTS_PER_CALL = 100
 
+# Transfer threads gocmd may spend on a SINGLE file. It defaults to 5 per
+# file (and 5 overall), so one trajectory can hold five IRODS connections by
+# itself. Capping per-file fan-out rather than passing --single_threaded keeps
+# several files moving at once, which is the point of batching a whole landing
+# directory into one call.
+#
+# Measured 2026-08-20 on an 82 MB release object: default took 16.9s and 4
+# connections, --thread_num_per_file 1 took 18.5s and 2. About 9% slower on a
+# single file for half the connections -- worth it while CyVerse's global
+# 500-connection ceiling, shared across all of their users, is the binding
+# constraint rather than our bandwidth.
+GOCMD_THREADS_PER_FILE = 1
+
 # Cap on how many landing directories share one "gocmd get". A batch is
 # all-or-nothing on its first attempt and reports nothing until it finishes,
 # so this trades a little of the saving for progress visibility and blast
@@ -864,7 +877,10 @@ def run_gocmd(paths: List[str], dest_dir: str) -> str:
     """
 
     quoted = " ".join(shlex.quote(path) for path in paths)
-    cmd = f"gocmd get -f --diff {quoted} {shlex.quote(dest_dir)}"
+    cmd = (
+        f"gocmd get -f --diff --thread_num_per_file {GOCMD_THREADS_PER_FILE} "
+        f"{quoted} {shlex.quote(dest_dir)}"
+    )
     rv, out = getstatusoutput(cmd)
     if rv != 0:
         # Keep gocmd's text verbatim: the queue reads it to decide whether
