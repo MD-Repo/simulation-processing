@@ -146,30 +146,28 @@ SUBMISSION_COMPLETE = "mdrepo-submission.completed.json"
 # long enough to hit ARG_MAX.
 MAX_OBJECTS_PER_CALL = 100
 
-# Transfer threads gocmd may spend on a SINGLE file. It defaults to 5 per
-# file (and 5 overall), so one trajectory can hold five IRODS connections by
-# itself. Capping per-file fan-out rather than passing --single_threaded keeps
-# several files moving at once, which is the point of batching a whole landing
-# directory into one call.
+# Transfer threads gocmd may spend on a SINGLE file. 0 means "don't pass the
+# flag", i.e. gocmd's own default of 5 -- the same convention as
+# push_sim_files.py's --transfer-threads.
 #
-# Measured 2026-08-20 on an 82 MB release object: default took 16.9s and 4
-# connections, --thread_num_per_file 1 took 18.5s and 2. About 9% slower on a
-# single file for half the connections -- worth it while CyVerse's global
-# 500-connection ceiling, shared across all of their users, is the binding
-# constraint rather than our bandwidth.
+# This was 1 between 37e5ae8 and now. It is back to the default because the
+# only measurement behind the cap was a GET of one 82 MB object on
+# md-postprocess against a congested server (16.9s and 4 connections at the
+# default, 18.5s and 2 capped), and fetch_uploads runs on BOTH hosts --
+# ticket.rs shells out to it from mdr-process. So the processing VM's fetches
+# were being capped by a number measured somewhere else entirely.
 #
-# That measurement is a GET, on md-postprocess, against a congested server, and
-# it does not generalise. The same reasoning was applied to the upload side in
-# 37e5ae8 and was wrong there: e4363b9 reverted push_sim_files.py after
-# num_threads=1 slowed the 18k backlog to near-sequential. This line was part of
-# 37e5ae8 too and was NOT reverted -- it survives because it is a download, not
-# because anyone re-measured it.
+# That is the exact shape of the mistake that made this line suspect. 37e5ae8
+# also capped the upload path from the same benchmark; on the VM that slowed an
+# 18,000-simulation backlog to near-sequential and was reverted in e4363b9.
+# gocmd PUT there rises monotonically with threads (5.7 MB/s at 1 against 10.3
+# at the default 5), which is what a bandwidth-delay-bound link looks like --
+# nothing like the server-bound behaviour measured here.
 #
-# For contrast, gocmd PUT was measured on md-process-2 2026-08-20 (300 MB,
-# alternated) and rises monotonically with threads: 5.7 MB/s at 1, 7.8 at 2,
-# 9.3 at 3, 10.3 at the default 5. On that host 1 is the worst available
-# setting for uploads, costing 45%. Nobody has yet measured gocmd GET here.
-GOCMD_THREADS_PER_FILE = 1
+# Nobody has measured gocmd GET on the VM. Until someone does, the default is
+# the setting that is not an extrapolation. Re-cap per host, on that host's own
+# numbers, not on these.
+GOCMD_THREADS_PER_FILE = 0
 
 # Cap on how many landing directories share one "gocmd get". A batch is
 # all-or-nothing on its first attempt and reports nothing until it finishes,
@@ -889,10 +887,12 @@ def run_gocmd(paths: List[str], dest_dir: str) -> str:
     """
 
     quoted = " ".join(shlex.quote(path) for path in paths)
-    cmd = (
-        f"gocmd get -f --diff --thread_num_per_file {GOCMD_THREADS_PER_FILE} "
-        f"{quoted} {shlex.quote(dest_dir)}"
+    threads = (
+        f"--thread_num_per_file {GOCMD_THREADS_PER_FILE} "
+        if GOCMD_THREADS_PER_FILE
+        else ""
     )
+    cmd = f"gocmd get -f --diff {threads}{quoted} {shlex.quote(dest_dir)}"
     rv, out = getstatusoutput(cmd)
     if rv != 0:
         # Keep gocmd's text verbatim: the queue reads it to decide whether
