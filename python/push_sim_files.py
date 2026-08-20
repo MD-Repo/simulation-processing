@@ -27,17 +27,24 @@ from subprocess import getstatusoutput
 # Attempts per file before giving up
 NUM_RETRIES = 3
 
-# Threads python-irodsclient may use for ONE transfer, and so how many IRODS
-# connections one transfer costs. It defaults to 3 for anything over 32 MB,
-# which with --threads 4 means a dozen or more connections for four files.
+# Default transfer threads for ONE put. 0 means "let python-irodsclient
+# decide", which is 3 for anything over 32 MB -- the behaviour this script had
+# before 2026-08-20.
 #
-# One is not a throughput sacrifice. Measured 2026-08-20 on two release
-# objects, alternating thread counts to rule out drift: 3 threads took 24.2s
-# and 24.8s, single-stream 12.8s and 13.7s. Single was never slower and
-# usually about 1.8x faster -- the parallel path appears to hurt against a
-# saturated server, and CyVerse's 500-connection ceiling is global across all
-# of their users, not ours alone.
-TRANSFER_THREADS = 1
+# Do NOT hardcode this to 1. It was, briefly, on the strength of a download
+# benchmark taken on the post-processing host against a congested server, where
+# the server was the bottleneck and extra streams bought nothing. Uploading from
+# the processing VM is a different regime: on a high-latency WAN link a single
+# TCP stream is capped by the bandwidth-delay product, and num_threads=1 does
+# not merely use fewer streams -- it fails should_parallelize_transfer() and
+# drops the put into a synchronous chunked write loop over one connection. On
+# the VM working the 18k backlog that turned four concurrent pushes into
+# something close to sequential.
+#
+# Tune it per host with --transfer-threads. Lower values trade throughput for
+# IRODS connections, which matter because CyVerse's ~500 ceiling is shared
+# across all of their users.
+DEFAULT_TRANSFER_THREADS = 0
 # Nothing bounded a whole invocation of this script. The socket read is
 # bounded (python-irodsclient defaults connection_timeout to 120s) and one
 # file is bounded by NUM_RETRIES, so the worst case for a single file is about
@@ -72,6 +79,7 @@ class Args(NamedTuple):
     out_file: Optional[str]
     remove_processed_dir: bool
     threads: int
+    transfer_threads: int
     timeout: int
 
 
@@ -155,6 +163,13 @@ def get_args() -> Args:
         type=int,
         default=4,
     )
+    parser.add_argument(
+        "--transfer-threads",
+        help="Threads per single transfer (0 = client default, 3 over 32MB)",
+        metavar="INT",
+        type=int,
+        default=DEFAULT_TRANSFER_THREADS,
+    )
 
     parser.add_argument(
         "--timeout",
@@ -193,6 +208,7 @@ def get_args() -> Args:
         out_file=args.out_file,
         remove_processed_dir=args.remove_processed_dir,
         threads=args.threads,
+        transfer_threads=args.transfer_threads,
         timeout=args.timeout,
     )
 
@@ -410,7 +426,13 @@ def main() -> None:
                     pool = ThreadPoolExecutor(max_workers=num_threads)
                     try:
                         futures = {
-                            pool.submit(put_file, sessions, path, irods_dir): path
+                            pool.submit(
+                                put_file,
+                                sessions,
+                                path,
+                                irods_dir,
+                                args.transfer_threads,
+                            ): path
                             for path in upload
                         }
 
@@ -569,7 +591,12 @@ def abort_uploads(signum, _frame) -> None:
 
 
 # --------------------------------------------------
-def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelta:
+def put_file(
+    sessions: queue.Queue,
+    local_path: str,
+    irods_dir: str,
+    transfer_threads: int,
+) -> timedelta:
     """Upload one file to IRODS, retrying on failure"""
 
     basename = os.path.basename(local_path)
@@ -599,7 +626,7 @@ def put_file(sessions: queue.Queue, local_path: str, irods_dir: str) -> timedelt
             session.data_objects.put(
                 local_path,
                 remote_path,
-                num_threads=TRANSFER_THREADS,
+                num_threads=transfer_threads,
                 **options,
             )
             return dt.now() - start
