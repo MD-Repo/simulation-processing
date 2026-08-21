@@ -140,10 +140,13 @@ def get_args() -> Args:
     parser.add_argument(
         "-s",
         "--server",
-        help="Target server",
+        help="Target server. Defaults to staging, deliberately: everything "
+        "processed out of bundles2 so far went to staging, nothing has been "
+        "promoted to prod, and a default of prod meant one forgotten flag "
+        "wrote a 15,000-bundle backfill straight into production",
         metavar="STR",
         choices=["staging", "prod"],
-        default="prod",
+        default="staging",
     )
 
     parser.add_argument(
