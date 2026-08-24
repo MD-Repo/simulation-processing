@@ -134,7 +134,8 @@ DEFAULT_WORK_DIR = "/opt/mdrepo/backups"
 COMPLETE_MARKER = b"PostgreSQL database dump complete"
 
 # The monthly archive: the first backup of each calendar month is ALSO stored
-# under a full date, mdrepo.YYYY-MM-DD.sql.gz, and nothing ever overwrites it.
+# under a full date, archive.mdrepo.YYYY-MM-DD.sql.gz, and nothing ever
+# overwrites it.
 #
 # The rotation is 31 slots reused every month, so a dump survives at most ~31
 # days: the July 6 dump is overwritten on August 6, and by the end of a month
@@ -152,8 +153,23 @@ COMPLETE_MARKER = b"PostgreSQL database dump complete"
 # It grows without bound by design: twelve objects a year, ~0.5 GB each and
 # rising. Against a 10 TiB Swift quota holding 9.5 GB today that is decades of
 # headroom, but it is deliberate accumulation, not a leak.
-ARCHIVE_TEMPLATE = "mdrepo.%Y-%m-%d.sql.gz"
-ARCHIVE_MONTH_PREFIX = "mdrepo.%Y-%m"
+#
+# The "archive." prefix is for the humans reading the listing, not for the
+# code: both destinations are read with a plain `swift list` / `gocmd ls`, which
+# sorts by name, so it lifts the handful of kept snapshots above the 31 rotation
+# slots and mdrepo.latest instead of interleaving them by year. Renamed
+# 2026-08-24; snapshots written before then still carry the bare mdrepo. name,
+# hence the legacy prefix below.
+ARCHIVE_TEMPLATE = "archive.mdrepo.%Y-%m-%d.sql.gz"
+ARCHIVE_MONTH_PREFIX = "archive.mdrepo.%Y-%m"
+
+# A month archived under the OLD name is still archived. Without this the first
+# run after the rename would see no archive.mdrepo.2026-08* and write a second
+# snapshot of the same month under the new name -- harmless but wasteful, and it
+# would make that month the only one holding two. Both prefixes are checked
+# rather than dropping the old ones after a rename, because these objects are
+# kept forever: there is no point at which the legacy names age out.
+ARCHIVE_LEGACY_MONTH_PREFIX = "mdrepo.%Y-%m"
 
 # Our own upload timestamp, because the catalog's mtime lies here.
 BACKUP_TIME_AVU = "mdrepo_backup_time"
@@ -626,10 +642,14 @@ def needs_month_archive(existing: List[str], when: datetime) -> bool:
     """True if this month has no archived snapshot yet
 
     Kept separate from the listing so the rule can be read at a glance: the
-    month is archived if nothing already carries this month's prefix.
+    month is archived if nothing already carries this month's prefix, under
+    either the current name or the pre-2026-08-24 one.
     """
 
-    return not any(n.startswith(when.strftime(ARCHIVE_MONTH_PREFIX)) for n in existing)
+    prefixes = (when.strftime(ARCHIVE_MONTH_PREFIX),
+                when.strftime(ARCHIVE_LEGACY_MONTH_PREFIX))
+
+    return not any(n.startswith(prefixes) for n in existing)
 
 
 # --------------------------------------------------
@@ -773,11 +793,17 @@ def main() -> None:
             try:
                 swift_targets = [(dump_path, dump_name), (latest_path, LATEST_NAME)]
                 if not args.no_archive:
-                    # The month prefix itself, not a looser "mdrepo.20" -- that
-                    # also matches the day-20 rotation slot.
-                    existing = swift_names(
-                        args.swift_container, started.strftime(ARCHIVE_MONTH_PREFIX)
-                    )
+                    # Two listings because a Swift prefix is a single string and
+                    # the legacy name is not a suffix of the current one. The
+                    # month prefix itself in both cases, never a looser
+                    # "mdrepo.20" -- that also matches the day-20 rotation slot.
+                    existing = [
+                        name
+                        for template in (ARCHIVE_MONTH_PREFIX,
+                                         ARCHIVE_LEGACY_MONTH_PREFIX)
+                        for name in swift_names(args.swift_container,
+                                                started.strftime(template))
+                    ]
                     if needs_month_archive(existing, started):
                         status(f"First Swift backup of {started:%B %Y}: also "
                                f"archiving as {archive_name}")
