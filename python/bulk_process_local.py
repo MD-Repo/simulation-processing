@@ -42,9 +42,13 @@ Purpose: Phase B/D of the ddd/HANDOFF survey-first plan (see
          metadata, the JSON/TSV evidence and Pro_lig.pdb stay. That is
          ~2.6 MB/bundle, ~18 GB for the whole corpus.
 
-         FAILED bundles are never reaped -- they are Phase C's triage
-         input, they are a small minority, and at the observed rate they
-         total ~115 GB even if every one is kept to the end.
+         FAILED bundles are handled by kind. A PUSH failure is kept: it is
+         retryable for the price of a re-push, since push_sim_files.py skips
+         any file whose md5 already matches, and reaping it forces a ~45
+         minute reprocess instead. A DATA failure is reaped like a success --
+         it needs the data fixed before a retry means anything. Keeping the
+         push failures is affordable only because the circuit breaker bounds
+         how many can pile up.
 
          Nothing is lost by reaping: ddd/data/<name>.tgz is untouched, so
          unpack_local() rebuilds any bundle from source, and Phase D
@@ -61,6 +65,7 @@ Purpose: Phase B/D of the ddd/HANDOFF survey-first plan (see
 """
 
 import argparse
+import collections
 import concurrent.futures
 import json
 import os
@@ -155,6 +160,8 @@ class Args(NamedTuple):
     keep_failed: bool
     max_consecutive_faults: int
     fault_wait: int
+    fault_window: int
+    max_window_faults: int
 
 
 # --------------------------------------------------
@@ -213,13 +220,21 @@ def get_args() -> Args:
                         "then isoform/trembl only if needed), so the peak "
                         "cost is --parallel x this, not more. Omit to leave "
                         "mdr-process's default alone")
-    parser.add_argument("--transfer-threads", type=int, default=None,
-                        metavar="INT",
-                        help="IRODS streams python-irodsclient may open for "
-                        "a single put; mdr-process defaults to 3. THIS is "
-                        "the IRODS knob -- concurrent streams are roughly "
-                        "--parallel x this -- so throttle it here rather "
-                        "than starving local CPU via --parallel")
+    parser.add_argument(
+        "--transfer-threads", type=int, default=0, metavar="INT",
+        help="IRODS streams for a single put. 0 means 'let "
+        "python-irodsclient decide' (3 above 32 MB, fewer below), which is "
+        "push_sim_files.py's own considered default -- see e4363b9. It has "
+        "to be passed EXPLICITLY because mdr-process always sends its own "
+        "default of 3, which otherwise silently overrides push's 0 and "
+        "forces three streams onto every small file. Concurrent connections "
+        "are roughly --parallel x --threads x this, against a CyVerse "
+        "ceiling of ~500 shared with every other user. NOTE: this was NOT "
+        "what lost 7 of 8 bundles on 2026-08-28 -- that was this host being "
+        "absent from CyVerse's VIP list and throttled to ~1 MB/s, which no "
+        "thread setting can help. Changed anyway because the override is "
+        "real and defeats push's deliberate choice",
+    )
     parser.add_argument("--parallel", type=int, default=8, metavar="INT",
                         help="Bundles run concurrently. Phase B can push "
                         "this high (local CPU is the only constraint); "
@@ -242,6 +257,22 @@ def get_args() -> Args:
         "--max-consecutive-faults", type=int, default=5, metavar="INT",
         help="Consecutive IRODS/push faults that mean the server is gone "
         "rather than flaky, triggering a wait (0 = never react)",
+    )
+    # The consecutive rule alone is not enough. On 2026-08-28 batch 1 lost
+    # 7 of 8 bundles to IRODS and never tripped it: four faults, then one
+    # success reset the count, then three more. With several workers in
+    # flight a single stale success lands between failures and hides an
+    # outage indefinitely. So also trip on a RATE over a recent window,
+    # which no interleaving can mask.
+    parser.add_argument(
+        "--fault-window", type=int, default=10, metavar="INT",
+        help="How many recent bundles the rate rule looks at (0 = off)",
+    )
+    parser.add_argument(
+        "--max-window-faults", type=int, default=5, metavar="INT",
+        help="IRODS faults within --fault-window that trip the breaker. A "
+        "healthy run fails ~3.5%% of bundles, so 5 in 10 is far outside "
+        "normal and cannot be produced by interleaving",
     )
     parser.add_argument(
         "--fault-wait", type=int, default=3600, metavar="SEC",
@@ -305,6 +336,7 @@ def get_args() -> Args:
         args.blast_num_threads, args.transfer_threads,
         args.script_dir, args.uv, args.keep_failed,
         args.max_consecutive_faults, args.fault_wait,
+        args.fault_window, args.max_window_faults,
     )
 
 
@@ -729,11 +761,19 @@ def process_one(args: Args, name: str) -> Tuple[str, str, str]:
 
     if returncode != 0:
         status(f"FAILED: {run_detail[:200]}")
-        # A failure costs the same ~5.3 GB as a success, and an outage fails
-        # EVERY bundle -- 4,400 kept failures fill this volume. The evidence
-        # that makes a failure triageable is small and survives the reap; the
-        # per-bundle mdr-process log lives in log_dir, not in here.
-        if args.reap and not args.keep_failed:
+        # A PUSH failure is the cheap kind to retry: push_sim_files.py skips
+        # any file whose md5 already matches, so a re-push moves only what is
+        # missing, in minutes. Reaping it throws that away and forces a ~45
+        # minute reprocess -- which is what happened to all 7 failures on
+        # 2026-08-28. So keep those and reap only data failures, which need
+        # the data fixed before a retry means anything either way.
+        #
+        # This is affordable ONLY because the circuit breaker bounds how many
+        # push failures can accumulate before the run stops; without it, an
+        # outage would keep every bundle and fill the volume.
+        if is_irods_fault("failed", run_detail):
+            status("kept for re-push (push failure, not a data failure)")
+        elif args.reap and not args.keep_failed:
             freed = reap_bundle(local_dir)
             status(f"reaped {freed / 1e9:.1f} GB of the failed bundle")
         return name, "failed", run_detail
@@ -800,6 +840,8 @@ def main() -> None:
     tally: Dict[str, int] = {}
     done = 0
     faults = 0
+    recent: collections.deque = collections.deque(maxlen=args.fault_window
+                                                  or 1)
     outage = False
     pending = list(bundles)
 
@@ -830,26 +872,34 @@ def main() -> None:
                       f"({', '.join(f'{k}={v}' for k, v in tally.items())})",
                       flush=True)
 
-                if is_irods_fault(result, detail):
-                    faults += 1
-                else:
-                    faults = 0
+                fault = is_irods_fault(result, detail)
+                faults = faults + 1 if fault else 0
+                recent.append(fault)
 
-                if (args.max_consecutive_faults
-                        and faults >= args.max_consecutive_faults
-                        and not outage):
-                    print(f"{stamp()} !! {faults} consecutive IRODS/push "
-                          f"faults -- the server looks gone, not flaky",
-                          flush=True)
+                consecutive_trip = (
+                    args.max_consecutive_faults
+                    and faults >= args.max_consecutive_faults
+                )
+                window_trip = (
+                    args.fault_window and args.max_window_faults
+                    and sum(recent) >= args.max_window_faults
+                )
+
+                if (consecutive_trip or window_trip) and not outage:
+                    why = (f"{faults} consecutive"
+                           if consecutive_trip
+                           else f"{sum(recent)} of the last {len(recent)}")
+                    print(f"{stamp()} !! {why} IRODS/push faults -- the "
+                          f"server looks gone, not flaky", flush=True)
                     if args.fault_wait and wait_for_irods(args):
                         faults = 0
+                        recent.clear()
                     else:
                         outage = True
                         pending = []
-                        print(f"{stamp()} !! stopping: {faults} consecutive "
-                              f"faults" + (f" and no IRODS in "
-                              f"{args.fault_wait}s" if args.fault_wait
-                              else ""), flush=True)
+                        print(f"{stamp()} !! stopping: {why} faults" +
+                              (f" and no IRODS in {args.fault_wait}s"
+                               if args.fault_wait else ""), flush=True)
 
                 if pending and not outage:
                     b = pending.pop(0)
