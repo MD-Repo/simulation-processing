@@ -70,6 +70,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import toml
@@ -151,6 +152,9 @@ class Args(NamedTuple):
     transfer_threads: Optional[int]
     script_dir: str
     uv: str
+    keep_failed: bool
+    max_consecutive_faults: int
+    fault_wait: int
 
 
 # --------------------------------------------------
@@ -223,6 +227,27 @@ def get_args() -> Args:
                         "DB with the live ticket queue")
     parser.add_argument("--limit", type=int, default=None, metavar="INT",
                         help="Process only the first N eligible bundles")
+    parser.add_argument(
+        "--keep-failed", action="store_true",
+        help="Keep a FAILED bundle's bulk files. Off by default: a failed "
+        "bundle costs the same ~5.3 GB as a good one, and an outage fails "
+        "every bundle, so keeping them all fills the volume long before the "
+        "run ends. The metadata, structure and any small artifacts are kept "
+        "either way, and the tarball re-extracts",
+    )
+    # Consecutive, not total, for merge_replicate_groups.py's reason: a
+    # steady trickle of unrelated data failures is not an outage, but five
+    # in a row is the server being gone.
+    parser.add_argument(
+        "--max-consecutive-faults", type=int, default=5, metavar="INT",
+        help="Consecutive IRODS/push faults that mean the server is gone "
+        "rather than flaky, triggering a wait (0 = never react)",
+    )
+    parser.add_argument(
+        "--fault-wait", type=int, default=3600, metavar="SEC",
+        help="How long to wait for IRODS to come back before ending the run "
+        "(0 = stop as soon as the fault limit is hit)",
+    )
     parser.add_argument("--script-dir", default=SCRIPT_DIR_DEFAULT,
                         metavar="DIR", help="Where mol_id.py lives")
     parser.add_argument("--uv", default=UV_DEFAULT, metavar="PATH")
@@ -278,7 +303,8 @@ def get_args() -> Args:
         args.parallel, args.limit, args.collection or None,
         args.orcid or None, args.reap, args.verify, args.keep_unverified,
         args.blast_num_threads, args.transfer_threads,
-        args.script_dir, args.uv,
+        args.script_dir, args.uv, args.keep_failed,
+        args.max_consecutive_faults, args.fault_wait,
     )
 
 
@@ -584,6 +610,79 @@ def seed_inferred_ligands(local_dir: str, args: Args) -> List[str]:
 
 
 # --------------------------------------------------
+def is_irods_fault(result: str, detail: str) -> bool:
+    """Does this failure look like the storage being gone, rather than this
+    bundle being bad?
+
+    The distinction is the whole point of a consecutive-fault count. A run
+    of short_description overflows or corrupt tarballs is a data problem and
+    must NOT trip the breaker; a run of failures in push_sim_files.py is
+    CyVerse, and grinding through 6,600 bundles against a dead server would
+    mint one hidden placeholder row each and reap nothing.
+    """
+
+    if result not in ("failed", "error"):
+        return False
+    lowered = detail.lower()
+    return any(marker in lowered for marker in (
+        "push_sim_files", "irods", "cyverse", "networkexception",
+        "unix_file", "hierarchy_error", "sys_", "timed out", "timeout",
+    ))
+
+
+# --------------------------------------------------
+def irods_healthy(args: Args) -> bool:
+    """Ask irods_write_canary.py whether IRODS will accept a real write.
+
+    A read probe is not enough: what fails here is the push. The canary
+    writes, verifies twice and removes, which is exactly the operation the
+    pipeline needs and cannot fake.
+    """
+
+    canary = os.path.join(args.script_dir, "irods_write_canary.py")
+    if not os.path.isfile(canary):
+        return False
+    try:
+        proc = subprocess.run(
+            [sys.executable, canary, "-s", args.server, "--size-mb", "1",
+             "--timeout", "120"],
+            capture_output=True, text=True, timeout=180,
+        )
+        return proc.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+# --------------------------------------------------
+def wait_for_irods(args: Args) -> bool:
+    """Sit out an IRODS outage, or report that it outlasted us.
+
+    Waiting rather than exiting is deliberate, and taken from
+    merge_replicate_groups.py's wait_for_irods(): this run takes days and is
+    unattended, so a ten minute blip at hour twenty should not need a human
+    to restart it. What it must not do is what the merge did on 2026-08-25 --
+    carry on through 87 groups in 90 minutes without merging anything, and
+    exit looking like a completed run.
+    """
+
+    waited = 0
+    delay = 60
+
+    while waited < args.fault_wait:
+        nap = min(delay, args.fault_wait - waited)
+        time.sleep(nap)
+        waited += nap
+        if irods_healthy(args):
+            print(f"{stamp()} .. IRODS answered again after {waited}s, "
+                  f"resuming", flush=True)
+            return True
+        print(f"{stamp()} .. still no IRODS after {waited}s of "
+              f"{args.fault_wait}s", flush=True)
+
+    return False
+
+
+# --------------------------------------------------
 def process_one(args: Args, name: str) -> Tuple[str, str, str]:
     """Unpack, fix SMILES, run mdr-process. Returns (name, result, detail)."""
 
@@ -630,6 +729,13 @@ def process_one(args: Args, name: str) -> Tuple[str, str, str]:
 
     if returncode != 0:
         status(f"FAILED: {run_detail[:200]}")
+        # A failure costs the same ~5.3 GB as a success, and an outage fails
+        # EVERY bundle -- 4,400 kept failures fill this volume. The evidence
+        # that makes a failure triageable is small and survives the reap; the
+        # per-bundle mdr-process log lives in log_dir, not in here.
+        if args.reap and not args.keep_failed:
+            freed = reap_bundle(local_dir)
+            status(f"reaped {freed / 1e9:.1f} GB of the failed bundle")
         return name, "failed", run_detail
 
     prefix = "dry-run" if args.dry_run else "done"
@@ -693,27 +799,69 @@ def main() -> None:
 
     tally: Dict[str, int] = {}
     done = 0
+    faults = 0
+    outage = False
+    pending = list(bundles)
+
+    # Submitted a window at a time rather than all at once: with every
+    # bundle queued up front there is no way to stop early, which is what
+    # turns an outage into 6,600 hidden placeholder rows and a full disk.
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=args.parallel
     ) as pool:
-        futures = {pool.submit(process_one, args, b): b for b in bundles}
-        for future in concurrent.futures.as_completed(futures):
-            name = futures[future]
-            try:
-                name, result, detail = future.result()
-            except Exception as e:
-                # One bundle's unexpected failure must never take the rest
-                # of the run down with it -- see survey_bundles.py's note.
-                result, detail = "error", f"{type(e).__name__}: {e}"
-            append_record(args.record_file, name, result, detail)
-            tally[result] = tally.get(result, 0) + 1
-            done += 1
-            print(f"{stamp()} {done:,}/{len(bundles):,} done "
-                  f"({', '.join(f'{k}={v}' for k, v in tally.items())})",
-                  flush=True)
+        futures = {}
+        while pending and len(futures) < args.parallel * 2:
+            b = pending.pop(0)
+            futures[pool.submit(process_one, args, b)] = b
 
-    print(f"{stamp()} finished: " +
-          ", ".join(f"{k}={v}" for k, v in tally.items()))
+        while futures:
+            for future in concurrent.futures.as_completed(list(futures)):
+                name = futures.pop(future)
+                try:
+                    name, result, detail = future.result()
+                except Exception as e:
+                    # One bundle's unexpected failure must never take the
+                    # rest of the run down -- see survey_bundles.py's note.
+                    result, detail = "error", f"{type(e).__name__}: {e}"
+                append_record(args.record_file, name, result, detail)
+                tally[result] = tally.get(result, 0) + 1
+                done += 1
+                print(f"{stamp()} {done:,}/{len(bundles):,} done "
+                      f"({', '.join(f'{k}={v}' for k, v in tally.items())})",
+                      flush=True)
+
+                if is_irods_fault(result, detail):
+                    faults += 1
+                else:
+                    faults = 0
+
+                if (args.max_consecutive_faults
+                        and faults >= args.max_consecutive_faults
+                        and not outage):
+                    print(f"{stamp()} !! {faults} consecutive IRODS/push "
+                          f"faults -- the server looks gone, not flaky",
+                          flush=True)
+                    if args.fault_wait and wait_for_irods(args):
+                        faults = 0
+                    else:
+                        outage = True
+                        pending = []
+                        print(f"{stamp()} !! stopping: {faults} consecutive "
+                              f"faults" + (f" and no IRODS in "
+                              f"{args.fault_wait}s" if args.fault_wait
+                              else ""), flush=True)
+
+                if pending and not outage:
+                    b = pending.pop(0)
+                    futures[pool.submit(process_one, args, b)] = b
+                break  # re-enter as_completed over the updated set
+
+    verb = "Stopped" if outage else "finished"
+    print(f"{stamp()} {verb}: " +
+          ", ".join(f"{k}={v}" for k, v in sorted(tally.items())) +
+          f"; {len(bundles) - done:,} not attempted", flush=True)
+    if outage:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
