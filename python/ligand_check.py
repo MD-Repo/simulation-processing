@@ -44,11 +44,22 @@ PASS = "pass"
 # Worst-first, so a multi-ligand bundle takes its worst verdict.
 SEVERITY = {BLOCK: 2, FLAG: 1, PASS: 0}
 
-# MDR-40: OpenBabel trusts the PDB element column, and 11gs/Pro_lig.pdb has
-# atoms named CL1/CL2 recorded as element C. Only two-letter symbols are
-# checked -- flagging every one-letter disagreement would be noise.
-TWO_LETTER_ELEMENTS = ("CL", "BR", "FE", "ZN", "MG", "MN", "NA", "CA",
-                       "CU", "SE", "NI", "CO")
+# MDR-40: OpenBabel trusts the PDB element column, and this corpus is full
+# of ligand atoms named CL* recorded as element C -- chlorine silently read
+# as carbon. Only two-letter symbols are checked; a one-letter disagreement
+# is noise.
+#
+# CA, CO, NA and NI are deliberately ABSENT. Every protein alpha-carbon is
+# named CA and is legitimately element C, so including calcium turns the
+# whole backbone into false positives; CO/NA/NI collide with ordinary
+# carbon/nitrogen atom names the same way. The elements kept are the ones
+# whose two-letter name prefix really does imply that element on a ligand.
+TWO_LETTER_ELEMENTS = ("CL", "BR", "FE", "ZN", "MG", "MN", "CU", "SE")
+
+# The ligand residue. mol_id.py infers from this residue, so the element
+# columns that matter are its own -- scanning the protein too would drown
+# the signal.
+LIGAND_RESNAMES = ("LIG", "MOL", "UNL", "UNK", "DRG")
 
 
 # --------------------------------------------------
@@ -70,7 +81,17 @@ def element_column_disagreements(pdb_path: str) -> List[str]:
     try:
         with open(pdb_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if not line.startswith("HETATM"):
+                # ATOM as well as HETATM: this corpus writes its ligand as
+                # ATOM records (1aid/Pro_lig.pdb has 3,175 ATOM and zero
+                # HETATM), so a HETATM-only scan silently examines nothing
+                # and reports every bundle clean.
+                if not line.startswith(("HETATM", "ATOM  ")):
+                    continue
+                # Ligand only: HETATM is a ligand by definition, but this
+                # corpus writes its ligand as ATOM records (1aid has 3,175
+                # ATOM and zero HETATM), so those are filtered by residue.
+                if line.startswith("ATOM  ") and \
+                        line[17:20].strip().upper() not in LIGAND_RESNAMES:
                     continue
                 name = line[12:16].strip().upper()
                 element = line[76:78].strip().upper()
@@ -86,6 +107,47 @@ def element_column_disagreements(pdb_path: str) -> List[str]:
         return [f"unreadable: {e}"]
 
     return sorted(set(bad))
+
+
+# --------------------------------------------------
+def write_element_corrected(src: str, dst: str) -> List[str]:
+    """Copy a structure file, setting the element column from the atom name
+    wherever a LIGAND atom's name implies a two-letter element the column
+    contradicts. Returns the corrections made.
+
+    THIS NEVER TOUCHES THE CONTRIBUTOR'S FILE. The caller writes to a scratch
+    path, uses it only to infer the ligand's identity, and discards it; the
+    bundle's own structure file is imported and pushed byte-identical. We are
+    reading their data correctly, not rewriting it -- publishing a corrected
+    structure would be a separate decision, theirs and the contributor's.
+
+    The premise -- element column wrong, atom name right -- is inference from
+    convergent evidence, not the contributor's testimony: on 2026-08-28 all
+    804 held-out bundles that took a correction stopped mismatching, and the
+    corrected formulas matched PDBbind's declared halogen counts. Worth the
+    contributor confirming rather than us assuming indefinitely.
+    """
+
+    fixed = []
+    with open(src, encoding="utf-8", errors="replace") as fh, \
+            open(dst, "w", encoding="utf-8") as out:
+        for line in fh:
+            if line.startswith(("HETATM", "ATOM  ")) and len(line) >= 78:
+                is_ligand = line.startswith("HETATM") or (
+                    line[17:20].strip().upper() in LIGAND_RESNAMES
+                )
+                if is_ligand:
+                    name = line[12:16].strip().upper()
+                    elem = line[76:78].strip().upper()
+                    implied = next(
+                        (e for e in TWO_LETTER_ELEMENTS
+                         if name.startswith(e)), None,
+                    )
+                    if implied and elem != implied:
+                        line = line[:76] + implied.ljust(2) + line[78:]
+                        fixed.append(f"{name}:{elem}->{implied}")
+            out.write(line)
+    return fixed
 
 
 # --------------------------------------------------

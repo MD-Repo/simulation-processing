@@ -639,7 +639,8 @@ def fetch_bundle(name: str, work_dir: str, status) -> Fetched:
 # --------------------------------------------------
 def run_mdr_process(
     local_dir: str, server: str, log_file: str, dry_run: bool, status,
-    num_threads: int = 4,
+    num_threads: int = 4, blast_num_threads: Optional[int] = None,
+    transfer_threads: Optional[int] = None,
 ) -> Tuple[Optional[int], str]:
     """Run "mdr-process process" on a local directory.
 
@@ -667,6 +668,14 @@ def run_mdr_process(
     ]
     if dry_run:
         cmd.append("--dry-run")
+
+    # Both stay OFF unless a caller asks, so the drain's command line is
+    # byte-identical to what it has always been. mdr-process's own defaults
+    # (blastp -num_threads 2, 3 IRODS streams per put) then apply.
+    if blast_num_threads is not None:
+        cmd += ["--blast-num-threads", str(blast_num_threads)]
+    if transfer_threads is not None:
+        cmd += ["--transfer-threads", str(transfer_threads)]
 
     status(f"Running {' '.join(cmd)}")
 

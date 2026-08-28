@@ -24,9 +24,12 @@ Purpose: Vet every DDD bundle's ligand BEFORE the prod wave imports it.
          bundle -> verdict (see ligand_check: block / flag / pass), which
          feeds --go-list on the real run.
 
-         Reads nothing but ddd/data/<name>.tgz (never modified) and, when a
-         bundle already happens to be unpacked, the work dir. Touches no
-         database on any server.
+         Reads nothing but ddd/data/<name>.tgz, which is never modified.
+         Touches no database on any server, and never writes into a bundle:
+         the element-corrected structure it infers from is a scratch copy
+         that is deleted with the temp dir. See
+         ligand_check.write_element_corrected for why that correction exists
+         and what it deliberately does NOT do.
 """
 
 import argparse
@@ -84,9 +87,10 @@ def get_args() -> Args:
                         metavar="DIR", help="Local <name>.tgz source")
     parser.add_argument("-w", "--work-dir", default=WORK_DIR_DEFAULT,
                         metavar="DIR",
-                        help="Checked first: a bundle already unpacked here "
-                        "with an inferred_ligands.json is reused instead of "
-                        "being re-inferred")
+                        help="Parent for the per-bundle scratch dirs this "
+                        "creates and removes; bundles unpacked here are NOT "
+                        "reused, since their inference predates the "
+                        "element-column correction")
     parser.add_argument("-s", "--survey-tsv", required=True, metavar="TSV",
                         help="survey_bundles.py output")
     parser.add_argument("--go-classes", nargs="+",
@@ -235,31 +239,10 @@ def declared_smiles(meta_path: str) -> Tuple[Sequence[str], Optional[str]]:
 def check_one(args: Args, name: str) -> Tuple[str, str, str]:
     """Vet one bundle. Returns (name, verdict, detail)."""
 
-    # Fast path: Phase B already unpacked and inferred this one.
-    unpacked = os.path.join(args.work_dir, name, name)
-    cached = os.path.join(unpacked, "processed", "inferred_ligands.json")
-    if os.path.isfile(cached) and os.path.isfile(
-        os.path.join(unpacked, METADATA_NAME)
-    ):
-        try:
-            import json
-            declared, structure = declared_smiles(
-                os.path.join(unpacked, METADATA_NAME)
-            )
-            with open(cached, encoding="utf-8") as fh:
-                inferred = json.load(fh)
-            candidates = [
-                lig.get("structure", {}).get("smiles") for lig in inferred
-                if lig.get("structure", {}).get("smiles")
-            ]
-            verdict, detail = ligand_check.check(
-                declared, candidates,
-                os.path.join(unpacked, structure) if structure else None,
-            )
-            return name, verdict, f"[cached] {detail}".strip()
-        except (OSError, ValueError, toml.TomlDecodeError):
-            pass  # fall through and do it the slow way
-
+    # No cached fast path. processed/inferred_ligands.json on disk was
+    # computed by mdr-process from the UNCORRECTED structure file, so
+    # reusing it would reproduce the very bug this pass exists to remove.
+    # Every bundle is re-inferred from an element-corrected scratch copy.
     tgz = os.path.join(args.data_dir, f"{name}.tgz")
     if not os.path.isfile(tgz):
         return name, "error", "no tarball"
@@ -285,9 +268,17 @@ def check_one(args: Args, name: str) -> Tuple[str, str, str]:
         if not os.path.isfile(pdb):
             return name, "error", f"structure file missing: {structure}"
 
+        # Infer from an element-corrected SCRATCH copy: this corpus records
+        # ligand chlorines as element C, and OpenBabel trusts that column, so
+        # inferring from the file as-written silently loses every halogen.
+        # `pdb` itself is untouched -- see ligand_check.write_element_corrected.
+        corrected = os.path.join(tmp, "corrected.pdb")
+        fixes = ligand_check.write_element_corrected(pdb, corrected)
+
         try:
             candidates = infer_from_structure(
-                pdb, os.path.join(tmp, "inferred.json"), args
+                corrected if fixes else pdb,
+                os.path.join(tmp, "inferred.json"), args,
             )
         except subprocess.TimeoutExpired:
             return name, "error", "mol_id.py timed out"
@@ -295,6 +286,9 @@ def check_one(args: Args, name: str) -> Tuple[str, str, str]:
             return name, "error", " ".join(f"inference failed: {e}".split())[:300]
 
         verdict, detail = ligand_check.check(declared, candidates, pdb)
+        if fixes:
+            detail = (f"[element-corrected: {' '.join(fixes[:3])}] "
+                      f"{detail}").strip()
         return name, verdict, detail
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

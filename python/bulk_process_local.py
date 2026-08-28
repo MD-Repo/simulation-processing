@@ -69,6 +69,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import toml
@@ -84,6 +85,9 @@ TABLE_DEFAULT = os.path.expanduser("~/pdbbind_ligand_smiles.tsv")
 GO_CLASSES_DEFAULT = ("fixed", "already")
 
 METADATA_NAME = "mdrepo-metadata.toml"
+SCRIPT_DIR_DEFAULT = "/media/volume/mdrepo_bd/simulation-processing/python"
+UV_DEFAULT = "/home/user13/.local/bin/uv"
+MOL_ID_TIMEOUT = 900
 
 # mdr-process/src/import.rs:46-47. lead_contributor_id() short-circuits on
 # this exact ORCID and resolves the owner by USERNAME instead of by ORCID,
@@ -143,6 +147,10 @@ class Args(NamedTuple):
     reap: bool
     verify: bool
     keep_unverified: bool
+    blast_num_threads: Optional[int]
+    transfer_threads: Optional[int]
+    script_dir: str
+    uv: str
 
 
 # --------------------------------------------------
@@ -189,8 +197,25 @@ def get_args() -> Args:
                      help="Phase D: the real push. Use only on the "
                      "triaged, vetted set -- see ddd/HANDOFF")
     parser.add_argument("--num-threads", type=int, default=4, metavar="INT",
-                        help="Passed to mdr-process per bundle. Load-"
-                        "bearing -- see RUNBOOK.md's MDR-33 note")
+                        help="mdr-process's GLOBAL -t: the size of its rayon "
+                        "pool, which is what parallelises the per-replicate "
+                        "trajectory work (process.rs:113). Bundles run up to "
+                        "50 replicates, so this is the main intra-bundle "
+                        "knob. Load-bearing -- see RUNBOOK.md's MDR-33 note")
+    parser.add_argument("--blast-num-threads", type=int, default=None,
+                        metavar="INT",
+                        help="blastp -num_threads. mdr-process defaults to "
+                        "2. BLAST runs SERIALLY within a bundle (swissprot, "
+                        "then isoform/trembl only if needed), so the peak "
+                        "cost is --parallel x this, not more. Omit to leave "
+                        "mdr-process's default alone")
+    parser.add_argument("--transfer-threads", type=int, default=None,
+                        metavar="INT",
+                        help="IRODS streams python-irodsclient may open for "
+                        "a single put; mdr-process defaults to 3. THIS is "
+                        "the IRODS knob -- concurrent streams are roughly "
+                        "--parallel x this -- so throttle it here rather "
+                        "than starving local CPU via --parallel")
     parser.add_argument("--parallel", type=int, default=8, metavar="INT",
                         help="Bundles run concurrently. Phase B can push "
                         "this high (local CPU is the only constraint); "
@@ -198,6 +223,9 @@ def get_args() -> Args:
                         "DB with the live ticket queue")
     parser.add_argument("--limit", type=int, default=None, metavar="INT",
                         help="Process only the first N eligible bundles")
+    parser.add_argument("--script-dir", default=SCRIPT_DIR_DEFAULT,
+                        metavar="DIR", help="Where mol_id.py lives")
+    parser.add_argument("--uv", default=UV_DEFAULT, metavar="PATH")
     parser.add_argument(
         "--collection", default=COLLECTION_DEFAULT, metavar="NAME",
         help="Put every bundle in this collection via the TOML's "
@@ -249,6 +277,8 @@ def get_args() -> Args:
         args.smiles_table, args.server, args.dry_run, args.num_threads,
         args.parallel, args.limit, args.collection or None,
         args.orcid or None, args.reap, args.verify, args.keep_unverified,
+        args.blast_num_threads, args.transfer_threads,
+        args.script_dir, args.uv,
     )
 
 
@@ -499,6 +529,61 @@ def remove(path: str) -> None:
 
 
 # --------------------------------------------------
+def seed_inferred_ligands(local_dir: str, args: Args) -> List[str]:
+    """Pre-compute processed/inferred_ligands.json from an element-corrected
+    SCRATCH copy of the structure file, so mdr-process's ligand check runs
+    against the right molecule. Returns the corrections made.
+
+    Why this works: get_inferred_ligands() (process.rs) reuses an existing
+    inferred_ligands.json rather than recomputing, and it only wipes
+    processed/ when --force is passed, which this driver does not pass. So
+    seeding the file makes mdr-process adopt our inference.
+
+    What it does NOT do: change anything that gets imported or pushed. The
+    bundle's own structure file is untouched and goes to IRODS byte for
+    byte; resolve_ligands() stores the DECLARED ligand when one is present
+    and uses the inference only to verify it. This corrects how their data
+    is READ, not their data.
+    """
+
+    meta_path = os.path.join(local_dir, METADATA_NAME)
+    if not os.path.isfile(meta_path):
+        return []
+    try:
+        structure = toml.load(meta_path).get("structure_file_name")
+    except (toml.TomlDecodeError, OSError):
+        return []
+    if not structure:
+        return []
+
+    pdb = os.path.join(local_dir, structure)
+    if not os.path.isfile(pdb):
+        return []
+
+    processed = os.path.join(local_dir, "processed")
+    os.makedirs(processed, exist_ok=True)
+    out_json = os.path.join(processed, "inferred_ligands.json")
+    if os.path.isfile(out_json):
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="elem-") as tmp:
+        corrected = os.path.join(tmp, "corrected.pdb")
+        fixes = ligand_check.write_element_corrected(pdb, corrected)
+        if not fixes:
+            return []
+        proc = subprocess.run(
+            [args.uv, "run", os.path.join(args.script_dir, "mol_id.py"),
+             "both", corrected, "--outfile", out_json],
+            capture_output=True, text=True, cwd=args.script_dir,
+            timeout=MOL_ID_TIMEOUT,
+        )
+        if proc.returncode != 0 and not os.path.isfile(out_json):
+            return []
+
+    return fixes
+
+
+# --------------------------------------------------
 def process_one(args: Args, name: str) -> Tuple[str, str, str]:
     """Unpack, fix SMILES, run mdr-process. Returns (name, result, detail)."""
 
@@ -529,10 +614,18 @@ def process_one(args: Args, name: str) -> Tuple[str, str, str]:
     if changed:
         status(f"metadata: {', '.join(changed)}")
 
+    try:
+        fixes = seed_inferred_ligands(local_dir, args)
+    except (subprocess.SubprocessError, OSError) as e:
+        fixes = []
+        status(f"element-correction skipped: {type(e).__name__}: {e}")
+    if fixes:
+        status(f"element column read as: {' '.join(fixes[:3])}")
+
     log_file = os.path.join(args.log_dir, f"{name}.log")
     returncode, run_detail = run_mdr_process(
         local_dir, args.server, log_file, args.dry_run, status,
-        args.num_threads,
+        args.num_threads, args.blast_num_threads, args.transfer_threads,
     )
 
     if returncode != 0:
