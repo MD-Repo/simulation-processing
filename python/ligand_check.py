@@ -30,6 +30,20 @@ Purpose: The DDD prod wave's ligand verdict, shared by preflight_ligands.py
          7.8% of the corpus, and it is what BLOCK is for. Everything short
          of it is recorded as FLAG: imported, but visible in the record for
          a contributor report.
+
+         FRAGMENTATION IS NOT A DIFFERENT MOLECULE (2026-09-04). OpenBabel
+         perceives bonds from simulated coordinates and regularly emits an
+         intact ligand as several dot-separated components -- a detached
+         H2, a phosphonate whose P-C bond was cut, an amine read as free
+         ammonia. Compared whole against a single-component declaration
+         those look like a connectivity mismatch, and all three bundles
+         blocked in the 2026-09 prod wave were this: 1yq7, 3in3, 4dhm.
+         Where the atom inventory is identical and only the bond graph is
+         split, "the declared ligand is not the molecule in the structure
+         file" is FALSE, so compare_smiles.fragment_artifact holds and the
+         verdict is FLAG. 1yq7 and 4dhm clear that way. 3in3 does not --
+         C20H17N5O vs C20H21N5O, four hydrogens genuinely adrift -- and
+         its BLOCK stands, which is the check still working.
 """
 
 import os
@@ -168,12 +182,18 @@ def best_comparison(declared: str, candidates: Sequence[str]) -> Optional[dict]:
             continue
 
         if result["exact_match"]:
-            rank = 4
+            rank = 5
         elif result["same_inchi"]:
-            rank = 3
+            rank = 4
         elif result["same_connectivity_and_stereo"]:
-            rank = 2
+            rank = 3
         elif result["same_connectivity"]:
+            rank = 2
+        elif result["fragment_artifact"]:
+            # Ranked BELOW real connectivity so a candidate that genuinely
+            # matches always wins, and ABOVE nothing so a bundle whose only
+            # near-match is a mis-perceived fragmentation reports that
+            # rather than a bare "different molecules".
             rank = 1
         else:
             rank = 0
@@ -217,18 +237,53 @@ def check(
             verdicts.append(PASS)
             continue
 
-        if not result["same_connectivity"]:
+        # An absent InChI /c layer is a failed comparison, not a verdict.
+        # The old code could not tell the two apart -- same_connectivity is
+        # `conn1 == conn2 and conn1 != ""`, so two empty layers reported as
+        # "different molecules" -- and said so in the record.
+        if not result["inchi_available"]:
             verdicts.append(BLOCK)
             notes.append(
-                f"ligand[{num}] connectivity "
-                f"({result['formula1']} vs {result['formula2']})"
+                f"ligand[{num}] unverifiable: no inchi connectivity layer"
             )
             continue
 
-        verdicts.append(FLAG)
-        notes.append(
-            f"ligand[{num}] " + (", ".join(result["differences"]) or "not exact")
-        )
+        if result["same_connectivity"]:
+            verdicts.append(FLAG)
+            notes.append(
+                f"ligand[{num}] "
+                + (", ".join(result["differences"]) or "not exact")
+            )
+            continue
+
+        # Connectivity differs, but every atom is present and only the bond
+        # graph was split -- see compare_smiles.largest_fragment(). The
+        # declared molecule IS the one in the structure file, so BLOCK's
+        # premise does not hold. FLAG keeps it in the record for the
+        # contributor report without withholding the bundle.
+        if result["fragment_artifact"]:
+            verdicts.append(FLAG)
+            notes.append(
+                f"ligand[{num}] " + (", ".join(result["differences"]) or "fragmented")
+            )
+            continue
+
+        # A real mismatch. Report the quantity the verdict was computed
+        # from: naming the gross formulas alone printed the SAME string on
+        # both sides whenever the difference was an isomer or a broken
+        # bond, which is how 1yq7 and 4dhm came to read
+        # "connectivity (C7H11NO7P2 vs C7H11NO7P2)".
+        verdicts.append(BLOCK)
+        if result["same_gross_formula"]:
+            notes.append(
+                f"ligand[{num}] connectivity differs, formula matches "
+                f"{result['formula1']} (isomer or rearrangement)"
+            )
+        else:
+            notes.append(
+                f"ligand[{num}] connectivity differs, formula "
+                f"{result['formula1']} vs {result['formula2']}"
+            )
 
     if structure_path and os.path.isfile(structure_path):
         bad = element_column_disagreements(structure_path)
