@@ -370,7 +370,23 @@ def trajectory_has_time_axis(cpptraj_output):
     """
 
     for line in cpptraj_output.splitlines():
-        if " is a " in line and " with " in line:
+        if " is a " not in line:
+            continue
+
+        # cpptraj describes a CHARMM DCD without a contents list at all:
+        #
+        #     'x.dcd' is a CHARMM DCD file (coords) Little Endian 32 bit, Parm ...
+        #
+        # The format stores one header timestep and no per-frame times, so
+        # cpptraj reads no time axis from it and the converted XTC gets the
+        # default 1 ps/frame. Measured against MDR00000376 on 2026-09-04: the
+        # line matched nothing below, "unknown" kept mdr-process measuring the
+        # converted file, and the entry recorded 0.001 ns/frame and 0.75 ns
+        # across three reprocesses with the right spacing declared each time.
+        if " is a CHARMM DCD file" in line:
+            return False
+
+        if " with " in line:
             contents = line.split(" with ", 1)[1]
             # The real line continues past the contents list with the parm and
             # box, e.g. "... with coordinates, box, Parm foo.prmtop (Truncated
