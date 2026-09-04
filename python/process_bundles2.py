@@ -94,6 +94,11 @@ from drain_process_queue import (
 BUNDLES_COLLECTION = "/iplant/home/shared/mdrepo/bundles2"
 ERROR_LINES = 20  # tail of mdr-process output to include in a failure notice
 
+# Was 500, which is smaller than the command line mdr-process echoes ahead
+# of the error. See append_record for what that cost.
+DETAIL_MAX = 2000
+DETAIL_HEAD = 700
+
 
 class Fetched(NamedTuple):
     """Where to run mdr-process, and what to delete afterwards.
@@ -525,12 +530,48 @@ def load_record(path: str) -> Dict[str, str]:
 
 
 # --------------------------------------------------
+def elide_middle(text: str, limit: int, head: int = DETAIL_HEAD) -> str:
+    """`text` shortened to `limit` chars by cutting out the middle.
+
+    Keeps `head` characters from the front and the rest from the back, with
+    a marker naming how much went missing so a reader knows the string is
+    not the whole story.
+    """
+
+    if len(text) <= limit:
+        return text
+
+    marker = "...[{} chars elided]..."
+    tail = limit - head - len(marker.format(len(text)))
+    if tail <= 0:
+        return text[:limit]
+
+    return text[:head] + marker.format(len(text) - head - tail) + text[-tail:]
+
+
+# --------------------------------------------------
 def append_record(path: str, name: str, result: str, detail: str) -> None:
-    """One line per outcome: timestamp, result, bundle, detail"""
+    """One line per outcome: timestamp, result, bundle, detail.
+
+    The detail is flattened to one line (this is a TSV) and capped, but the
+    cap ELIDES THE MIDDLE rather than the tail. Head-only truncation lost
+    the thing worth keeping: mdr-process reports a failed child as
+    "Command failed: {cmd:?}\n{stderr}", and {cmd:?} for these bundles is
+    ~440 characters of absolute paths, so at the old 500-char cap the
+    command line consumed the whole budget and the error itself -- plus the
+    20-line debug tail appended after it -- fell off the end.
+
+    Every one of the 2026-09 wave's four failure rows is exactly 500
+    characters for that reason. 1m0o's real cause is simply not recoverable
+    from the record: its child wrote nothing to stderr and the log tail
+    that would have shown the last thing mdr-process did was cut after 60
+    characters. Keeping both ends means the failing STEP (head) and the
+    actual diagnosis (tail) both survive.
+    """
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     new = not os.path.exists(path)
-    flat = " ".join((detail or "").split())[:500]
+    flat = elide_middle(" ".join((detail or "").split()), DETAIL_MAX)
     with open(path, "a") as fh:
         if new:
             fh.write("timestamp\tresult\tbundle\tdetail\n")
