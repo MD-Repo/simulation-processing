@@ -101,6 +101,28 @@ MOL_ID_TIMEOUT = 900
 # rather than a fake person. Verified on prod 2026-08-28: mdrepo_admin is
 # md_user id 1 and already owns 68,184 of 90,290 simulations.
 ADMIN_ORCID = "0000-0000-0000-0000"
+
+# DDD's real lead contributor: Li Maodong, md_user 239 (username bgalang).
+# This is the --orcid DEFAULT, and it is NOT cosmetic -- it decides two
+# things at once, because import.rs feeds the SAME resolved user id to both
+# upsert_simulation (md_simulation.created_by_id) and upsert_collection,
+# and ops::upsert_collection keys on (user_id, name). So the owner also
+# picks WHICH collection of that name the bundles land in.
+#
+# The 2026-09-01..09-04 prod wave ran with ADMIN_ORCID as this default and
+# neither --orcid nor --collection passed, so all 2,118 of its simulations
+# were created_by mdrepo_admin (id 1) and were auto-filed into a SECOND
+# "Dissociation Dynamic Database" -- md_collection 6, owned by user 1 --
+# alongside the real one, id 5, owned by 239. Repaired by hand on 09-04
+# (rows moved to 5, created_by set to 239, collection 6 dropped); see
+# ddd/logs/dbfix/. Changing this default is what stops it recurring.
+#
+# Verified on prod 2026-09-04: socialaccount_socialaccount has exactly one
+# provider='orcid' row with this uid, and it maps to md_user 239, which is
+# the owner of md_collection 5. find_user_id_by_orcid() is a plain join on
+# (provider, uid), so an ORCID with no social account is FATAL at import --
+# it is not silently ignored.
+LEAD_ORCID_DEFAULT = "0000-0001-5637-5862"
 COLLECTION_DEFAULT = "Dissociation Dynamic Database"
 
 # libmdrepo/src/metadata.rs validates short_description at 300 chars. DDD's
@@ -289,10 +311,12 @@ def get_args() -> Args:
         "(md_collection is unique on user_id+name); '' to disable",
     )
     parser.add_argument(
-        "--orcid", default=ADMIN_ORCID, metavar="ORCID",
-        help="Rewrite lead_contributor_orcid to this. The default is "
-        "mdr-process's ADMIN_ORCID sentinel, which resolves to the "
-        "mdrepo_admin user; '' to leave the submitter's value alone",
+        "--orcid", default=LEAD_ORCID_DEFAULT, metavar="ORCID",
+        help="Rewrite lead_contributor_orcid to this. The default is DDD's "
+        "lead contributor (md_user 239), which also selects the collection "
+        "owner -- see LEAD_ORCID_DEFAULT. Pass ADMIN_ORCID "
+        "('0000-0000-0000-0000') to attribute to mdrepo_admin instead; "
+        "'' to leave the submitter's value alone",
     )
     reap = parser.add_mutually_exclusive_group()
     reap.add_argument("--reap", dest="reap", action="store_true", default=True,
@@ -386,6 +410,84 @@ def unpack_local(name: str, data_dir: str, work_dir: str) -> str:
 
 
 # --------------------------------------------------
+def repair_metadata_quotes(local_dir: str) -> int:
+    """Escape stray double quotes inside a TOML string value. Returns the
+    number escaped, 0 if the file was already fine or could not be helped.
+
+    DDD's generator writes the chemistry prime symbol as a plain double
+    quote, and when a ligand name carries one it lands INSIDE a quoted
+    value and ends the string early:
+
+        name = "3'-3"-DICHLOROPHENOL-1,8-3H-BENZO[DE]ISOCHROMEN-1-ONE"
+
+    The file is then not TOML at all, so mdr-process cannot read it and
+    neither can anything else -- 1tsl and 1xa5 failed the 2026-09-04
+    re-vet that way, each broken in both [[ligands]].name and
+    short_description. Escaping is lossless: the recovered name is
+    character-for-character what was intended.
+
+    ONLY RUNS ON A FILE THAT DOES NOT ALREADY PARSE, and keeps the result
+    only if the repair makes it parse. A well-formed file is never
+    touched, so this cannot damage the 8,000-odd bundles that are fine.
+
+    Line-based for the same reason as retarget_metadata, and here it is
+    forced: a TOML round trip cannot read the file in the first place.
+    Multi-line values are skipped -- this corpus has none, and the naive
+    rule would corrupt their delimiters.
+
+    Takes the .orig backup itself, using fix_ligand_smiles.py's
+    convention (copy2, never overwrite an existing one), because it runs
+    BEFORE fix_smiles and .orig must hold the submitter's true original
+    rather than our edit.
+    """
+
+    path = os.path.join(local_dir, METADATA_NAME)
+    if not os.path.isfile(path):
+        return 0
+
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+
+    try:
+        toml.loads(original)
+        return 0
+    except (toml.TomlDecodeError, ValueError):
+        pass
+
+    value = re.compile(r'^(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*")(.*)("\s*)$')
+    triple = '"' * 3
+    escaped = 0
+    lines = []
+    for line in original.splitlines():
+        match = value.match(line)
+        rhs = line.split("=", 1)[-1].lstrip() if "=" in line else ""
+        if not match or rhs.startswith(triple):
+            lines.append(line)
+            continue
+        head, body, tail = match.groups()
+        fixed, count = re.subn(r'(?<!\\)"', r'\\"', body)
+        escaped += count
+        lines.append(head + fixed + tail)
+
+    if not escaped:
+        return 0
+
+    repaired = "\n".join(lines) + "\n"
+    try:
+        toml.loads(repaired)
+    except (toml.TomlDecodeError, ValueError):
+        return 0
+
+    backup = path + ".orig"
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(repaired)
+
+    return escaped
+
+
+# --------------------------------------------------
 def fix_smiles(local_dir: str, args: Args) -> Tuple[bool, str]:
     """Real (non-dry-run) SMILES fill. Returns (ok, detail)."""
 
@@ -418,8 +520,9 @@ def truncate_short_description(text: str, limit: int) -> str:
 
 # --------------------------------------------------
 def retarget_metadata(local_dir: str, args: Args) -> List[str]:
-    """Point the bundle at the admin user, put it in the target collection,
-    and bring an over-long short_description inside the 300-char cap.
+    """Point the bundle at the lead contributor (args.orcid, which also
+    decides the collection's owner), put it in the target collection, and
+    bring an over-long short_description inside the 300-char cap.
     Returns a list of what changed.
 
     Line-based, not a TOML round trip, for fix_ligand_smiles.py's stated
@@ -731,6 +834,13 @@ def process_one(args: Args, name: str) -> Tuple[str, str, str]:
         # append_record's TSV stays one row per line.
         detail = " ".join(f"corrupt or truncated tarball: {e}".split())
         return name, "fetch-failed", detail[:300]
+
+    try:
+        escaped = repair_metadata_quotes(local_dir)
+    except OSError as e:
+        return name, "failed", f"metadata quote repair failed: {e}"
+    if escaped:
+        status(f"metadata: escaped {escaped} stray quote(s) to make the TOML parse")
 
     ok, detail = fix_smiles(local_dir, args)
     if not ok:

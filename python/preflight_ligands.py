@@ -45,6 +45,7 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 import toml
 
 import ligand_check
+from bulk_process_local import repair_metadata_quotes
 from common import stamp
 from process_bundles2 import append_record, load_record
 
@@ -236,6 +237,47 @@ def declared_smiles(meta_path: str) -> Tuple[Sequence[str], Optional[str]]:
 
 
 # --------------------------------------------------
+def wildcard_file_references(meta_path: str) -> List[str]:
+    """Referenced filenames containing a glob, as "field: name" strings.
+
+    Nothing in the pipeline expands globs -- mdr-process stats every
+    referenced name literally -- so a pattern here is a guaranteed failure
+    at import, and it fails as `No such file or directory`, which reads
+    like a lost file rather than an unsupported spelling. Catching it in
+    preflight keeps the bundle out of the go-list entirely.
+
+    In this corpus the wildcard also means the data is missing: 2h3e, 2igy
+    and 2obo each declared `trajectory_file_names = ["Pro_lig*.mdc"]` and
+    each shipped ZERO .mdc files, while healthy bundles enumerate all
+    fifty. libmdrepo now rejects this too (Meta::check_no_wildcard); this
+    is the same check moved earlier, so a bundle is never queued for it.
+    """
+
+    try:
+        meta = toml.load(meta_path)
+    except (toml.TomlDecodeError, OSError):
+        return []
+
+    problems = []
+    scalars = ("structure_file_name", "topology_file_name")
+    for field in scalars:
+        value = meta.get(field)
+        if isinstance(value, str) and any(c in value for c in "*?["):
+            problems.append(f"{field}: {value}")
+
+    for num, value in enumerate(meta.get("trajectory_file_names") or [], 1):
+        if isinstance(value, str) and any(c in value for c in "*?["):
+            problems.append(f"trajectory_file_names[{num}]: {value}")
+
+    for num, entry in enumerate(meta.get("additional_files") or [], 1):
+        value = (entry or {}).get("file_name")
+        if isinstance(value, str) and any(c in value for c in "*?["):
+            problems.append(f"additional_files[{num}].file_name: {value}")
+
+    return problems
+
+
+# --------------------------------------------------
 def check_one(args: Args, name: str) -> Tuple[str, str, str]:
     """Vet one bundle. Returns (name, verdict, detail)."""
 
@@ -256,6 +298,11 @@ def check_one(args: Args, name: str) -> Tuple[str, str, str]:
         if local is None:
             return name, "error", "no mdrepo-metadata.toml in tarball"
 
+        # The driver does this before fix_ligand_smiles for the same
+        # reason: a file with a stray quote in a ligand name is not TOML,
+        # so nothing downstream can read it. No-op on a valid file.
+        repair_metadata_quotes(local)
+
         fill_smiles(local, args)
         try:
             declared, structure = declared_smiles(
@@ -263,6 +310,13 @@ def check_one(args: Args, name: str) -> Tuple[str, str, str]:
             )
         except (toml.TomlDecodeError, OSError) as e:
             return name, "error", f"unreadable toml: {e}"[:300]
+
+        globs = wildcard_file_references(os.path.join(local, METADATA_NAME))
+        if globs:
+            return name, "error", (
+                "wildcard in referenced filename, globs are not expanded: "
+                + "; ".join(globs)
+            )[:300]
 
         pdb = os.path.join(local, structure or "Pro_lig.pdb")
         if not os.path.isfile(pdb):
