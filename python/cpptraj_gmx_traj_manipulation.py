@@ -3,6 +3,7 @@
 import os
 import argparse
 import shutil
+import struct
 import warnings
 import subprocess
 import pytraj as pt
@@ -304,6 +305,16 @@ CPPTRAJ_FAILURES = []
 # report_time_axis() for the values and why "unknown" is not treated as absent.
 TIME_AXIS_MARKER = "[mdrepo] source_has_time_axis="
 
+# The frame spacing recovered from the source trajectory's own header, in ps,
+# or "unknown". See source_sampling_ps() for why this is worth more than either
+# the metadata declaration or anything measurable after conversion.
+SAMPLING_MARKER = "[mdrepo] source_sampling_ps="
+
+# One AKMA time unit in ps. CHARMM and NAMD write the integration timestep into
+# the DCD header in AKMA units; multiplying by NSAVC gives the spacing between
+# saved frames. Same constant MDAnalysis uses (1 / 20.45482949774598).
+AKMA_TO_PS = 4.888821e-2
+
 
 # --------------------------------------------------
 def run_cpptraj(cppin, label, capture=True, fatal=True):
@@ -407,6 +418,120 @@ def report_time_axis(has_time):
 
 
 # --------------------------------------------------
+def dcd_sampling_ps(path):
+    """Frame spacing in ps from a DCD header, or None if it cannot be read
+
+    DCD stores the integration timestep (DELTA) and the number of steps between
+    saved frames (NSAVC), which is everything needed -- but cpptraj does not
+    expose either, and reports a DCD as holding only `coords`. So a DCD lands
+    in trajectory_has_time_axis()'s "unknown" bucket, conversion stamps 1
+    ps/frame onto the XTC, and the fabricated spacing is measured back as
+    though it were real. Reading the header here is what breaks that chain.
+
+    Parsed by hand rather than with MDAnalysis, which reads this correctly but
+    is not installed in the simproc env this script runs under. The layout is
+    fixed and ancient; offsets below are from readdcd.h, the reference
+    implementation MDAnalysis itself vendors:
+
+        0..3    block size, always 84 -- also the endianness tell
+        4..7    "CORD"
+        8..11   NSET    number of frames
+        12..15  ISTART  starting step
+        16..19  NSAVC   steps between saved frames
+        44..47  DELTA   timestep: float32 if CHARMM, float64 if X-PLOR
+        84..87  CHARMM version, nonzero for CHARMM/NAMD files
+
+    Returns None rather than raising for anything unexpected: failing to
+    recover the spacing is a normal outcome that falls back to the declaration,
+    not an error worth killing a conversion over.
+    """
+
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(92)
+        if len(head) < 92:
+            return None
+
+        # Endianness comes from the leading 84, not from the platform: DCDs get
+        # copied between machines and the magic is the only thing that says.
+        for endian in ("<", ">"):
+            if struct.unpack(endian + "i", head[0:4])[0] == 84:
+                break
+        else:
+            return None
+
+        if head[4:8] != b"CORD":
+            return None
+
+        nsavc = struct.unpack(endian + "i", head[16:20])[0]
+        is_charmm = struct.unpack(endian + "i", head[84:88])[0] != 0
+
+        # X-PLOR widens DELTA to a double over the same offset CHARMM uses for
+        # a float. Reading the wrong width gives garbage, not a small error.
+        if is_charmm:
+            delta = struct.unpack(endian + "f", head[44:48])[0]
+        else:
+            delta = struct.unpack(endian + "d", head[44:52])[0]
+
+        sampling_ps = delta * AKMA_TO_PS * nsavc
+        if nsavc <= 0 or not (0 < sampling_ps < float("inf")):
+            return None
+        return sampling_ps
+    except Exception as e:
+        warn(f"Could not read DCD header from {path}: {e}")
+        return None
+
+
+# --------------------------------------------------
+def source_sampling_ps(trajectory_file):
+    """Frame spacing recovered from the source trajectory, or None
+
+    Only DCD is handled, because DCD is the only format we ingest that carries
+    the spacing in a header cpptraj declines to expose. Formats with a real
+    time axis (NetCDF, XTC) survive conversion with their timing intact and are
+    measured correctly downstream; formats without one have nothing to recover.
+    """
+
+    if not trajectory_file or not os.path.isfile(trajectory_file):
+        return None
+    if trajectory_file.lower().endswith(".dcd"):
+        return dcd_sampling_ps(trajectory_file)
+    return None
+
+
+# --------------------------------------------------
+def report_source_sampling(sampling_ps):
+    """Emit the frame-spacing marker mdr-process reads
+
+    `unknown` is the honest answer for every format we cannot recover, and
+    mdr-process falls back to the metadata declaration or the measurement. Only
+    a positive number here overrides those.
+    """
+
+    value = "unknown" if sampling_ps is None else repr(float(sampling_ps))
+    print(f"{SAMPLING_MARKER}{value}")
+
+
+# --------------------------------------------------
+def time_action(sampling_ps):
+    """cpptraj `time` action stamping a real frame spacing, or "" if unknown
+
+    Without this, converting a source that cpptraj reports as coords-only
+    writes an XTC whose frames are 1 ps apart -- a spacing nothing in the
+    simulation ever had. That number does not just mislead our own duration
+    arithmetic: full.xtc and minimal.xtc are published, so every downstream
+    consumer inherits the fabricated time axis too.
+
+    Emitted only when the spacing was actually recovered. Guessing here would
+    reproduce the original bug with a different constant.
+    """
+
+    if sampling_ps is None:
+        return ""
+    return f"time time0 0 dt {sampling_ps}\n"
+
+
+# --------------------------------------------------
 def detect_format(top_file, tpr_file):
     exts = set(
         map(
@@ -445,7 +570,13 @@ def has_box(frame):
 
 # --------------------------------------------------
 def process_stripped_trajectory(
-    topology_file, trajectory_file, outdir, strip_mask, prefix, fit_mask="@CA,C,N"
+    topology_file,
+    trajectory_file,
+    outdir,
+    strip_mask,
+    prefix,
+    fit_mask="@CA,C,N",
+    sampling_ps=None,
 ):
     """Process a stripped trajectory with principal rotation workflow.
 
@@ -459,6 +590,8 @@ def process_stripped_trajectory(
         outdir: Output directory
         strip_mask: cpptraj strip mask (e.g., ':WAT,HOH,NA,CL')
         prefix: Output file prefix (e.g., 'minimal' or 'minimal_lipid')
+        sampling_ps: Frame spacing recovered from the source, stamped onto the
+            output so the published trajectory carries a real time axis
 
     Returns:
         tuple: (xtc_path, pdb_path, ref_path) or (None, None, None) on failure
@@ -501,6 +634,7 @@ def process_stripped_trajectory(
         f.write(f"trajin {trajectory_file} parm [full]\n")
         f.write(f"strip {strip_mask}\n")
         f.write(f"rms ref [rotref] {fit_mask}\n")
+        f.write(time_action(sampling_ps))
         f.write(f"trajout {output_xtc} xtc\n")
         f.write(f"trajout {output_pdb} pdb onlyframes 1\n")
         f.write("run\n")
@@ -609,6 +743,14 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     _, frame0_out = run_cpptraj(cppin_frame0, "frame0 extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
 
+    # Recovered from the source header, not from cpptraj's report, because
+    # cpptraj does not expose DCD timing at all. Everything below stamps this
+    # onto the converted output so it carries a real time axis.
+    sampling_ps = source_sampling_ps(trajectory_file)
+    report_source_sampling(sampling_ps)
+    if sampling_ps is not None:
+        verbose(f"Recovered {sampling_ps} ps/frame from the source header")
+
     # Load structure with parmed for .gro file generation
     structure = None
     try:
@@ -646,6 +788,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
                 verbose("No box detected. Skipping autoimage...")
             # RMS fit to first frame using backbone atoms (or all atoms for CG)
             f.write(f"rms first {fit_mask}\n")
+            f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
             # f.write(f"trajout {full_cif} cif onlyframes 1\n")
             f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
@@ -679,6 +822,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             strip_mask_minimal,
             "minimal",
             fit_mask=fit_mask,
+            sampling_ps=sampling_ps,
         )
 
     # Generate minimal.gro from structure
@@ -717,6 +861,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
                 strip_mask_minlip,
                 "minimal_lipid",
                 fit_mask=fit_mask,
+                sampling_ps=sampling_ps,
             )
 
         # Generate minimal_lipid.gro from structure
@@ -772,6 +917,14 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
         f.write("run\n")
     _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
+
+    # Recovered from the source header, not from cpptraj's report, because
+    # cpptraj does not expose DCD timing at all. Everything below stamps this
+    # onto the converted output so it carries a real time axis.
+    sampling_ps = source_sampling_ps(trajectory_file)
+    report_source_sampling(sampling_ps)
+    if sampling_ps is not None:
+        verbose(f"Recovered {sampling_ps} ps/frame from the source header")
     fix_pdb_element_symbols(traj_pdb)
 
     # Load with pytraj to check box and lipids
@@ -890,6 +1043,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
                 verbose("No box detected. Skipping autoimage...")
             # RMS fit to first frame using backbone atoms (or all atoms for CG)
             f.write(f"rms first {fit_mask}\n")
+            f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
             f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
             f.write("run\n")
@@ -925,6 +1079,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             strip_mask_minimal,
             "minimal",
             fit_mask=fit_mask,
+            sampling_ps=sampling_ps,
         )
     elif not trajectory_file:
         verbose(
@@ -966,6 +1121,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
                 strip_mask_minlip,
                 "minimal_lipid",
                 fit_mask=fit_mask,
+                sampling_ps=sampling_ps,
             )
 
         # Generate minimal_lipid.gro
