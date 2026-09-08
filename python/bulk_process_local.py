@@ -132,6 +132,12 @@ COLLECTION_DEFAULT = "Dissociation Dynamic Database"
 # uncapped, so truncating here loses nothing.
 MAX_SHORT_DESCRIPTION = 300
 
+# The DDD's frame spacing, in picoseconds. Declared into every bundle's TOML
+# because their exporter omits it and mdr-process will not record a measured
+# spacing below 10 ps undeclared. Corpus-wide: all 7,197 DDD simulations
+# already in prod measure exactly this.
+DDD_SAMPLING_FREQUENCY_PS = 1.0
+
 # What survives the reap of a SUCCEEDED bundle. Everything else under the
 # bundle directory goes. Keep the cheap evidence -- metadata, provenance,
 # the ligand inference Phase C reads, the BLAST hits, the thumbnail -- and
@@ -542,8 +548,19 @@ def retarget_metadata(local_dir: str, args: Args) -> List[str]:
 
     changed: List[str] = []
     orcid_at = None
+    timestep_at = None
+    has_sampling = False
 
     for num, line in enumerate(lines):
+        # Tracked unconditionally, unlike orcid_at: these anchor the sampling
+        # declaration below, which has to be found whether or not --orcid was
+        # passed. integration_timestep_fs is a required key, so every bundle
+        # that parses has one.
+        if re.match(r"\s*integration_timestep_fs\s*=", line):
+            timestep_at = num
+        if re.match(r"\s*sampling_frequency_ps\s*=", line):
+            has_sampling = True
+
         if args.orcid and re.match(r"\s*lead_contributor_orcid\s*=", line):
             orcid_at = num
             if f'"{args.orcid}"' not in line:
@@ -572,6 +589,29 @@ def retarget_metadata(local_dir: str, args: Args) -> List[str]:
             f'collections = ["{args.collection}"]',
         )
         changed.append("collections")
+
+    # DDD saved coordinates every 1.0 ps and their exporter declares no frame
+    # spacing at all, so the value is measured and nothing corroborates it.
+    # mdr-process refuses a measured spacing below 10 ps unless the metadata
+    # declares the same number, which would fail every remaining bundle in the
+    # corpus. Declaring it here is not a workaround for the check -- it is the
+    # fact the check asks for, and it is established twice over: their paper
+    # says "Coordinates were saved every 1.0 ps", and striding sim 21548's own
+    # trajectory gives a consecutive-CA-RMSD ratio of 1.39 between 1 and 2 ps
+    # against sqrt(2) = 1.41, then saturating near 0.47 A. A fabricated axis
+    # would already sit at that plateau at stride 1; this sits at half of it.
+    #
+    # Never overwrites a value the submitter did supply, and a wrong value here
+    # cannot publish quietly: mdr-process compares it against the trajectory
+    # and refuses the bundle if they disagree.
+    if not has_sampling and timestep_at is not None:
+        lines.insert(
+            timestep_at + 1,
+            f"# sampling_frequency_ps added by bulk_process_local.py for the "
+            f"DDD prod wave; not supplied by the submitter\n"
+            f"sampling_frequency_ps = {DDD_SAMPLING_FREQUENCY_PS}",
+        )
+        changed.append("sampling_frequency_ps")
 
     if changed:
         with open(path, "w", encoding="utf-8") as fh:
