@@ -1,0 +1,43 @@
+# Fixture, redacted 2026-09-09. Real DDD bundle 186l, with the
+# [[contributors]] table and lead_contributor_orcid replaced by placeholders
+# because this repository is public. Everything a test reads -- the ligand
+# table, structure_file_name, the timestep -- is the contributor's original.
+# Do not "restore" the redacted fields from the source bundle.
+lead_contributor_orcid = "0000-0000-0000-0000"
+trajectory_file_names = ["Pro_lig10.mdc", "Pro_lig11.mdc", "Pro_lig12.mdc", "Pro_lig13.mdc", "Pro_lig14.mdc", "Pro_lig15.mdc", "Pro_lig16.mdc", "Pro_lig17.mdc", "Pro_lig18.mdc", "Pro_lig19.mdc", "Pro_lig1.mdc", "Pro_lig20.mdc", "Pro_lig21.mdc", "Pro_lig22.mdc", "Pro_lig23.mdc", "Pro_lig24.mdc", "Pro_lig25.mdc", "Pro_lig26.mdc", "Pro_lig27.mdc", "Pro_lig28.mdc", "Pro_lig29.mdc", "Pro_lig2.mdc", "Pro_lig30.mdc", "Pro_lig31.mdc", "Pro_lig32.mdc", "Pro_lig33.mdc", "Pro_lig34.mdc", "Pro_lig35.mdc", "Pro_lig36.mdc", "Pro_lig37.mdc", "Pro_lig38.mdc", "Pro_lig39.mdc", "Pro_lig3.mdc", "Pro_lig40.mdc", "Pro_lig41.mdc", "Pro_lig42.mdc", "Pro_lig43.mdc", "Pro_lig44.mdc", "Pro_lig45.mdc", "Pro_lig46.mdc", "Pro_lig47.mdc", "Pro_lig48.mdc", "Pro_lig49.mdc", "Pro_lig4.mdc", "Pro_lig50.mdc", "Pro_lig5.mdc", "Pro_lig6.mdc", "Pro_lig7.mdc", "Pro_lig8.mdc", "Pro_lig9.mdc"]
+structure_file_name = "Pro_lig.pdb"
+topology_file_name = "Pro_lig.gro"
+temperature_kelvin = 300
+integration_timestep_fs = 1
+short_description = "Dissociation trajectory ensemble for the 186l PDB entry (P00720) bound to ligand 2-HYDROXYETHYL DISULFIDE, produced via the DDD (DD-03B) metadynamics pipeline"
+software_name = "SPONGE"
+software_version = "1.4"
+description = "Enhanced-sampling all-atom molecular dynamics dissociation trajectory for the 186l protein-ligand complex, which includes Uniprot entry P00720 bound to ligand 2-HYDROXYETHYL DISULFIDE. The simulation is one of 50 replicates for this complex, produced using the DD-03B pipeline of the Dissociation Dynamic Database (DDD) project. DD-03B is a large-scale dynamic resource that provides all-atom dissociation trajectories for 15440 ligand-protein complexes sourced from PDBbind+v2020.R1 free, totaling approximately 0.3 billion simulation frames and ~39.9 TB of data.  To induce ligand egress without requiring a predefined reaction coordinate, we applied metadynamics (MetaD) with a three-dimensional collective variable defined by the Cartesian coordinates of the ligand center-of-mass; each run terminates as soon as the ligand COM crosses the protein surface, which serves as the committor boundary. For each complex, multiple parallel MetaD runs with different random seeds were performed, yielding an ensemble of independent dissociation pathways. Simulations were carried out in explicit solvent using the same computational pipeline using the SPONGE MD engine. "
+toml_version = 2
+run_commands = "sponge"
+forcefield = "AMBER FF14SB GAFF1"
+pdb_id = "186l"
+uniprot_ids = [
+    "P00720",
+]
+
+dois = ["10.48550/arXiv.2604.06761"]
+
+[water]
+model = "TIP3P"
+density_kg_m3 = 1000.0
+
+[[ligands]]
+name = "2-HYDROXYETHYL DISULFIDE"
+
+[[solutes]]
+name = "K+"
+concentration_mol_liter = 0.15
+
+[[solutes]]
+name = "Cl-"
+concentration_mol_liter = 0.15
+
+[[contributors]]
+name = "Redacted Contributor"
+orcid = "0000-0000-0000-0000"

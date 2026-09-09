@@ -4,6 +4,7 @@
 # dependencies = [
 #     "openbabel-wheel",
 #     "MDAnalysis>=2.0",
+#     "rdkit>=2026.3.3",
 # ]
 # ///
 """
@@ -50,9 +51,49 @@ import warnings
 
 import numpy as np
 from openbabel import openbabel as ob
+from rdkit import Chem, RDLogger
 
 # Suppress Open Babel's C-level stderr warnings (e.g. "unusual valence" in InChI code).
 ob.obErrorLog.SetOutputLevel(ob.obError)
+
+# InChI and InChIKey come from RDKit, which bundles InChI 1.07.3, rather than
+# from OpenBabel, which still bundles 1.04 from 2011. OpenBabel keeps every
+# other job here: reading the coordinates, perceiving bonds, writing canonical
+# SMILES. See compare_smiles.to_inchi() for the measurement behind the split.
+RDLogger.DisableLog("rdApp.*")
+
+
+def _inchikey_from_smiles(smiles: str) -> Optional[str]:
+    """The standard InChIKey for a SMILES, or None if neither toolkit will.
+
+    RDKit (InChI 1.07.3) unless it refuses the molecule, then OpenBabel (1.04).
+
+    The fallback is not optional here. RDKit checks valence and OpenBabel does
+    not, and these SMILES come from bonds perceived off simulated coordinates,
+    which produces things like a neutral four-bonded nitrogen routinely --
+    measured 2026-09-09, RDKit rejects 1,963 of 6,659 inferred structures,
+    29.5%. Returning no key for those would empty a field that is populated
+    today and is what MDR-55 matched sibling simulations on.
+
+    Which version produced a given key therefore varies by row. That is the
+    argument for recording it alongside the value; until there is a column for
+    it, prefer the newer and never fail over it.
+    """
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is not None:
+        key = Chem.MolToInchiKey(mol)
+        if key:
+            return key
+
+    conv = ob.OBConversion()
+    conv.SetInFormat("smi")
+    conv.SetOutFormat("inchikey")
+    ob_mol = ob.OBMol()
+    if not conv.ReadString(ob_mol, smiles):
+        return None
+    return conv.WriteString(ob_mol).strip() or None
+
 
 # MDAnalysis prints a forest of harmless warnings on import; quiet them.
 with warnings.catch_warnings():
@@ -443,8 +484,7 @@ def _mol_summary(mol) -> dict:
     conv = ob.OBConversion()
     conv.SetOutFormat("can")
     smiles = conv.WriteString(mol).strip().split("\t")[0]
-    conv.SetOutFormat("inchikey")
-    inchikey = conv.WriteString(mol).strip()
+    inchikey = _inchikey_from_smiles(smiles) or ""
     return {
         "smiles": smiles,
         "formula": mol.GetFormula(),
@@ -608,15 +648,14 @@ def _http_get_json(
 
 
 def smiles_to_inchikey(smiles: str) -> Optional[str]:
-    """Compute the InChIKey for a SMILES string via OpenBabel."""
-    conv = ob.OBConversion()
-    conv.SetInFormat("smi")
-    conv.SetOutFormat("inchikey")
-    mol = ob.OBMol()
-    if not conv.ReadString(mol, smiles):
-        return None
-    key = conv.WriteString(mol).strip()
-    return key or None
+    """Compute the InChIKey for a SMILES string via RDKit (InChI 1.07.3).
+
+    This key is the lookup term for Wikidata and PDBe below, and those index
+    standard InChIKeys, so the version that generates it matters more here than
+    anywhere else in this file.
+    """
+
+    return _inchikey_from_smiles(smiles)
 
 
 def query_wikidata_by_inchikey(inchikey: str) -> Optional[str]:

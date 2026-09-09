@@ -25,8 +25,14 @@ import sys
 from typing import List, Tuple
 
 from openbabel import openbabel as ob
+from rdkit import Chem, RDLogger
 
 ob.obErrorLog.SetOutputLevel(ob.obError)
+
+# RDKit narrates every rejected molecule on stderr. The rejections are a
+# result here, not a fault -- see to_inchi() -- so they are reported through
+# the return value rather than the log.
+RDLogger.DisableLog("rdApp.*")
 
 
 def parse_smiles(smi: str) -> ob.OBMol:
@@ -44,10 +50,66 @@ def to_canonical(mol: ob.OBMol) -> str:
     return conv.WriteString(mol).strip().split("\t")[0]
 
 
-def to_inchi(mol: ob.OBMol) -> str:
+RDKIT = "rdkit"
+OPENBABEL = "openbabel"
+
+
+def _inchi_rdkit(canonical_smiles: str) -> str:
+    """InChI 1.07.3, or "" if RDKit will not accept the molecule."""
+
+    mol = Chem.MolFromSmiles(canonical_smiles)
+    if mol is None:
+        return ""
+    return Chem.MolToInchi(mol) or ""
+
+
+def _inchi_openbabel(mol: ob.OBMol) -> str:
+    """InChI 1.04. The fallback, not the default -- see to_inchi()."""
+
     conv = ob.OBConversion()
     conv.SetOutFormat("inchi")
     return conv.WriteString(mol).strip()
+
+
+def to_inchi(mol: ob.OBMol) -> str:
+    """The standard InChI for a molecule, computed by RDKit.
+
+    WHY NOT OPENBABEL, WHICH PARSED THE MOLECULE (2026-09-09): OpenBabel 3.1.0
+    bundles the InChI library at version 1.04, built 2011-09-09. RDKit 2026.03.3
+    bundles 1.07.3, three releases newer. InChI is only canonical per software
+    version -- the InChIKey spends a character encoding the version for exactly
+    this reason -- so the toolkit that computes it is part of what the value
+    means, and a fifteen-year-old one is not the thing to standardise on.
+
+    Measured before switching, over all 6,664 declared ligands in collection 5:
+    6,662 byte-identical InChIs between the two versions, zero layer
+    differences, zero InChIKey differences. So this is hygiene, not a repair.
+
+    RDKit CANNOT BE USED UNCONDITIONALLY, and the measurement that says so was
+    taken on 2026-09-09, on the side the earlier one did not cover. RDKit checks
+    valence and OpenBabel does not, so a molecule OpenBabel built happily can be
+    one RDKit refuses. On the DECLARED side that is 2 ligands in 6,664 -- 2w1c
+    and 2w1e, both publishing `C[NH]5CCOCC5`, a morpholine nitrogen with four
+    bonds and no charge. On the INFERRED side, where OpenBabel is perceiving
+    bonds from simulated coordinates, it is **1,963 of 6,659, or 29.5%**.
+
+    So this falls back to OpenBabel rather than failing. Refusing them would
+    turn nearly a third of the corpus from a publishable verdict into
+    "unverifiable", which is not an upgrade, it is an outage. The perception
+    problem is real and worth fixing upstream in mol_id.py; it is not this
+    function's to fix, and it must not be this function's to punish.
+
+    The molecule is handed to RDKit as canonical SMILES rather than re-read
+    from the caller's input, so both toolkits describe the same parse.
+
+    A COMPARISON MUST NOT MIX THE TWO. An InChI is canonical only within one
+    software version, so comparing a 1.07.3 string against a 1.04 string
+    compares the toolkits as much as the molecules. compare() therefore picks
+    one toolkit for the whole pair and records it as `inchi_software`; this
+    single-molecule entry point prefers RDKit and falls back on its own.
+    """
+
+    return _inchi_rdkit(to_canonical(mol)) or _inchi_openbabel(mol)
 
 
 def inchi_layers(inchi: str) -> dict:
@@ -124,13 +186,44 @@ def largest_fragment(smi: str) -> Tuple[str, List[str]]:
     return ranked[0], ranked[1:]
 
 
-def connectivity_of(smi: str) -> str:
-    """The InChI /c layer for a SMILES, or "" if InChI is unavailable."""
+def connectivity_of(smi: str, software: str = "") -> str:
+    """The InChI /c layer for a SMILES, or "" if InChI is unavailable.
+
+    `software` pins which toolkit computes it, so a caller mid-comparison can
+    stay on the one its pair was resolved with. Left unset it prefers RDKit.
+    """
 
     try:
-        return inchi_layers(to_inchi(parse_smiles(smi))).get("c", "")
+        mol = parse_smiles(smi)
     except (ValueError, RuntimeError):
         return ""
+
+    if software == RDKIT:
+        inchi = _inchi_rdkit(to_canonical(mol))
+    elif software == OPENBABEL:
+        inchi = _inchi_openbabel(mol)
+    else:
+        inchi = to_inchi(mol)
+
+    return inchi_layers(inchi).get("c", "")
+
+
+def inchi_pair(mol1: ob.OBMol, mol2: ob.OBMol) -> Tuple[str, str, str]:
+    """Both InChIs from ONE toolkit, plus which one it was.
+
+    RDKit unless it refuses either molecule, in which case both are recomputed
+    with OpenBabel. Never one of each: an InChI is canonical per software
+    version, so a mixed pair would report a version difference as a molecular
+    one -- and on this corpus that would fire on the 29.5% of inferred
+    structures RDKit will not accept.
+    """
+
+    rd1 = _inchi_rdkit(to_canonical(mol1))
+    rd2 = _inchi_rdkit(to_canonical(mol2))
+    if rd1 and rd2:
+        return rd1, rd2, RDKIT
+
+    return _inchi_openbabel(mol1), _inchi_openbabel(mol2), OPENBABEL
 
 
 def compare(smi1: str, smi2: str) -> dict:
@@ -140,8 +233,7 @@ def compare(smi1: str, smi2: str) -> dict:
     can1 = to_canonical(mol1)
     can2 = to_canonical(mol2)
 
-    inchi1 = to_inchi(mol1)
-    inchi2 = to_inchi(mol2)
+    inchi1, inchi2, inchi_software = inchi_pair(mol1, mol2)
 
     layers1 = inchi_layers(inchi1)
     layers2 = inchi_layers(inchi2)
@@ -174,8 +266,10 @@ def compare(smi1: str, smi2: str) -> dict:
     elif not inchi_available:
         same_connectivity_largest_fragment = False
     else:
-        main_conn1 = conn1 if not dropped1 else connectivity_of(main1)
-        main_conn2 = conn2 if not dropped2 else connectivity_of(main2)
+        # Same toolkit as the pair above, or the fragment check would compare
+        # a 1.07.3 layer against a 1.04 one.
+        main_conn1 = conn1 if not dropped1 else connectivity_of(main1, inchi_software)
+        main_conn2 = conn2 if not dropped2 else connectivity_of(main2, inchi_software)
         same_connectivity_largest_fragment = (
             main_conn1 == main_conn2 and main_conn1 != ""
         )
@@ -264,6 +358,10 @@ def compare(smi1: str, smi2: str) -> dict:
         "connectivity1": conn1,
         "connectivity2": conn2,
         "inchi_available": inchi_available,
+        # Which toolkit produced inchi1/inchi2, and so which InChI version the
+        # layer comparisons above are expressed in: "rdkit" is 1.07.3,
+        # "openbabel" is 1.04. Both sides always come from the same one.
+        "inchi_software": inchi_software,
         "same_connectivity_largest_fragment": same_connectivity_largest_fragment,
         "same_gross_formula": same_gross_formula,
         "fragment_artifact": fragment_artifact,

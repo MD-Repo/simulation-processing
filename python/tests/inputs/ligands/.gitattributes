@@ -1,0 +1,4 @@
+# The delivered DDD metadata really is CRLF, and fix_ligand_smiles.py
+# normalising it to LF is part of what these fixtures exist to pin. Keep the
+# bytes exactly as committed.
+*.toml -text
