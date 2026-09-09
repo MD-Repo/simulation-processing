@@ -71,6 +71,22 @@ def _inchi_openbabel(mol: ob.OBMol) -> str:
     return conv.WriteString(mol).strip()
 
 
+def inchi_of(mol: ob.OBMol) -> Tuple[str, str]:
+    """(InChI, which toolkit produced it). "" and "" if neither could.
+
+    The single-molecule counterpart of inchi_pair(). Callers that STORE an
+    InChI need the second value: it is what `md_ligand.identity_software`
+    records, and without it a stored string does not say which InChI version
+    it is canonical under.
+    """
+
+    rd = _inchi_rdkit(to_canonical(mol))
+    if rd:
+        return rd, RDKIT
+    ob_inchi = _inchi_openbabel(mol)
+    return (ob_inchi, OPENBABEL) if ob_inchi else ("", "")
+
+
 def to_inchi(mol: ob.OBMol) -> str:
     """The standard InChI for a molecule, computed by RDKit.
 
@@ -109,7 +125,7 @@ def to_inchi(mol: ob.OBMol) -> str:
     single-molecule entry point prefers RDKit and falls back on its own.
     """
 
-    return _inchi_rdkit(to_canonical(mol)) or _inchi_openbabel(mol)
+    return inchi_of(mol)[0]
 
 
 def inchi_layers(inchi: str) -> dict:
