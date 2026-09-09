@@ -81,13 +81,14 @@ import fcntl
 import gzip
 import hashlib
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
-from typing import List, NamedTuple
+from datetime import date, datetime, timezone
+from typing import Dict, List, NamedTuple, Optional
 
 from dotenv import load_dotenv
 from irods.session import iRODSSession
@@ -98,6 +99,12 @@ from common import stamp
 # The restore path in terraform-mdrepo (ansible/roles/mdrepo-db/tasks/main.yaml)
 # fetches this name. Do not rename it.
 LATEST_NAME = "mdrepo.latest.sql.gz"
+
+# The 31 rotation slots, and the format of the timestamp AVU written beside
+# them. Anchored so mdrepo.latest.sql.gz and the archive.* snapshots are not
+# mistaken for rotation slots -- neither belongs to the day-of-month cycle.
+SLOT_RE = re.compile(r"^mdrepo\.(0[1-9]|[12]\d|3[01])\.sql\.gz$")
+AVU_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # The old script derived the collection from `hostname | sed s/-/./g`, which
 # worked only because it ran ON the database VM. Run anywhere else and that
@@ -690,6 +697,84 @@ def upload_to_swift(local: str, container: str, name: str, size: int, status) ->
 
 
 # --------------------------------------------------
+def expected_slot_date(day: int, today: date) -> Optional[date]:
+    """The most recent date on or before `today` whose day-of-month is `day`
+
+    Slot NN is written on the NNth of a month, so whatever sits in it should be
+    the dump from the last NNth that actually happened. Walking back a month at
+    a time, rather than assuming "this month or last", is what makes short
+    months right: on 5 March the most recent 30th is 30 January, because
+    February has none, so slot 30 legitimately holds a dump five weeks old and
+    is not stale. Returns None if no such date exists within a year.
+    """
+
+    year, month = today.year, today.month
+    for _ in range(14):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            candidate = None  # this month has no such day; keep walking back
+        if candidate is not None and candidate <= today:
+            return candidate
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+
+    return None
+
+
+def check_rotation(seen: Dict[int, date], today: date, status) -> int:
+    """Assert that every rotation slot that should exist does, and is current
+
+    The gap this closes: report_stored audits the objects that ARE there, which
+    cannot see the one failure that matters most -- a slot that is GONE. On
+    2026-09-05 a failed put removed mdrepo.05.sql.gz and never replaced it, and
+    four nightly verify-only runs afterwards reported "0 problem(s)" while the
+    listing jumped straight from 04 to 06. The tool written to audit this
+    collection called a missing night healthy.
+
+    It also catches the OTHER shape, which today's code cannot produce but the
+    planned reorder can: a slot that still holds last month's dump because this
+    month's write failed after the old object was left in place. Under
+    delete-then-put a failed night leaves nothing; under put-then-rename it
+    leaves something stale. Checking dates rather than presence covers both.
+
+    `seen` maps slot number to the date its content was taken. The horizon is
+    the oldest date in it, so a collection younger than 31 days does not report
+    the slots it has not reached yet as missing.
+    """
+
+    if not seen:
+        status("  <-- NO ROTATION SLOTS AT ALL")
+        return 1
+
+    horizon = min(seen.values())
+    problems = 0
+
+    for day in range(1, 32):
+        expected = expected_slot_date(day, today)
+        if expected is None or expected < horizon:
+            continue
+
+        name = f"mdrepo.{day:02d}.sql.gz"
+        if day not in seen:
+            status(f"  {name:24} <-- MISSING: expected the {expected} dump")
+            problems += 1
+        elif seen[day] < expected and expected != today:
+            # A slot whose turn is today may simply not have run yet; every
+            # other slot holding something older than its last turn is stale.
+            status(
+                f"  {name:24} <-- STALE: holds {seen[day]}, "
+                f"expected the {expected} dump"
+            )
+            problems += 1
+
+    if not problems:
+        status(f"  rotation: all {len(seen)} slot(s) present and current")
+
+    return problems
+
+
 def report_stored(session, collection: str, status) -> int:
     """Describe what is in the collection now; return a problem count
 
@@ -700,6 +785,7 @@ def report_stored(session, collection: str, status) -> int:
 
     coll = session.collections.get(collection)
     problems = 0
+    seen: Dict[int, date] = {}
 
     status(f"{collection}: {len(coll.data_objects)} object(s)")
     for obj in sorted(coll.data_objects, key=lambda d: d.name):
@@ -717,6 +803,23 @@ def report_stored(session, collection: str, status) -> int:
             f"  {obj.name:24} {obj.size:>13,}  written {when}"
             f"  catalog mtime {obj.modify_time:%Y-%m-%d %H:%M}{flag}"
         )
+
+        # The AVU is the truth about WHEN the dump was taken; the catalog mtime
+        # only says when the object was written, which differs for anything
+        # restored by hand. Fall back to it only for the pre-AVU objects.
+        slot = SLOT_RE.match(obj.name)
+        if slot:
+            if written:
+                try:
+                    taken = datetime.strptime(
+                        written[0].value, AVU_TIME_FORMAT).date()
+                except ValueError:
+                    taken = obj.modify_time.date()
+            else:
+                taken = obj.modify_time.date()
+            seen[int(slot.group(1))] = taken
+
+    problems += check_rotation(seen, datetime.now(timezone.utc).date(), status)
 
     return problems
 
