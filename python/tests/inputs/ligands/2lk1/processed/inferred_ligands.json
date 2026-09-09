@@ -1,0 +1,23 @@
+[
+  {
+    "structure": {
+      "smiles": "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(O)(O)O",
+      "formula": "C14H10O5S",
+      "num_atoms": 27,
+      "num_heavy_atoms": 20,
+      "charge": 0,
+      "inchikey": "NQMXHCVFCXRZSE-UHFFFAOYSA-N",
+      "resname": "LIG"
+    },
+    "name": {
+      "smiles_input": "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(O)(O)O",
+      "inchikey": "NQMXHCVFCXRZSE-UHFFFAOYSA-N",
+      "cid": 0,
+      "iupac_name": "unknown",
+      "pubchem_title": "unknown",
+      "formula": "",
+      "charge": 0,
+      "best_name": "unknown"
+    }
+  }
+]

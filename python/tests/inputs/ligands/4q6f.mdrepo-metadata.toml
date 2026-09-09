@@ -1,0 +1,43 @@
+# Fixture, redacted 2026-09-09. Real DDD bundle 4q6f, with the
+# [[contributors]] table and lead_contributor_orcid replaced by placeholders
+# because this repository is public. Everything a test reads -- the ligand
+# table, structure_file_name, the timestep -- is the contributor's original.
+# Do not "restore" the redacted fields from the source bundle.
+lead_contributor_orcid = "0000-0000-0000-0000"
+trajectory_file_names = ["Pro_lig40.mdc"]
+structure_file_name = "Pro_lig.pdb"
+topology_file_name = "Pro_lig.gro"
+temperature_kelvin = 300
+integration_timestep_fs = 1
+short_description = "Dissociation trajectory ensemble for the 4q6f PDB entry (Q9UIF9) bound to ligand , produced via the DDD (DD-03B) metadynamics pipeline"
+software_name = "SPONGE"
+software_version = "1.4"
+description = "Enhanced-sampling all-atom molecular dynamics dissociation trajectory for the 4q6f protein-ligand complex, which includes Uniprot entry Q9UIF9 bound to ligand . The simulation is one of 50 replicates for this complex, produced using the DD-03B pipeline of the Dissociation Dynamic Database (DDD) project. DD-03B is a large-scale dynamic resource that provides all-atom dissociation trajectories for 15440 ligand-protein complexes sourced from PDBbind+v2020.R1 free, totaling approximately 0.3 billion simulation frames and ~39.9 TB of data.  To induce ligand egress without requiring a predefined reaction coordinate, we applied metadynamics (MetaD) with a three-dimensional collective variable defined by the Cartesian coordinates of the ligand center-of-mass; each run terminates as soon as the ligand COM crosses the protein surface, which serves as the committor boundary. For each complex, multiple parallel MetaD runs with different random seeds were performed, yielding an ensemble of independent dissociation pathways. Simulations were carried out in explicit solvent using the same computational pipeline using the SPONGE MD engine. "
+toml_version = 2
+run_commands = "sponge"
+forcefield = "AMBER FF14SB GAFF1"
+pdb_id = "4q6f"
+uniprot_ids = [
+    "Q9UIF9",
+]
+
+dois = ["10.48550/arXiv.2604.06761"]
+
+[water]
+model = "TIP3P"
+density_kg_m3 = 1000.0
+
+[[ligands]]
+name = ""
+
+[[solutes]]
+name = "K+"
+concentration_mol_liter = 0.15
+
+[[solutes]]
+name = "Cl-"
+concentration_mol_liter = 0.15
+
+[[contributors]]
+name = "Redacted Contributor"
+orcid = "0000-0000-0000-0000"
