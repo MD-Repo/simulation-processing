@@ -1,7 +1,12 @@
 """Tests for push_sim_files.py
 
-Only verify_irods() is covered here, and for one reason: it is the function
-that decides whether a pushed simulation is complete, and on 2026-08-12 and
+Two functions are covered here, verify_irods() and remote_md5_and_size(), and
+for one reason: both ask IRODS for a checksum, and each in turn killed a run by
+letting the answer escape as an exception. The second half of this file is the
+2026-09-10 repeat; the first half is the original.
+
+verify_irods() is the function that decides whether a pushed simulation is
+complete, and on 2026-08-12 and
 2026-08-14 it was also the function that killed the run. It called
 `obj.chksum()`, which makes the server resolve a resource hierarchy and re-read
 the object; that raised HIERARCHY_ERROR on 46 replicate-merge groups, and
@@ -172,3 +177,110 @@ def test_unverifiable_file_never_reads_as_verified():
 
     assert remote_md5 != GOOD_MD5.lower()
     assert not (remote_md5 == GOOD_MD5.lower())
+
+
+# --------------------------------------------------
+# remote_md5_and_size() -- the skip decision, added 2026-09-10.
+#
+# Same RPC, same failure, other end of the run. verify_irods() was hardened in
+# August; this path kept calling obj.chksum() unconditionally and unguarded,
+# and on 2026-09-10 it took down job 193 (ticket 2337) as a traceback in 14
+# seconds. One 0-byte replica, left intermediate by an interrupted write the
+# night before, answered HIERARCHY_ERROR -- and because the call sat in the
+# loop that decides what to upload, the run died before it had looked at a
+# single file. Nothing was uploaded, nothing was verified, nothing was
+# recorded.
+
+
+# --------------------------------------------------
+def test_skip_check_absent_object_is_zero_and_empty():
+    """A path IRODS does not have cannot be skipped, and is not asked anything"""
+
+    obj = FakeObj(size=10, checksum=GOOD_MD5)
+    size, md5 = p.remote_md5_and_size(FakeSession(obj, exists=False), "/z/gone")
+
+    assert (size, md5) == (0, "")
+    assert obj.chksum_calls == 0
+
+
+# --------------------------------------------------
+def test_skip_check_uses_the_registered_checksum():
+    """The catalog value is the answer, and chksum() is never called for it
+
+    The normal re-run path: every object this script wrote has its checksum
+    registered by put_file(), so the hierarchy-resolving RPC is not touched at
+    all. That is the difference between a re-run costing a metadata lookup per
+    file and costing a full server-side re-read of every file.
+    """
+
+    obj = FakeObj(size=4096, checksum=GOOD_MD5)
+    size, md5 = p.remote_md5_and_size(FakeSession(obj), "/z/ok")
+
+    assert (size, md5) == (4096, GOOD_MD5)
+    assert obj.chksum_calls == 0
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("registered", [f"md5:{GOOD_MD5}", f"  {GOOD_MD5.upper()}  "])
+def test_skip_check_normalises_the_checksum(registered):
+    """A "md5:" prefix, padding, or upper case still compares to our manifest"""
+
+    obj = FakeObj(size=4096, checksum=registered)
+    assert p.remote_md5_and_size(FakeSession(obj), "/z/ok") == (4096, GOOD_MD5)
+
+
+# --------------------------------------------------
+def test_skip_check_falls_back_to_computing():
+    """An object with nothing registered still gets an answer
+
+    Objects written before REG_CHKSUM_KW, or by something other than this
+    script, have no catalog checksum. Skipping them on size alone is what the
+    2026-08-10 change set out to stop, so the fallback has to exist.
+    """
+
+    obj = FakeObj(size=4096, checksum=None, chksum_returns=GOOD_MD5)
+    size, md5 = p.remote_md5_and_size(FakeSession(obj), "/z/old")
+
+    assert (size, md5) == (4096, GOOD_MD5)
+    assert obj.chksum_calls == 1
+
+
+# --------------------------------------------------
+def test_skip_check_contains_hierarchy_error(capsys):
+    """HIERARCHY_ERROR from chksum() returns no md5 instead of propagating
+
+    The regression. The size still comes back, because the caller's fallback
+    test needs it and the catalog really does say 0.
+    """
+
+    from irods.exception import HIERARCHY_ERROR
+
+    obj = FakeObj(size=0, checksum=None, chksum_raises=HIERARCHY_ERROR(None))
+    size, md5 = p.remote_md5_and_size(FakeSession(obj), "/z/stuck")
+
+    assert (size, md5) == (0, "")
+    assert "could not checksum" in capsys.readouterr().out
+
+
+# --------------------------------------------------
+def test_stuck_object_is_queued_rather_than_skipped():
+    """The 0-byte intermediate replica must read as "upload this"
+
+    This is the decision the run actually makes, spelled out: an unanswerable
+    checksum sends it to the size test, and 188,689 local bytes against 0
+    remote ones is not a skip. Anything else would be worse than the crash --
+    silently accepting an empty object as the published file.
+    """
+
+    from irods.exception import HIERARCHY_ERROR
+
+    local_size, local_md5 = 188689, "4386ca18466183940d42f2119c40e7b2"
+    obj = FakeObj(size=0, checksum=None, chksum_raises=HIERARCHY_ERROR(None))
+    remote_size, remote_md5 = p.remote_md5_and_size(FakeSession(obj), "/z/stuck")
+
+    if local_md5 and remote_md5:
+        can_skip = remote_md5 == local_md5.strip().lower()
+    else:
+        can_skip = local_size == remote_size
+
+    assert can_skip is False

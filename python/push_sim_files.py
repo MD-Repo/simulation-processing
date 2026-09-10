@@ -21,7 +21,7 @@ import humanize
 from dotenv import dotenv_values
 from irods.parallel import abort_parallel_transfers
 from irods.session import iRODSSession
-from typing import Dict, List, NamedTuple, TextIO, Optional
+from typing import Dict, List, NamedTuple, TextIO, Optional, Tuple
 from subprocess import getstatusoutput
 
 # Attempts per file before giving up
@@ -362,22 +362,14 @@ def main() -> None:
                     # byte-identical to July's and so were genuinely fine, which
                     # is what made it look like a size-threshold problem.
                     #
-                    # chksum() forces a server-side hash rather than trusting the
-                    # catalog, matching verify_irods() below -- catalog metadata
-                    # on this zone has been demonstrably stale (see the replica
-                    # divergence in the DB backups). That costs server time on a
-                    # re-run, but only for objects that already exist: a first
-                    # push finds nothing remote and pays none of it.
+                    # The md5 comes from remote_md5(), which reads the catalog
+                    # before forcing a server-side hash -- see its docstring.
                     basename = os.path.basename(local_path)
                     remote_path = os.path.join(irods_dir, basename)
                     local_md5 = files["meta"].get(local_path, {}).get("md5", "")
-                    remote_size = 0
-                    remote_md5 = ""
-                    if session.data_objects.exists(remote_path):
-                        obj = session.data_objects.get(remote_path)
-                        remote_size = obj.size
-                        chksum = obj.chksum() or ""
-                        remote_md5 = chksum.split(":", 1)[-1].strip().lower()
+                    remote_size, remote_md5 = remote_md5_and_size(
+                        session, remote_path
+                    )
 
                     # Fall back to the old size test only when a checksum is
                     # genuinely unavailable on one side, so a manifest without
@@ -685,6 +677,48 @@ def get_files(args: Args) -> Dict[str, List[str]]:
             files["media_files"].append(local_path)
 
     return files
+
+
+# --------------------------------------------------
+def remote_md5_and_size(session, remote_path: str) -> Tuple[int, str]:
+    """Return (size, md5) for an IRODS object, or (0, "") if it is not there.
+
+    Used to decide whether an upload can be skipped. The md5 is read from the
+    catalog first and computed only when nothing is registered -- the same
+    order, and the same reasoning, as verify_irods(). This used to call
+    chksum() unconditionally, on the grounds that catalog metadata on this
+    zone has been demonstrably stale (the replica divergence in the DB
+    backups). What makes the catalog trustworthy here is that put_file()
+    registers the checksum as it writes, with REG_CHKSUM_KW: the value comes
+    from hashing the bytes that landed, not from a later claim about them.
+
+    The unconditional call was also a live hazard. chksum() asks the server to
+    resolve a resource hierarchy, and an object whose only replica cannot be
+    resolved answers with HIERARCHY_ERROR -- which killed job 193 (ticket
+    2337) as an uncaught traceback in 14 seconds, before a single file was
+    examined, over one 0-byte replica left intermediate by an earlier
+    interrupted write.
+
+    An md5 of "" means "no answer", never "no match": the caller falls back to
+    its size test, which for that 0-byte replica says do not skip. The file is
+    then queued, and a put that cannot succeed either is reported per-file by
+    machinery that already exists, instead of taking the run down with it.
+    """
+
+    if not session.data_objects.exists(remote_path):
+        return (0, "")
+
+    obj = session.data_objects.get(remote_path)
+    chksum = obj.checksum or ""
+
+    if not chksum:
+        try:
+            chksum = obj.chksum() or ""
+        except Exception as err:
+            print(f" could not checksum {remote_path}: {err}")
+            chksum = ""
+
+    return (obj.size, chksum.split(":", 1)[-1].strip().lower())
 
 
 # --------------------------------------------------
