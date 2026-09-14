@@ -34,11 +34,27 @@ class FakeObj:
 
 # --------------------------------------------------
 class FakeHandle:
-    def __init__(self, payload):
+    def __init__(self, payload, sizes=None):
         self._payload = payload
+        self._pos = 0
+        # Every size the canary asked for, so a test can prove the read is
+        # bounded rather than trusting that it is.
+        self.sizes = sizes if sizes is not None else []
 
-    def read(self):
-        return self._payload
+    def read(self, size=-1):
+        """A real cursor, because the canary now reads in chunks.
+
+        The old fake ignored the size and returned everything on every call,
+        which is precisely why the suite passed while the real read-back was
+        stalling in production: nothing here exercised a bounded read.
+        """
+        self.sizes.append(size)
+        if size is None or size < 0:
+            chunk = self._payload[self._pos:]
+        else:
+            chunk = self._payload[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -75,7 +91,7 @@ class FakeDataObjects:
         payload = self.parent.readback_override
         if payload is None:
             payload = self.parent.stored
-        return FakeHandle(payload)
+        return FakeHandle(payload, self.parent.read_sizes)
 
     def unlink(self, remote_path, force=False):
         self.parent.unlinked.append((remote_path, force))
@@ -105,6 +121,7 @@ class FakeSession:
         self.checksum_override = None
         self.readback_override = None
         self.put_raises = None
+        self.read_sizes = []
         self.data_objects = FakeDataObjects(self)
         self.collections = FakeCollections(self)
 
@@ -321,3 +338,34 @@ def test_canary_collection_is_server_scoped():
     assert prod != staging
     assert "/prod/release/" in prod
     assert "/staging/release/" in staging
+
+
+# --------------------------------------------------
+def test_readback_is_bounded_never_a_bare_read(fake_session, tmp_path):
+    """The read-back must ask for a size, every time.
+
+    This is the regression test for 2026-09-11 through 09-14, when the canary
+    reported prod unwritable for three days and held the batch-2 ingest. The
+    zone was writable the whole time: put, stat, chksum and unlink all passed
+    against a 250 MB object, and only the read-back stalled. An unbounded
+    fh.read() makes the client seek for the object length first, and that seek
+    returned nothing -- ResponseNotParseable("Server response was None while
+    parsing as FileSeekResponse") -- while a chunked read of the same object
+    seconds later succeeded.
+
+    The old fake ignored the size argument and returned the whole payload on
+    every call, so the suite passed no matter how the canary read. Asserting
+    on the sizes is what makes this catchable in CI instead of in production.
+    """
+
+    holder = fake_session()
+    result = c.run_canary(server="prod", irods_env="ignored", size_mb=1,
+                          tmp_dir=str(tmp_path))
+
+    assert result.ok, result.detail
+
+    sizes = holder["session"].read_sizes
+    assert sizes, "the read-back never ran"
+    assert all(n is not None and n > 0 for n in sizes), (
+        f"read-back used an unbounded read: {sizes}")
+    assert all(n <= c.READBACK_CHUNK for n in sizes)

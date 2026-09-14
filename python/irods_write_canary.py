@@ -65,6 +65,12 @@ DEFAULT_SIZE_MB = 5
 # Exactly the failure backup_database.py added --put-timeout for (item 27).
 DEFAULT_TIMEOUT = 180
 
+# Read the bytes back in bounded chunks. See the read-back in run_canary():
+# a bare fh.read() seeks for the object length, and that seek is what stalled
+# on 2026-09-11, 09-13 and 09-14. Any bounded size avoids the seek; 8 MiB just
+# keeps the loop short.
+READBACK_CHUNK = 8 * 1024 * 1024
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -303,14 +309,31 @@ def run_canary(
         # a stale replica can be served in place of what was just written. A
         # server-computed checksum and a client-side read-back can disagree,
         # and it is the read-back that matches what a consumer would get.
+        # Read in bounded chunks, never a bare fh.read(). An unbounded read
+        # asks the server for the object's length first, and on 2026-09-14
+        # that seek returned nothing for a 250 MB object -- ResponseNotParseable
+        # ("Server response was None while parsing as FileSeekResponse") --
+        # while a chunked read of the SAME object seconds later succeeded in
+        # 20.7s. That seek is what failed this canary on 09-11, 09-13 and
+        # 09-14 and held batch 2 for three days: the zone was writable
+        # throughout, put/stat/chksum/unlink all passed, and this was the only
+        # iRODS read in the pipeline shaped that way. Measured with
+        # utils/python/irods_phase_probe.py --readback-mode both.
+        readback_md5 = hashlib.md5()
+        readback_len = 0
         with session.data_objects.open(remote_path, "r") as fh:
-            readback = fh.read()
+            while True:
+                chunk = fh.read(READBACK_CHUNK)
+                if not chunk:
+                    break
+                readback_md5.update(chunk)
+                readback_len += len(chunk)
 
-        if hashlib.md5(readback).hexdigest() != local_md5:
+        if readback_md5.hexdigest() != local_md5:
             return CanaryResult(
                 False,
                 f"read-back mismatch: wrote {len(payload):,} bytes, "
-                f"read {len(readback):,} that hash differently",
+                f"read {readback_len:,} that hash differently",
                 elapsed(),
             )
 
