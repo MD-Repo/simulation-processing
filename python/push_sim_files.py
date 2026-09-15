@@ -84,6 +84,29 @@ class Args(NamedTuple):
 
 
 # --------------------------------------------------
+def describe_exc(e: BaseException) -> str:
+    """Render an exception so the log names the fault.
+
+    python-irodsclient raises its error classes with a bare None message, so
+    an f"{e}" renders the single word "None" and throws the diagnosis away.
+    That is how the 2026-09-05 IRODS failure became unknowable, and how the
+    2026-09-15 push failures on MDR00099444/99447 recorded nothing about a
+    LOCKED_DATA_OBJECT_ACCESS that an admin then had to identify by hand.
+
+    The class name IS the diagnosis, and the numeric iRODS code sits on the
+    class, so "LOCKED_DATA_OBJECT_ACCESS(-406000)" costs one call and needs
+    no traceback. Non-iRODS exceptions keep their message.
+    """
+
+    label = type(e).__name__
+    code = getattr(e, "code", None)
+    if code is not None:
+        label = f"{label}({code})"
+    text = str(e)
+    return label if text in ("", "None") else f"{label}: {text}"
+
+
+# --------------------------------------------------
 def get_args() -> Args:
     """Get command-line arguments"""
 
@@ -266,7 +289,7 @@ def main() -> None:
                 try:
                     media_server.put(local_path, remote=remote_path)
                 except Exception as e:
-                    errors.append(f"{local_path} -> media: {e}")
+                    errors.append(f"{local_path} -> media: {describe_exc(e)}")
             else:
                 errors.append(f"Invalid path '{local_path}'")
 
@@ -436,8 +459,8 @@ def main() -> None:
                                 took = humanize.precisedelta(future.result())
                                 message = f" {basename} (took {took})"
                             except Exception as e:
-                                message = f" {basename} FAILED: {e}"
-                                errors.append(f"{local_path}: {e}")
+                                message = f" {basename} FAILED: {describe_exc(e)}"
+                                errors.append(f"{local_path}: {describe_exc(e)}")
 
                             # The upload threads print retries under this lock
                             with PRINT_LOCK:
@@ -461,7 +484,7 @@ def main() -> None:
                             if future.cancelled():
                                 errors.append(f"{local_path}: not uploaded (aborted)")
                             elif exc := future.exception():
-                                errors.append(f"{local_path}: {exc}")
+                                errors.append(f"{local_path}: {describe_exc(exc)}")
                             else:
                                 # Finished while the pool was shutting down
                                 took = humanize.precisedelta(future.result())
@@ -633,7 +656,7 @@ def put_file(
                 raise
 
             with PRINT_LOCK:
-                print(f" {basename} attempt {attempt} failed: {e}")
+                print(f" {basename} attempt {attempt} failed: {describe_exc(e)}")
                 sys.stdout.flush()
         finally:
             sessions.put(session)
@@ -715,7 +738,7 @@ def remote_md5_and_size(session, remote_path: str) -> Tuple[int, str]:
         try:
             chksum = obj.chksum() or ""
         except Exception as err:
-            print(f" could not checksum {remote_path}: {err}")
+            print(f" could not checksum {remote_path}: {describe_exc(err)}")
             chksum = ""
 
     return (obj.size, chksum.split(":", 1)[-1].strip().lower())
@@ -754,7 +777,7 @@ def verify_irods(session, remote_path: str, expected_size: int):
         try:
             chksum = obj.chksum() or ""
         except Exception as err:
-            print(f" could not checksum {remote_path}: {err}")
+            print(f" could not checksum {remote_path}: {describe_exc(err)}")
             return (True, None)
 
     return (True, chksum.split(":", 1)[-1].strip().lower())
