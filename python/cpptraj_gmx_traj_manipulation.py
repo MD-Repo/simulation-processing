@@ -569,6 +569,25 @@ def has_box(frame):
 
 
 # --------------------------------------------------
+def autoimage_action(box_present):
+    """cpptraj `autoimage` line, or "" when there is no unit cell to image in
+
+    The full trajectory has always had this; the stripped one never did, and
+    the stripped one is what becomes minimal.xtc and then the sampled.xtc
+    video. So a complex whose chains sit in different periodic images -- an
+    FXR ligand-binding domain and its coactivator peptide, say -- was written
+    to the video with the peptide flung to the far side of the box, jumping a
+    whole box vector between frames.
+
+    Nothing was wrong with the simulation or with full.xtc. Only the video.
+    """
+
+    if not box_present:
+        return ""
+    return "autoimage\n"
+
+
+# --------------------------------------------------
 def process_stripped_trajectory(
     topology_file,
     trajectory_file,
@@ -577,6 +596,7 @@ def process_stripped_trajectory(
     prefix,
     fit_mask="@CA,C,N",
     sampling_ps=None,
+    box_present=False,
 ):
     """Process a stripped trajectory with principal rotation workflow.
 
@@ -592,6 +612,8 @@ def process_stripped_trajectory(
         prefix: Output file prefix (e.g., 'minimal' or 'minimal_lipid')
         sampling_ps: Frame spacing recovered from the source, stamped onto the
             output so the published trajectory carries a real time axis
+        box_present: Whether the source carries a unit cell, enabling the
+            autoimage that keeps a multi-chain complex whole (see below)
 
     Returns:
         tuple: (xtc_path, pdb_path, ref_path) or (None, None, None) on failure
@@ -611,6 +633,10 @@ def process_stripped_trajectory(
     with open(cppin_ref, "w") as f:
         f.write(f"parm {topology_file}\n")
         f.write(f"trajin {trajectory_file} 1 1\n")
+        # Before strip, so the imaging sees whole molecules and a real box.
+        # The principal axes are measured from this frame; a chain sitting in
+        # the wrong periodic image drags them off and tilts the whole video.
+        f.write(autoimage_action(box_present))
         f.write(f"strip {strip_mask}\n")
         f.write(f"principal {fit_mask} dorotation\n")
         f.write("rotate z 90\n")
@@ -632,6 +658,12 @@ def process_stripped_trajectory(
         f.write(f"parmstrip {strip_mask} parmindex 1\n")
         f.write(f"reference {ref_pdb} parm [stripped] [rotref]\n")
         f.write(f"trajin {trajectory_file} parm [full]\n")
+        # MUST precede both strip and rms. Imaging needs the unrotated box:
+        # `rms` rewrites coordinates into the reference's frame, after which
+        # the stored box vectors no longer describe the periodic lattice and
+        # imaging silently does the wrong thing. Stripping first would also
+        # remove the solvent that tells autoimage which molecules are mobile.
+        f.write(autoimage_action(box_present))
         f.write(f"strip {strip_mask}\n")
         f.write(f"rms ref [rotref] {fit_mask}\n")
         f.write(time_action(sampling_ps))
@@ -702,6 +734,10 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
         return
 
     first_frame = traj[0]
+    # Hoisted out of the full-trajectory branch below: the stripped
+    # trajectories need the same answer, and re-deriving it there would let
+    # the two paths disagree about whether there is a cell to image in.
+    box_present = has_box(first_frame)
     atom_names = {atom.name for atom in traj.top.atoms}
     fit_mask = "@CA,C,N" if atom_names & {"CA", "C", "N"} else "@*"
     if fit_mask == "@*":
@@ -781,7 +817,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             f.write(f"parm {topology_file}\n")
             f.write(f"trajin {trajectory_file}\n")
             # Use autoimage only if box is present
-            if has_box(first_frame):
+            if box_present:
                 verbose("Box detected. Using autoimage...")
                 f.write("autoimage\n")
             else:
@@ -823,6 +859,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             "minimal",
             fit_mask=fit_mask,
             sampling_ps=sampling_ps,
+            box_present=box_present,
         )
 
     # Generate minimal.gro from structure
@@ -862,6 +899,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
                 "minimal_lipid",
                 fit_mask=fit_mask,
                 sampling_ps=sampling_ps,
+                box_present=box_present,
             )
 
         # Generate minimal_lipid.gro from structure
@@ -1080,6 +1118,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             "minimal",
             fit_mask=fit_mask,
             sampling_ps=sampling_ps,
+            box_present=box_present,
         )
     elif not trajectory_file:
         verbose(
@@ -1122,6 +1161,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
                 "minimal_lipid",
                 fit_mask=fit_mask,
                 sampling_ps=sampling_ps,
+                box_present=box_present,
             )
 
         # Generate minimal_lipid.gro
