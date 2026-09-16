@@ -190,6 +190,8 @@ class Args(NamedTuple):
     fault_wait: int
     fault_window: int
     max_window_faults: int
+    health_probe_objects: int
+    max_trips: int
 
 
 # --------------------------------------------------
@@ -307,6 +309,28 @@ def get_args() -> Args:
         help="How long to wait for IRODS to come back before ending the run "
         "(0 = stop as soon as the fault limit is hit)",
     )
+    # A probe must sample as hard as the thing it clears. On 2026-09-16 the
+    # breaker tripped 70 times over 11 hours and a ONE-object canary cleared
+    # it every time, because the fault was partial: ~8.5% of files failed
+    # independently with HIERARCHY_ERROR, so one object passed 91.5% of the
+    # time while a 19-file bundle passed 18.6%. Probing once against a
+    # per-file failure rate cannot tell healthy from badly broken.
+    parser.add_argument(
+        "--health-probe-objects", type=int, default=19, metavar="INT",
+        help="Objects the health probe writes before declaring IRODS well. "
+        "All must succeed. Defaults to the 19 files in a bundle, so the "
+        "probe is exactly as likely to notice a partial outage as a real "
+        "push is (1 = the pre-2026-09-16 behaviour)",
+    )
+    # The backstop for the same day: whatever the probe says, a breaker that
+    # keeps tripping is describing a server that keeps failing. Resuming on
+    # a probe is only defensible a bounded number of times.
+    parser.add_argument(
+        "--max-trips", type=int, default=3, metavar="INT",
+        help="Total breaker trips allowed across the run before stopping "
+        "regardless of what the health probe reports (0 = unlimited, the "
+        "pre-2026-09-16 behaviour)",
+    )
     parser.add_argument("--script-dir", default=SCRIPT_DIR_DEFAULT,
                         metavar="DIR", help="Where mol_id.py lives")
     parser.add_argument("--uv", default=UV_DEFAULT, metavar="PATH")
@@ -367,6 +391,7 @@ def get_args() -> Args:
         args.script_dir, args.uv, args.keep_failed,
         args.max_consecutive_faults, args.fault_wait,
         args.fault_window, args.max_window_faults,
+        args.health_probe_objects, args.max_trips,
     )
 
 
@@ -812,20 +837,31 @@ def irods_healthy(args: Args) -> bool:
     A read probe is not enough: what fails here is the push. The canary
     writes, verifies twice and removes, which is exactly the operation the
     pipeline needs and cannot fake.
+
+    It writes --health-probe-objects of them, and ALL must pass. One is not
+    enough, measured on 2026-09-16: that day's fault failed individual files
+    at ~8.5% independently, so a single object cleared the breaker 70 times
+    over 11 hours while 81.4% of real bundles were failing. Sampling once
+    tells you about one object; a bundle pushes 19, and the probe has to be
+    as exposed as the thing it is vouching for. Short-circuits on the first
+    failure, so an unhealthy server is reported quickly.
     """
 
     canary = os.path.join(args.script_dir, "irods_write_canary.py")
     if not os.path.isfile(canary):
         return False
-    try:
-        proc = subprocess.run(
-            [sys.executable, canary, "-s", args.server, "--size-mb", "1",
-             "--timeout", "120"],
-            capture_output=True, text=True, timeout=180,
-        )
-        return proc.returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        return False
+    for _ in range(max(1, args.health_probe_objects)):
+        try:
+            proc = subprocess.run(
+                [sys.executable, canary, "-s", args.server, "--size-mb", "1",
+                 "--timeout", "120"],
+                capture_output=True, text=True, timeout=180,
+            )
+            if proc.returncode != 0:
+                return False
+        except (subprocess.SubprocessError, OSError):
+            return False
+    return True
 
 
 # --------------------------------------------------
@@ -993,6 +1029,7 @@ def main() -> None:
     recent: collections.deque = collections.deque(maxlen=args.fault_window
                                                   or 1)
     outage = False
+    trips = 0
     pending = list(bundles)
 
     # Submitted a window at a time rather than all at once: with every
@@ -1036,12 +1073,23 @@ def main() -> None:
                 )
 
                 if (consecutive_trip or window_trip) and not outage:
+                    trips += 1
                     why = (f"{faults} consecutive"
                            if consecutive_trip
                            else f"{sum(recent)} of the last {len(recent)}")
                     print(f"{stamp()} !! {why} IRODS/push faults -- the "
-                          f"server looks gone, not flaky", flush=True)
-                    if args.fault_wait and wait_for_irods(args):
+                          f"server looks gone, not flaky "
+                          f"(trip {trips}"
+                          + (f" of {args.max_trips}" if args.max_trips else "")
+                          + ")", flush=True)
+                    exhausted = args.max_trips and trips >= args.max_trips
+                    if exhausted:
+                        # The probe has already cleared this run and been
+                        # wrong. Do not ask it again -- see --max-trips.
+                        print(f"{stamp()} !! {trips} breaker trips -- not "
+                              f"trusting the health probe again", flush=True)
+                    if (not exhausted
+                            and args.fault_wait and wait_for_irods(args)):
                         faults = 0
                         recent.clear()
                     else:

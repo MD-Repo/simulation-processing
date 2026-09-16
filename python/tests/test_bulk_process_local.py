@@ -42,12 +42,13 @@ OK = ("dry-run-ok", "")
 
 
 def run_loop(outcomes, max_faults=5, fault_wait=0, parallel=2,
-             window=10, win_faults=5):
+             window=10, win_faults=5, max_trips=3, probe=False):
     """Drive main()'s real loop over len(outcomes) stub bundles.
 
-    Returns (recorded rows, exit code). wait_for_irods is stubbed to False so
-    the outage always outlasts us; the waiting path is a sleep loop and is not
-    what these tests are about.
+    Returns (recorded rows, exit code). wait_for_irods is stubbed to `probe`:
+    False (the default) means the outage always outlasts us, True means the
+    health probe keeps insisting the server is fine -- which is the
+    2026-09-16 shape and what --max-trips exists to survive.
     """
 
     tmp = tempfile.mkdtemp()
@@ -67,7 +68,7 @@ def run_loop(outcomes, max_faults=5, fault_wait=0, parallel=2,
              B.wait_for_irods, sys.argv)
     concurrent.futures.ProcessPoolExecutor = concurrent.futures.ThreadPoolExecutor
     B.process_one = stub
-    B.wait_for_irods = lambda a: False
+    B.wait_for_irods = lambda a: probe
     sys.argv = [
         "bulk_process_local.py", "--survey-tsv", survey, "--go-classes", "go",
         "--record", record, "--work-dir", os.path.join(tmp, "work"),
@@ -77,6 +78,7 @@ def run_loop(outcomes, max_faults=5, fault_wait=0, parallel=2,
         "--fault-wait", str(fault_wait),
         "--fault-window", str(window),
         "--max-window-faults", str(win_faults),
+        "--max-trips", str(max_trips),
     ]
 
     code = 0
@@ -212,3 +214,95 @@ def test_window_rule_tolerates_a_healthy_failure_rate():
     rows, code = run_loop(outcomes)
     assert len(rows) == 40
     assert code == 0
+
+
+# ---- the 2026-09-16 regression: a probe that is wrong all day -------------
+
+def test_a_lying_health_probe_cannot_keep_the_run_alive():
+    """The breaker must stop even when the health probe says the server is up.
+
+    On 2026-09-16 the breaker tripped 70 times over 11 hours and the probe
+    cleared it every single time, so the wave pushed on and left 355 failed
+    bundles and ~354 hidden placeholder rows. The probe was not lying: it
+    wrote ONE object, and the fault failed files independently at ~8.5%, so
+    one object passed 91.5% of the time while a 19-file bundle passed 18.6%.
+
+    A breaker that a probe can veto indefinitely is not a breaker. After
+    --max-trips trips the probe has been demonstrated wrong and is not
+    consulted again.
+    """
+
+    # Every bundle is a storage fault, and the probe always says "fine".
+    rows, code = run_loop([PUSH_FAIL] * 200, fault_wait=600,
+                          max_trips=3, probe=True)
+
+    assert code == 1, "a run this broken must exit non-zero"
+    assert len(rows) < 200, "the run must stop, not grind through every bundle"
+    # 3 trips, each needing max_faults(5) faults to arm: comfortably under 60.
+    assert len(rows) <= 60, (
+        f"stopped only after {len(rows)} bundles -- the trip cap is not "
+        f"bounding the damage")
+
+
+def test_max_trips_zero_restores_the_old_unbounded_behaviour():
+    """0 means "never stop on trip count", which is what shipped before.
+
+    Kept switchable because the trip cap is a policy, not a fact: a run that
+    genuinely expects a long flaky patch may want the probe to keep deciding.
+    """
+
+    rows, code = run_loop([PUSH_FAIL] * 40, fault_wait=600,
+                          max_trips=0, probe=True)
+
+    assert code == 0, "with no trip cap the probe keeps clearing the breaker"
+    assert len(rows) == 40, "every bundle is attempted, as it did on 09-16"
+
+
+def test_a_probe_that_reports_recovery_still_resumes():
+    """The cap must not break the case the waiting path exists for.
+
+    A genuine ten-minute blip at hour twenty should not need a human, so one
+    or two trips followed by a real recovery must resume normally.
+    """
+
+    # Five faults arm the breaker once, then the server comes back for good.
+    rows, code = run_loop([PUSH_FAIL] * 5 + [OK] * 30, fault_wait=600,
+                          max_trips=3, probe=True)
+
+    assert code == 0, "one trip then recovery is not an outage"
+    assert len(rows) == 35, "the run should complete every bundle"
+
+
+# ---- the probe samples as hard as a real push ----------------------------
+
+def test_health_probe_writes_a_bundles_worth_of_objects(monkeypatch, tmp_path):
+    """One object cannot clear a partial outage -- that is the 09-16 bug.
+
+    The probe must fail if ANY of its writes fail, and must write about as
+    many as a bundle pushes, or it is systematically blinder than the thing
+    it is vouching for.
+    """
+
+    canary = tmp_path / "irods_write_canary.py"
+    canary.write_text("")
+    calls = []
+
+    class Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    # Healthy: every write succeeds.
+    monkeypatch.setattr(B.subprocess, "run",
+                        lambda *a, **k: (calls.append(1), Proc(0))[1])
+    args = B.Args(*([None] * len(B.Args._fields)))._replace(
+        script_dir=str(tmp_path), server="prod", health_probe_objects=19)
+    assert B.irods_healthy(args) is True
+    assert len(calls) == 19, "the probe must write a bundle's worth, not one"
+
+    # Partial outage: the 7th write fails, as HIERARCHY_ERROR did.
+    calls.clear()
+    monkeypatch.setattr(
+        B.subprocess, "run",
+        lambda *a, **k: (calls.append(1), Proc(0 if len(calls) < 7 else 1))[1])
+    assert B.irods_healthy(args) is False, (
+        "one failed object among many must condemn the whole probe")
