@@ -34,14 +34,26 @@ AKMA_TO_PS = 4.888821e-2
 def _load_module():
     """Import the script with its conda-only dependencies stubbed out."""
 
-    for name in ("pytraj", "parmed"):
-        sys.modules.setdefault(name, types.ModuleType(name))
-    spec = importlib.util.spec_from_file_location(
-        "cpptraj_gmx_traj_manipulation", "cpptraj_gmx_traj_manipulation.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    # The stubs are needed only while the module body runs, and must not
+    # outlive it. MDAnalysis asks `isinstance(thing, parmed.Structure)` while
+    # working out which parser a file needs, so a stub left in sys.modules
+    # makes every Universe in the process raise AttributeError -- which turned
+    # every later trajectory test into a silent pass.
+    planted = [
+        name
+        for name in ("pytraj", "parmed")
+        if sys.modules.setdefault(name, types.ModuleType(name)).__spec__ is None
+    ]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "cpptraj_gmx_traj_manipulation", "cpptraj_gmx_traj_manipulation.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name in planted:
+            sys.modules.pop(name, None)
 
 
 cg = _load_module()
