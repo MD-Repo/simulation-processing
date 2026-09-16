@@ -559,13 +559,75 @@ def detect_format(top_file, tpr_file):
 
 
 # --------------------------------------------------
+def usable_box(box):
+    """Whether `box` describes a real unit cell.
+
+    Judged on the three lengths alone. A simulation run without a periodic
+    box reports zero lengths with the default 90 degree angles, which is not
+    a box but is not all zeros either, so a test over all six values calls it
+    real. Everything downstream then believes there is a cell to work in:
+    cpptraj is told to autoimage, and parmed is handed a zero-length cell it
+    cannot turn into box vectors.
+    """
+    if box is None:
+        return False
+    return all(abs(v) > 1e-6 for v in list(box)[:3])
+
+
 def has_box(frame):
-    if getattr(frame, "box", None) is None:
-        return False
-    vals = list(frame.box)
-    if all(abs(v) < 1e-6 for v in vals):
-        return False
-    return True
+    return usable_box(getattr(frame, "box", None))
+
+
+def bounding_box(structure):
+    """A cell big enough to hold `structure`, with 5 angstroms of clearance.
+
+    The GRO format always wants the box line, even for a simulation that had
+    no periodic box. Parmed writes one itself in that case, but takes the
+    extent along the wrong axis -- per atom rather than per dimension -- so
+    the numbers it puts there do not describe the molecule at all.
+
+    Returns None if the structure has no coordinates to measure.
+    """
+    coords = getattr(structure, "coordinates", None)
+    if coords is None:
+        return None
+    extent = coords.max(axis=0) - coords.min(axis=0) + 5.0
+    return [float(extent[0]), float(extent[1]), float(extent[2]), 90.0, 90.0, 90.0]
+
+
+def keep_mask(structure, strip_residues):
+    """A per-atom 0/1 mask over `structure`, 1 where the atom is kept.
+
+    Parmed reads `structure[selection]` one of two ways: as a list of atom
+    indices, or -- when the length of the selection happens to equal the atom
+    count -- as a boolean mask. So a plain index list changes meaning the
+    moment nothing is stripped: `[0, 1, 2, ...]` read as a mask deselects
+    atom 0, because 0 is false, and the first atom of the structure silently
+    disappears. A mask means the same thing at every length.
+    """
+    return [
+        0 if atom.residue.name in strip_residues else 1
+        for atom in structure.atoms
+    ]
+
+
+def save_gro(structure, path):
+    """Write `structure` to `path` as a .gro, with a box line that is real.
+
+    A failed write is not left behind. Parmed writes the box last, so a write
+    that dies there leaves a file holding every atom line and no box line --
+    one that looks complete, passes a size check, and is not a valid .gro.
+    """
+    if not usable_box(getattr(structure, "box", None)):
+        structure.box = bounding_box(structure)
+    if os.path.isfile(path):
+        os.remove(path)
+    try:
+        structure.save(path, format="gro")
+    except Exception:
+        if os.path.isfile(path):
+            os.remove(path)
+        raise
 
 
 # --------------------------------------------------
@@ -836,9 +898,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     # Generate full.gro from structure
     if structure is not None and not file_exists(full_gro):
         try:
-            if os.path.isfile(full_gro):
-                os.remove(full_gro)
-            structure.save(full_gro, format="gro")
+            save_gro(structure, full_gro)
             verbose("Generated full.gro")
         except Exception as e:
             warn(f"Could not generate full.gro: {e}")
@@ -868,15 +928,8 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             # Strip water, ions, and lipids from structure using efficient selection
             strip_residues = set(KNOWN_WATER + KNOWN_IONS + KNOWN_LIPIDS)
             # Select atoms to keep (not in strip list)
-            keep_indices = [
-                i
-                for i, atom in enumerate(structure.atoms)
-                if atom.residue.name not in strip_residues
-            ]
-            minimal_struct = structure[keep_indices]
-            if os.path.isfile(minimal_gro):
-                os.remove(minimal_gro)
-            minimal_struct.save(minimal_gro, format="gro")
+            minimal_struct = structure[keep_mask(structure, strip_residues)]
+            save_gro(minimal_struct, minimal_gro)
             verbose("Generated minimal.gro")
         except Exception as e:
             warn(f"Could not generate minimal.gro: {e}")
@@ -908,15 +961,8 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
                 # Strip water and ions only (keep lipids) using efficient selection
                 strip_residues = set(KNOWN_WATER + KNOWN_IONS)
                 # Select atoms to keep (not in strip list)
-                keep_indices = [
-                    i
-                    for i, atom in enumerate(structure.atoms)
-                    if atom.residue.name not in strip_residues
-                ]
-                minlip_struct = structure[keep_indices]
-                if os.path.isfile(minlip_gro):
-                    os.remove(minlip_gro)
-                minlip_struct.save(minlip_gro, format="gro")
+                minlip_struct = structure[keep_mask(structure, strip_residues)]
+                save_gro(minlip_struct, minlip_gro)
                 verbose("Generated minimal_lipid.gro")
             except Exception as e:
                 warn(f"Could not generate minimal_lipid.gro: {e}")
@@ -1095,9 +1141,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
     # Generate full.gro
     if full_structure is not None and not file_exists(full_gro):
         try:
-            if os.path.isfile(full_gro):
-                os.remove(full_gro)
-            full_structure.save(full_gro, format="gro")
+            save_gro(full_structure, full_gro)
             verbose("Generated full.gro")
         except Exception as e:
             warn(f"Could not generate full.gro: {e}")
@@ -1131,15 +1175,8 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             # Strip water, ions, and lipids from structure using efficient selection
             strip_residues = set(KNOWN_WATER + KNOWN_IONS + KNOWN_LIPIDS)
             # Select atoms to keep (not in strip list)
-            keep_indices = [
-                i
-                for i, atom in enumerate(full_structure.atoms)
-                if atom.residue.name not in strip_residues
-            ]
-            minimal_struct = full_structure[keep_indices]
-            if os.path.isfile(minimal_gro):
-                os.remove(minimal_gro)
-            minimal_struct.save(minimal_gro, format="gro")
+            minimal_struct = full_structure[keep_mask(full_structure, strip_residues)]
+            save_gro(minimal_struct, minimal_gro)
             verbose("Generated minimal.gro")
         except Exception as e:
             warn(f"Could not generate minimal.gro: {e}")
@@ -1170,15 +1207,8 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
                 # Strip water and ions only (keep lipids) using efficient selection
                 strip_residues = set(KNOWN_WATER + KNOWN_IONS)
                 # Select atoms to keep (not in strip list)
-                keep_indices = [
-                    i
-                    for i, atom in enumerate(full_structure.atoms)
-                    if atom.residue.name not in strip_residues
-                ]
-                minlip_struct = full_structure[keep_indices]
-                if os.path.isfile(minlip_gro):
-                    os.remove(minlip_gro)
-                minlip_struct.save(minlip_gro, format="gro")
+                minlip_struct = full_structure[keep_mask(full_structure, strip_residues)]
+                save_gro(minlip_struct, minlip_gro)
                 verbose("Generated minimal_lipid.gro")
             except Exception as e:
                 warn(f"Could not generate minimal_lipid.gro: {e}")
