@@ -5,8 +5,13 @@ Install [uv](https://docs.astral.sh/uv/#installation)
 Then:
 
 ```
-uv add --requirements requirements.txt
+uv sync
 ```
+
+`uv sync` installs exactly what `uv.lock` pins. Do not use
+`uv add --requirements ...`: that re-resolves every dependency and moves the
+lock, which is how this environment and `utils/python` drift apart on shared
+libraries such as MDAnalysis. Both are meant to hold the same versions.
 
 To install `playwright`:
 
