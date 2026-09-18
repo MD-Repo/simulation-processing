@@ -614,6 +614,23 @@ def keep_mask(structure, strip_residues):
 def save_gro(structure, path):
     """Write `structure` to `path` as a .gro, with a box line that is real.
 
+    `combine="all"` is load-bearing, not a tuning knob. Without it parmed's
+    GRO writer calls `struct.split()` to group atoms into moleculetypes, and
+    that loop raises `RuntimeError: Could not find <Atom ...>` MID-WRITE for
+    any structure whose bonded groups it cannot match -- after the count line
+    and a handful of atom lines are already on disk. That is how 46,578
+    released `minimal.gro` files came to declare thousands of atoms and hold
+    one. `combine="all"` skips the split entirely (`gromacsgro.py:257`), and
+    parmed's own docstring is explicit that only the default may reorder
+    atoms: every other value leaves the order alone, which is what we want,
+    because the order is the topology's.
+
+    Verified against 40 released simulations: byte-identical to the default
+    wherever the default succeeds (27 of 27), and succeeds on all 13 where
+    the default raises. Reprocessing does NOT fix these files without it --
+    proved on MDR00021551, where a clean reprocess still wrote no .gro at
+    all.
+
     A failed write is not left behind. Parmed writes the box last, so a write
     that dies there leaves a file holding every atom line and no box line --
     one that looks complete, passes a size check, and is not a valid .gro.
@@ -623,7 +640,7 @@ def save_gro(structure, path):
     if os.path.isfile(path):
         os.remove(path)
     try:
-        structure.save(path, format="gro")
+        structure.save(path, format="gro", combine="all")
     except Exception:
         if os.path.isfile(path):
             os.remove(path)
