@@ -614,7 +614,7 @@ def keep_mask(structure, strip_residues):
 def save_gro(structure, path):
     """Write `structure` to `path` as a .gro, with a box line that is real.
 
-    `combine="all"` is load-bearing, not a tuning knob. Without it parmed's
+    `combine="all"` is required, not an optimisation. Without it parmed's
     GRO writer calls `struct.split()` to group atoms into moleculetypes, and
     that loop raises `RuntimeError: Could not find <Atom ...>` MID-WRITE for
     any structure whose bonded groups it cannot match -- after the count line

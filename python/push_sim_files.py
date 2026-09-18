@@ -59,8 +59,8 @@ DEFAULT_TRANSFER_THREADS = 0
 # Files at or under this are verified by READING THE BYTES BACK; above it the
 # checksum the server registered while writing is trusted instead. 64 MiB
 # covers every published file except the trajectories and tars, so almost
-# everything is proved by a read at a cost that is a rounding error next to
-# the upload itself.
+# everything is proved by a read, and the extra read costs much less than the
+# upload it checks.
 READBACK_LIMIT = 64 * 1024 * 1024
 
 PUSH_TIMEOUT = 3600  # seconds
