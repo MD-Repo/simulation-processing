@@ -611,6 +611,74 @@ def keep_mask(structure, strip_residues):
     ]
 
 
+def check_gro(path, expected_atoms):
+    """Raise unless `path` is a complete .gro holding `expected_atoms` atoms.
+
+    Nothing anywhere read a .gro back after writing it, and that is how both
+    of the 2026-09 defects reached 49,602 published simulations. One wrote
+    every atom line and then died before the box line. The other wrote a
+    correct count line, one atom, and then died inside parmed's molecule
+    matching. Both produced a file that exists, has a plausible size, and is
+    wrong. Neither the caller nor mdr-process looked inside.
+
+    Three things are checked, and each one alone would have caught a real bug:
+
+      the count line matches the structure   -- catches a lost atom, which is
+                                                what made 2,959 files short by
+                                                exactly one
+      the atom lines present match the count -- catches a truncated write,
+                                                which is what made 46,578
+                                                files declare thousands and
+                                                hold one
+      a box line is there                    -- catches the ZeroDivisionError
+                                                that fired after every atom
+                                                line was already on disk
+
+    This reads the file rather than trusting the writer, for the same reason
+    push_sim_files.py reads objects back out of IRODS: the writer's opinion
+    that it succeeded is not evidence.
+    """
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+
+    if len(lines) < 3:
+        raise ValueError(f"{path}: {len(lines)} lines, too short to be a .gro")
+
+    try:
+        declared = int(lines[1].strip())
+    except ValueError:
+        raise ValueError(f"{path}: count line is {lines[1]!r}, not a number")
+
+    if declared != expected_atoms:
+        raise ValueError(
+            f"{path}: declares {declared} atoms, structure has {expected_atoms}"
+        )
+
+    # A .gro is title + count + N atom lines + box, so a correct file has
+    # N + 3 lines. Work out whether the last line is a box before counting,
+    # because a file that lost only its box line otherwise reports as one
+    # atom short, which sends the reader after the wrong bug.
+    box = lines[-1].split()
+    lengths = None
+    if len(box) in (3, 9):
+        try:
+            lengths = [float(v) for v in box[:3]]
+        except ValueError:
+            lengths = None
+
+    present = len(lines) - 3
+    if present != declared:
+        raise ValueError(
+            f"{path}: declares {declared} atoms, holds {present} atom lines"
+            + ("" if lengths is not None else ", and its last line is not a box")
+        )
+
+    if lengths is None:
+        raise ValueError(f"{path}: last line is {lines[-1]!r}, not a box line")
+    if not all(abs(v) > 1e-6 for v in lengths):
+        raise ValueError(f"{path}: box line has a zero length: {lengths}")
+
+
 def save_gro(structure, path):
     """Write `structure` to `path` as a .gro, with a box line that is real.
 
@@ -641,6 +709,7 @@ def save_gro(structure, path):
         os.remove(path)
     try:
         structure.save(path, format="gro", combine="all")
+        check_gro(path, len(structure.atoms))
     except Exception:
         if os.path.isfile(path):
             os.remove(path)
