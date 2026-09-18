@@ -89,6 +89,7 @@ class Args(NamedTuple):
     remove_processed_dir: bool
     threads: int
     transfer_threads: int
+    readback_limit: int
     timeout: int
 
 
@@ -252,6 +253,7 @@ def get_args() -> Args:
         remove_processed_dir=args.remove_processed_dir,
         threads=args.threads,
         transfer_threads=args.transfer_threads,
+        readback_limit=args.readback_limit,
         timeout=args.timeout,
     )
 
