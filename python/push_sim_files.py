@@ -7,6 +7,7 @@ Purpose: Push simulation files to cat/IRODS
 
 import argparse
 import fabric
+import hashlib
 import irods.keywords as kw
 import json
 import os
@@ -15,6 +16,7 @@ import shlex
 import signal
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime as dt, timedelta
 import humanize
@@ -54,6 +56,13 @@ DEFAULT_TRANSFER_THREADS = 0
 # to be killed by hand before the ticket could finish. A landing that is
 # working takes about two minutes, so an hour is thirty times the headroom a
 # healthy push needs and still cuts a wedged one loose the same shift.
+# Files at or under this are verified by READING THE BYTES BACK; above it the
+# checksum the server registered while writing is trusted instead. 64 MiB
+# covers every published file except the trajectories and tars, so almost
+# everything is proved by a read at a cost that is a rounding error next to
+# the upload itself.
+READBACK_LIMIT = 64 * 1024 * 1024
+
 PUSH_TIMEOUT = 3600  # seconds
 # What the graceful abort gets before the process leaves anyway. The wedged
 # case is exactly the one where waiting for transfer threads to wind down is
@@ -192,6 +201,17 @@ def get_args() -> Args:
         metavar="INT",
         type=int,
         default=DEFAULT_TRANSFER_THREADS,
+    )
+
+    parser.add_argument(
+        "--readback-limit",
+        help="Verify files up to this many bytes by READING THEM BACK out of "
+        "IRODS rather than trusting the checksum the server registered while "
+        "writing. Above it the registered checksum is used, because a second "
+        "full read of a 10G tar is not free (0 disables read-back entirely)",
+        metavar="BYTES",
+        type=int,
+        default=READBACK_LIMIT,
     )
 
     parser.add_argument(
@@ -511,10 +531,13 @@ def main() -> None:
         print("Verifying uploads")
         for target in targets:
             if target["location"] == "media":
-                present, remote_md5 = verify_media(media_server, target["dest"])
+                present, remote_md5, how = verify_media(
+                    media_server, target["dest"]
+                )
             else:
-                present, remote_md5 = verify_irods(
-                    session, target["dest"], target["size"]
+                present, remote_md5, how = verify_irods(
+                    session, target["dest"], target["size"],
+                    args.readback_limit,
                 )
 
             verified = present and remote_md5 == target["expected_md5"].lower()
@@ -539,6 +562,10 @@ def main() -> None:
                     "remote_md5": remote_md5,
                     "present": present,
                     "verified": verified,
+                    # Which evidence "verified" rests on. A read back proves
+                    # the object is readable now; a registered checksum only
+                    # proves what the server hashed as it wrote.
+                    "verified_by": how,
                 }
             )
 
@@ -557,7 +584,10 @@ def main() -> None:
             print(json.dumps(result, indent=4), file=fh)
 
     n_verified = sum(1 for f in file_results if f["verified"])
-    print(f"Verified {n_verified}/{len(file_results)} file(s); complete={complete}")
+    n_read = sum(1 for f in file_results
+                 if f["verified"] and str(f.get("verified_by", "")).startswith("read back"))
+    print(f"Verified {n_verified}/{len(file_results)} file(s) "
+          f"({n_read} by reading the bytes back); complete={complete}")
     if errors:
         print("Upload errors:\n" + "\n".join(errors))
     print("Done")
@@ -606,6 +636,59 @@ def abort_uploads(signum, _frame) -> None:
 
 
 # --------------------------------------------------
+def md5_local(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def md5_readback(session, remote_path: str) -> str:
+    """Hash what IRODS actually serves, by reading the object.
+
+    A registered checksum is a claim about bytes that may be unreadable; only
+    a read is evidence. replace_irods_object.py has held this standard since
+    it was written, and this is the same rule applied to the path that
+    publishes releases.
+    """
+    h = hashlib.md5()
+    with session.data_objects.open(remote_path, "r") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def preflight_collection(session, irods_dir: str) -> None:
+    """Prove `irods_dir` is writable BEFORE anything in it is deleted.
+
+    CyVerse picks a storage resource per write and some of them are broken, so
+    a write can fail for reasons that have nothing to do with the file or the
+    caller. A test run on 2026-08-20 deleted its object and then took
+    UNIX_FILE_CREATE_ERR on the upload, leaving the path empty.
+
+    Once per collection, not once per file: the probe is what proves the
+    resource is healthy, and repeating it for every file in the same
+    collection buys nothing and costs a round trip each time.
+    """
+    probe = f"{irods_dir}/.push-preflight-{uuid.uuid4().hex[:12]}"
+    try:
+        with session.data_objects.open(probe, "w") as fh:
+            fh.write(b"preflight")
+        with session.data_objects.open(probe, "r") as fh:
+            if fh.read(1) != b"p":
+                raise RuntimeError("probe read back wrong")
+    finally:
+        try:
+            if session.data_objects.exists(probe):
+                session.data_objects.unlink(probe, force=True)
+        except Exception as err:
+            with PRINT_LOCK:
+                print(f" !! could not clean up probe {probe}: "
+                      f"{describe_exc(err)}")
+
+
+# --------------------------------------------------
 def put_file(
     sessions: queue.Queue,
     local_path: str,
@@ -617,17 +700,30 @@ def put_file(
     basename = os.path.basename(local_path)
     remote_path = os.path.join(irods_dir, basename)
 
-    # Files over 32M are transferred with multiple threads automatically.
+    # DELETE, THEN PUT -- not an overwrite. Changed 2026-09-18.
     #
-    # REG_CHKSUM_KW makes the server hash the bytes as it writes them and
-    # register the result in the catalog. That is what lets verify_irods()
-    # read a checksum back as plain metadata instead of calling chksum(),
-    # which asks the server to resolve a resource hierarchy and re-read the
-    # whole object -- the RPC that raised HIERARCHY_ERROR on 46 groups across
-    # the 08-12 and 08-14 merge runs. Without this, a put registers no
-    # checksum at all, so there is nothing for verification to fall back on.
-    # It is also the cheaper of the two: hashing during the write replaces a
-    # second full read of every file, which matters at 10G per full.tar.
+    # This used to force-put over the live object. That is a second, weaker
+    # mechanism for the same job replace_and_record.py already does, and the
+    # difference is not cosmetic:
+    #
+    #   - An in-place overwrite has to be accepted by the existing object. A
+    #     wedged replica -- status 2, no registered checksum, left behind by
+    #     an interrupted write -- refuses, and a force put simply retries into
+    #     the same refusal. Deleting first removes the thing doing the
+    #     refusing.
+    #   - An overwrite that writes fewer bytes than the object already holds
+    #     can leave the old tail in place. A fresh object cannot.
+    #
+    # The collection is proved writable BEFORE the delete, because a failed
+    # write after a successful delete leaves the path EMPTY, and these are
+    # published files. That is the whole reason preflight exists.
+    #
+    # REG_CHKSUM_KW still makes the server hash the bytes as it writes them
+    # and register the result, which is what lets verify_irods() read a
+    # checksum as plain metadata instead of calling chksum() -- the RPC that
+    # raised HIERARCHY_ERROR on 46 groups across the 08-12 and 08-14 merge
+    # runs. FORCE_FLAG_KW is kept as a backstop for the race where something
+    # else recreates the path between the unlink and the put.
     options = {kw.FORCE_FLAG_KW: "", kw.REG_CHKSUM_KW: ""}
 
     for attempt in range(1, NUM_RETRIES + 1):
@@ -638,6 +734,21 @@ def put_file(
         session = sessions.get()
         try:
             start = dt.now()
+
+            if session.data_objects.exists(remote_path):
+                preflight_collection(session, irods_dir)
+                session.data_objects.unlink(remote_path, force=True)
+                # Verify the unlink took. An unlink that silently did nothing
+                # would put us straight back to overwriting in place, which
+                # is the behaviour this replaced.
+                if session.data_objects.exists(remote_path):
+                    raise RuntimeError(
+                        f"{basename}: object still present after unlink; "
+                        f"nothing written"
+                    )
+                with PRINT_LOCK:
+                    print(f" {basename} (replaced: deleted then put)")
+
             session.data_objects.put(
                 local_path,
                 remote_path,
@@ -745,42 +856,67 @@ def remote_md5_and_size(session, remote_path: str) -> Tuple[int, str]:
 
 
 # --------------------------------------------------
-def verify_irods(session, remote_path: str, expected_size: int):
-    """Return (present, md5) for an IRODS object. `present` requires the remote
-    size to match the local file; `md5` is the object's MD5 as IRODS has it (the
-    zone hashes with MD5, so this compares to our manifest directly). A `md5` of
-    None means the object is there but could not be checksummed -- the caller
-    treats that as unverified, never as a pass."""
+def verify_irods(session, remote_path: str, expected_size: int,
+                 readback_limit: int = READBACK_LIMIT):
+    """Return (present, md5, how) for an IRODS object. `present` requires the
+    remote size to match the local file; `md5` is the object's MD5 as IRODS has
+    it (the zone hashes with MD5, so this compares to our manifest directly).
+    A `md5` of None means the object is there but could not be checksummed --
+    the caller treats that as unverified, never as a pass. `how` names which
+    evidence the md5 came from, and goes into the result file, because
+    "verified" meant two different strengths of claim and the record did not
+    say which.
+
+    TWO STRENGTHS, and the difference is real. REG_CHKSUM_KW makes the server
+    hash the bytes AS IT WRITES THEM, so a registered checksum is strong
+    evidence about what arrived -- but it says nothing about whether the object
+    can be READ BACK now. A read proves both. It also costs a second full pass
+    over the file, which at 10G per full.tar is not something to do
+    unconditionally, so it is done for everything up to `readback_limit` and
+    the registered checksum is trusted above it.
+    """
 
     if not session.data_objects.exists(remote_path):
-        return (False, None)
+        return (False, None, "absent")
 
     obj = session.data_objects.get(remote_path)
     if obj.size != expected_size:
-        return (False, None)
+        return (False, None, "size mismatch")
+
+    # Small enough to prove by reading. This is the standard
+    # replace_irods_object.py has always held -- "the registered checksum is a
+    # claim about bytes that may be unreadable; only a read proves anything" --
+    # and it now applies to the path that publishes releases too.
+    if expected_size <= readback_limit:
+        try:
+            return (True, md5_readback(session, remote_path), "read back")
+        except Exception as err:
+            print(f" could not read back {remote_path}: {describe_exc(err)}")
+            # Fall through to the registered checksum rather than failing the
+            # file outright: a read that will not complete is exactly the
+            # condition worth recording, and the catalog may still know.
 
     # Read the checksum the catalog already holds. put_file() registers it at
-    # upload time, so this is the normal path, and it is a metadata lookup: no
-    # hierarchy to resolve, nothing to re-read. MD5-scheme checksums come back
-    # as bare hex; strip any "md5:" prefix defensively.
+    # upload time, so this is the normal path for a large file, and it is a
+    # metadata lookup: no hierarchy to resolve, nothing to re-read.
     chksum = obj.checksum or ""
 
     if not chksum:
         # Nothing registered -- an object uploaded before REG_CHKSUM_KW, or by
-        # something other than this script. Forcing a computation is the only
-        # way left to get an answer, and it is exactly the call that returned
-        # HIERARCHY_ERROR on 46 merge groups. It stays behind a fallback, and
-        # its failure is contained: one unverifiable file is a NOT VERIFIED
-        # line and a simulation left a placeholder, which a later push clears.
-        # Letting it propagate killed the whole verification pass instead, and
-        # with it the run -- so nothing was recorded about the other files.
+        # something other than this script. Read the bytes rather than calling
+        # obj.chksum(): that RPC asks the server to resolve a resource
+        # hierarchy and re-read the object, and it is what returned
+        # HIERARCHY_ERROR on 46 merge groups. A read gets the same answer
+        # without the hierarchy resolution, at whatever size the object is.
         try:
-            chksum = obj.chksum() or ""
+            return (True, md5_readback(session, remote_path), "read back (no "
+                    "registered checksum)")
         except Exception as err:
             print(f" could not checksum {remote_path}: {describe_exc(err)}")
-            return (True, None)
+            return (True, None, "unreadable")
 
-    return (True, chksum.split(":", 1)[-1].strip().lower())
+    return (True, chksum.split(":", 1)[-1].strip().lower(),
+            "registered checksum")
 
 
 # --------------------------------------------------
@@ -792,8 +928,8 @@ def verify_media(media_server, remote_path: str):
         f"md5sum -- {shlex.quote(remote_path)}", warn=True, hide=True
     )
     if result.ok and result.stdout.strip():
-        return (True, result.stdout.split()[0].strip().lower())
-    return (False, None)
+        return (True, result.stdout.split()[0].strip().lower(), "md5sum")
+    return (False, None, "absent")
 
 
 # --------------------------------------------------
