@@ -155,13 +155,55 @@ def main() -> None:
         cleanup(tmp_out)
         die(f"failed to write sample: {type(e).__name__}: {e}", args, num_frames)
 
+    # COUNT WHAT WAS WRITTEN, BEFORE IT IS MOVED INTO PLACE.
+    #
+    # A short sample is not hypothetical and it is not visible to any other
+    # check we have. When this script died partway through with a SIGFPE on a
+    # damaged frame it left a truncated sampled.xtc, and the old
+    # skip-if-exists path then treated that file as already done and imported
+    # it: bundle 1m0o holds 94 frames where its trajectory implies 95.
+    #
+    # screen_trajectory.py does NOT catch this. Verified 2026-09-18 on a
+    # deliberately truncated sampled.xtc: the screen passed it, because
+    # MDAnalysis stops at the last complete frame and reports a smaller count
+    # without raising. The screen finds frames that are not data; this finds
+    # frames that are not there. Neither substitutes for the other.
+    #
+    # Counted here rather than derived from the database, because the database
+    # cannot answer it: `duration` covers all replicates in some rows and one
+    # replicate in others, so a count derived from it is ambiguous. The
+    # trajectory in hand is not.
+    # COUNT BY ITERATING, NOT WITH len(). MDAnalysis builds an offset index of
+    # where each frame STARTS, and a file truncated inside its last frame
+    # still has that frame's start, so len() reports the full count. Measured
+    # 2026-09-18 on a sampled.xtc cut 4,000 bytes short: len() said 100,
+    # iterating read 99, and neither raised. Touching the coordinates is what
+    # makes the reader go and get the bytes.
+    want = len(sampled_frames)
+    try:
+        written = 0
+        for step in mda.Universe(args.structure, tmp_out).trajectory:
+            _ = step.positions[0]
+            written += 1
+    except Exception as e:
+        cleanup(tmp_out)
+        die(f"wrote the sample but could not read it back: "
+            f"{type(e).__name__}: {e}", args, num_frames)
+
+    if written != want:
+        cleanup(tmp_out)
+        die(f"sample holds {written} frames, expected {want} from "
+            f"{num_frames} input frames at stride {sample_rate}", args,
+            num_frames)
+
     try:
         os.replace(tmp_out, args.outfile)
     except OSError as e:
         cleanup(tmp_out)
         die(f"failed to move sample into place: {e}", args, num_frames)
 
-    print(f"Wrote {num_frames} frames to '{args.outfile}'")
+    print(f"Wrote {want} of {num_frames} frames to '{args.outfile}' "
+          f"(stride {sample_rate}, verified by reading it back)")
 
 
 # --------------------------------------------------
