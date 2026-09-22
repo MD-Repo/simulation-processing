@@ -192,6 +192,7 @@ class Args(NamedTuple):
     max_window_faults: int
     health_probe_objects: int
     max_trips: int
+    toml_fix_dir: Optional[str]
 
 
 # --------------------------------------------------
@@ -227,6 +228,14 @@ def get_args() -> Args:
                         metavar="PATH")
     parser.add_argument("--smiles-table", default=TABLE_DEFAULT,
                         metavar="TSV")
+    parser.add_argument("--toml-fix", default=None, metavar="DIR",
+                        dest="toml_fix",
+                        help="The contributor's 2026-09-08 TOML delivery, "
+                        "unpacked one directory per bundle. When given, "
+                        "[[ligands]].name is overlaid from it where the "
+                        "delivery's value is non-blank and differs. BATCH 1 "
+                        "ONLY -- measured over batch 2 it changes nothing. "
+                        "Omitted, the overlay does not run at all")
     parser.add_argument("--server", choices=["staging", "prod"],
                         default="prod",
                         help="Passed to mdr-process. Only meaningful for "
@@ -392,6 +401,7 @@ def get_args() -> Args:
         args.max_consecutive_faults, args.fault_wait,
         args.fault_window, args.max_window_faults,
         args.health_probe_objects, args.max_trips,
+        args.toml_fix or None,
     )
 
 
@@ -441,6 +451,39 @@ def unpack_local(name: str, data_dir: str, work_dir: str) -> str:
 
 
 # --------------------------------------------------
+def escape_stray_quotes(text: str) -> Tuple[str, int]:
+    """Escape unescaped double quotes inside single-line TOML string values.
+    Returns (rewritten text, number of quotes escaped).
+
+    Factored out of repair_metadata_quotes() so the rule has ONE
+    implementation. overlay_contributor_metadata() needs it too: the
+    contributor's 09-08 delivery is produced by the same exporter and
+    carries the same bug, proven live on 6szp (2026-09-15), so the overlay
+    has to read through it to get at a name.
+
+    Multi-line (triple-quoted) values are skipped -- this corpus has none,
+    and the naive rule would corrupt their delimiters.
+    """
+
+    value = re.compile(r'^(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*")(.*)("\s*)$')
+    triple = '"' * 3
+    escaped = 0
+    lines = []
+    for line in text.splitlines():
+        match = value.match(line)
+        rhs = line.split("=", 1)[-1].lstrip() if "=" in line else ""
+        if not match or rhs.startswith(triple):
+            lines.append(line)
+            continue
+        head, body, tail = match.groups()
+        fixed, count = re.subn(r'(?<!\\)"', r'\\"', body)
+        escaped += count
+        lines.append(head + fixed + tail)
+
+    return "\n".join(lines) + "\n", escaped
+
+
+# --------------------------------------------------
 def repair_metadata_quotes(local_dir: str) -> int:
     """Escape stray double quotes inside a TOML string value. Returns the
     number escaped, 0 if the file was already fine or could not be helped.
@@ -485,25 +528,10 @@ def repair_metadata_quotes(local_dir: str) -> int:
     except (toml.TomlDecodeError, ValueError):
         pass
 
-    value = re.compile(r'^(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*")(.*)("\s*)$')
-    triple = '"' * 3
-    escaped = 0
-    lines = []
-    for line in original.splitlines():
-        match = value.match(line)
-        rhs = line.split("=", 1)[-1].lstrip() if "=" in line else ""
-        if not match or rhs.startswith(triple):
-            lines.append(line)
-            continue
-        head, body, tail = match.groups()
-        fixed, count = re.subn(r'(?<!\\)"', r'\\"', body)
-        escaped += count
-        lines.append(head + fixed + tail)
-
+    repaired, escaped = escape_stray_quotes(original)
     if not escaped:
         return 0
 
-    repaired = "\n".join(lines) + "\n"
     try:
         toml.loads(repaired)
     except (toml.TomlDecodeError, ValueError):
@@ -516,6 +544,213 @@ def repair_metadata_quotes(local_dir: str) -> int:
         fh.write(repaired)
 
     return escaped
+
+
+# --------------------------------------------------
+def toml_basic(value: str) -> str:
+    """Quote a value for a TOML basic (double-quoted) string.
+
+    Basic rather than fix_ligand_smiles.py's literal single-quoted form,
+    because ligand names in this corpus contain apostrophes far more often
+    than backslashes -- 3'-3"-DICHLOROPHENOL... is the shape that started
+    all of this. Escaping the backslash first is required; reversing the
+    two would double-escape the backslash this function just inserted.
+    """
+
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# --------------------------------------------------
+def load_delivery_meta(path: str) -> Optional[dict]:
+    """Parse one TOML from the contributor's delivery, repairing the
+    exporter's stray quotes IN MEMORY if that is what stops it parsing.
+
+    Never writes. The delivery is reference material we were handed, not
+    our working copy, so it is read and left exactly as it arrived.
+    """
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+
+    try:
+        return toml.loads(text)
+    except (toml.TomlDecodeError, ValueError):
+        pass
+
+    repaired, escaped = escape_stray_quotes(text)
+    if not escaped:
+        return None
+    try:
+        return toml.loads(repaired)
+    except (toml.TomlDecodeError, ValueError):
+        return None
+
+
+# --------------------------------------------------
+def overlay_contributor_metadata(
+    local_dir: str, name: str, args: Args
+) -> Tuple[List[str], List[str]]:
+    """Take [[ligands]].name from the contributor's 09-08 delivery where the
+    bundle's own copy disagrees. Returns (changed, skipped) -- both are
+    human-readable and the caller prints both, because a silent skip here
+    is the failure mode this corpus keeps producing.
+
+    WHY. 842 batch-1 bundles are held out as `name_mismatch`: the tarball's
+    ligand name disagrees with the reference table's, so
+    fix_ligand_smiles.py:387 refuses to take the table's SMILES. The
+    delivery is the contributor's authoritative metadata and for 278 of
+    those it carries a name that matches the table exactly. Overlaying it
+    first means those 278 pass the name check HONESTLY rather than by
+    --allow-name-mismatch, which takes a third of the population out of the
+    override path entirely. Measured 2026-09-15 and reconfirmed 2026-09-21:
+    278 now match, 550 still disagree, 14 are blank on both sides.
+
+    BATCH 1 ONLY. The same measurement over batch 2's 647 gives ZERO --
+    those tarballs were fetched 09-06 and already carry whatever names the
+    delivery has. Running this on batch 2 is pure cost, so the caller
+    passes --toml-fix for batch-1 waves and omits it otherwise.
+
+    CONDITIONAL, never a file replacement. A field is taken only where the
+    delivery's value is non-blank; the delivery holds 585 blank ligand
+    names corpus-wide, and a blank must never overwrite a real name. On
+    these 842 no name can be lost either way -- all 14 blanks in the
+    delivery are blank in the tarball too.
+
+    NO SMILES CAN BE LOST. Only `name` is touched. The delivery has zero
+    `smiles` keys (measured over all 15,526), and a bundle only reaches the
+    name-mismatch branch when its own SMILES is already unset.
+
+    Line-based, like retarget_metadata() and for the same reason: a TOML
+    round trip reorders keys and drops fix_ligand_smiles.py's provenance
+    comments, so every line reads as changed when one key did.
+
+    Takes the .orig backup itself, on fix_ligand_smiles.py's convention
+    (copy2, never overwrite an existing one), because this runs BEFORE
+    fix_smiles and .orig must hold the submitter's true original.
+
+    Idempotent: a second run finds the names already equal and writes
+    nothing.
+    """
+
+    if not args.toml_fix_dir:
+        return [], []
+
+    delivery_path = os.path.join(args.toml_fix_dir, name, METADATA_NAME)
+    if not os.path.isfile(delivery_path):
+        return [], [f"no {name} in the delivery"]
+
+    delivery = load_delivery_meta(delivery_path)
+    if delivery is None:
+        return [], [f"delivery TOML for {name} will not parse"]
+
+    path = os.path.join(local_dir, METADATA_NAME)
+    if not os.path.isfile(path):
+        return [], [f"no {METADATA_NAME} in the bundle"]
+
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    try:
+        meta = toml.loads(text)
+    except (toml.TomlDecodeError, ValueError) as e:
+        # repair_metadata_quotes() has already run, so this is a shape it
+        # could not help. Leave it for mdr-process to refuse on its own
+        # terms rather than editing a file we cannot read.
+        return [], [f"bundle TOML will not parse: {e}"]
+
+    theirs = [(l.get("name") or "").strip()
+              for l in (delivery.get("ligands") or [])]
+    ours = [(l.get("name") or "").strip()
+            for l in (meta.get("ligands") or [])]
+
+    # Positional, so the counts have to agree. All 278 carry exactly one
+    # ligand, so this guard never fires on the set it was measured for --
+    # it is here for the 550 and for batch 2's 409, which have not been
+    # checked and where a mismatch would silently rename the wrong ligand.
+    if len(theirs) != len(ours):
+        return [], [f"ligand count {len(ours)} in the bundle vs "
+                    f"{len(theirs)} in the delivery, not overlaid"]
+
+    wanted = {}
+    for i, (mine, given) in enumerate(zip(ours, theirs)):
+        if given and given != mine:
+            wanted[i] = given
+
+    if not wanted:
+        return [], []
+
+    lines = text.splitlines()
+    table = None
+    index = -1
+    seen_name = set()
+    out = []
+    changed: List[str] = []
+
+    header = re.compile(r"^\s*\[\[?\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\]?\]\s*$")
+    name_key = re.compile(r"^(\s*name\s*=\s*).*$")
+
+    for line in lines:
+        match = header.match(line)
+        if match:
+            # A [[solutes]] table has a `name` key too, so the walker has to
+            # know which table it is standing in. Matching `name = ` across
+            # the whole file would rename the solvent.
+            table = match.group(1)
+            if table == "ligands":
+                index += 1
+            out.append(line)
+            continue
+
+        if table == "ligands" and index in wanted and name_key.match(line):
+            head = name_key.match(line).group(1)
+            out.append(head + toml_basic(wanted[index]))
+            changed.append(f"ligand[{index}].name -> {wanted[index]}")
+            seen_name.add(index)
+            continue
+
+        out.append(line)
+
+    # A ligands table with no `name` key at all: insert one under its
+    # header rather than dropping the value on the floor.
+    missing = [i for i in wanted if i not in seen_name]
+    if missing:
+        rebuilt = []
+        index = -1
+        for line in out:
+            rebuilt.append(line)
+            match = header.match(line)
+            if match and match.group(1) == "ligands":
+                index += 1
+                if index in missing:
+                    rebuilt.append(
+                        f"# name supplied by bulk_process_local.py from the "
+                        f"contributor's 2026-09-08 delivery")
+                    rebuilt.append("name = " + toml_basic(wanted[index]))
+                    changed.append(
+                        f"ligand[{index}].name added -> {wanted[index]}")
+        out = rebuilt
+
+    if not changed:
+        return [], []
+
+    rewritten = "\n".join(out) + "\n"
+    try:
+        toml.loads(rewritten)
+    except (toml.TomlDecodeError, ValueError) as e:
+        # Refuse to leave a file we just broke. toml_basic() escapes, so
+        # this should be unreachable; it is here because the cost of being
+        # wrong is an unreadable bundle.
+        return [], [f"overlay would not re-parse, not written: {e}"]
+
+    backup = path + ".orig"
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(rewritten)
+
+    return changed, []
 
 
 # --------------------------------------------------
@@ -917,6 +1152,18 @@ def process_one(args: Args, name: str) -> Tuple[str, str, str]:
         return name, "failed", f"metadata quote repair failed: {e}"
     if escaped:
         status(f"metadata: escaped {escaped} stray quote(s) to make the TOML parse")
+
+    # Before fix_smiles: the overlay's whole purpose is to make the name
+    # check that fix_ligand_smiles.py is about to run come out right.
+    try:
+        overlaid, skipped = overlay_contributor_metadata(
+            local_dir, name, args)
+    except OSError as e:
+        return name, "failed", f"contributor overlay failed: {e}"
+    for note in skipped:
+        status(f"overlay skipped: {note}")
+    if overlaid:
+        status(f"overlay: {'; '.join(overlaid)}")
 
     ok, detail = fix_smiles(local_dir, args)
     if not ok:
