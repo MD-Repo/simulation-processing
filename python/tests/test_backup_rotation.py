@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backup_database import (  # noqa: E402
     SLOT_RE,
     check_rotation,
+    describe_exception,
     expected_slot_date,
 )
 
@@ -169,3 +170,59 @@ def test_empty_collection_is_a_problem():
     """No slots at all is not "nothing to check\""""
 
     assert check_rotation({}, date(2026, 9, 9), quiet) == 1
+
+
+# --------------------------------------------------
+def test_describe_exception_keeps_an_ordinary_message():
+    """Anything the script raises itself already says enough
+
+    The class name is still prepended -- it costs one word and it is the
+    difference between "the put failed" and "the put timed out".
+    """
+
+    e = RuntimeError("gocmd put of mdrepo.22.sql.gz exited 1: no output")
+
+    assert describe_exception(e) == (
+        "RuntimeError: gocmd put of mdrepo.22.sql.gz exited 1: no output"
+    )
+
+
+# --------------------------------------------------
+def test_describe_exception_survives_a_messageless_irods_error():
+    """The 2026-09-22 case: a real server error that stringifies as "None"
+
+    python-irodsclient builds exc_class(None) when it cannot decode the
+    server's error text, and str() of that is the literal "None" -- which is
+    all the log held that night. The class and code are what identify the
+    error, so they must come through even though there is no message.
+    """
+
+    from irods.exception import get_exception_by_code
+
+    e = get_exception_by_code(-816000, None)
+
+    assert str(e) == "None"                      # the trap this exists for
+    assert describe_exception(e) == "CAT_INVALID_ARGUMENT (-816000)"
+
+
+# --------------------------------------------------
+def test_describe_exception_keeps_both_when_irods_does_send_text():
+    """A decodable server error keeps its message as well as its identity"""
+
+    from irods.exception import get_exception_by_code
+
+    e = get_exception_by_code(-818000, "user mdadm lacks write access")
+
+    assert describe_exception(e) == (
+        "CAT_NO_ACCESS_PERMISSION (-818000): user mdadm lacks write access"
+    )
+
+
+# --------------------------------------------------
+def test_describe_exception_handles_no_message_at_all():
+    """An exception raised bare has an empty str(), not the word None"""
+
+    class Boom(Exception):
+        pass
+
+    assert describe_exception(Boom()) == "Boom"

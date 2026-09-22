@@ -825,6 +825,42 @@ def report_stored(session, collection: str, status) -> int:
 
 
 # --------------------------------------------------
+def describe_exception(e: BaseException) -> str:
+    """Render an exception so the log can say WHICH error it was
+
+    str() alone is not enough for a python-irodsclient error. When the server
+    returns a status whose message the client cannot decode, connection.recv()
+    swallows the TypeError, sets the message to None, and builds the exception
+    as exc_class(None) -- and str() of that is the literal string "None".
+
+    That is exactly what the staging run logged on 2026-09-22:
+
+        01:10:14Z Removing existing mdrepo.22.sql.gz before upload
+        01:10:18Z IRODS FAILED: None
+
+    A real server error on the unlink, with the two things that identify it --
+    the exception class and its .code -- thrown away by the format string. The
+    object had already gone to trash, so the delete itself worked and the error
+    came back on the reply; nothing in the log says what it was, and nothing
+    ever will for that night. Hence the class and code go in unconditionally,
+    and the message is appended only when it carries something.
+    """
+
+    head = type(e).__name__
+
+    # PRC sets .code on the exceptions it raises from a server status. Nothing
+    # else here has one, so its absence is not worth reporting.
+    code = getattr(e, "code", None)
+    if code is not None:
+        head += f" ({code})"
+
+    # "None" is the sentinel described above, not a message. Drop it, but keep
+    # the class and code that came with it.
+    text = str(e)
+    return f"{head}: {text}" if text and text != "None" else head
+
+
+# --------------------------------------------------
 def main() -> None:
     """Make a jazz noise here"""
 
@@ -917,8 +953,9 @@ def main() -> None:
                 for path, name in swift_targets:
                     upload_to_swift(path, args.swift_container, name, size, status)
             except Exception as e:
-                status(f"SWIFT FAILED: {e}")
-                failures.append(f"Swift: {e}")
+                detail = describe_exception(e)
+                status(f"SWIFT FAILED: {detail}")
+                failures.append(f"Swift: {detail}")
 
         if args.no_irods:
             status("Skipping the IRODS copy (--no-irods)")
@@ -968,8 +1005,9 @@ def main() -> None:
                         "copies did not verify:\n  " + "\n  ".join(problems)
                     )
             except Exception as e:
-                status(f"IRODS FAILED: {e}")
-                failures.append(f"IRODS: {e}")
+                detail = describe_exception(e)
+                status(f"IRODS FAILED: {detail}")
+                failures.append(f"IRODS: {detail}")
 
     finally:
         if not args.keep_local:
