@@ -88,10 +88,10 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from irods.exception import NetworkException
+from irods.exception import NetworkException, iRODSException
 from irods.session import iRODSSession
 
-from common import FRONTEND_BASE_URLS, send_slack_message, stamp
+from common import FRONTEND_BASE_URLS, describe_exc, send_slack_message, stamp
 
 TICKET_RE = re.compile(r"^MDRSubmit_([^:]+):(.+)$")
 # Where push_sim_files.py puts the permanent copy. local_file_path in the file
@@ -119,7 +119,7 @@ IN_FLIGHT = ("pending", "running")
 # What one landing's removal reports, in both places at once. IRODS and local
 # counts are never added together: they free different disks, and only one of
 # them is the one that fills.
-EMPTY = {"present": 0, "freed": 0, "removed": 0, "stalled": 0,
+EMPTY = {"present": 0, "freed": 0, "removed": 0, "stalled": 0, "failed": 0,
          "local_present": 0, "local_freed": 0, "local_removed": 0,
          "local_failed": 0}
 
@@ -693,6 +693,14 @@ def remove_irods_landing(
             coll.remove(recurse=True, force=args.force)
     except (TimeoutError, NetworkException):
         return {"present": 1, "stalled": 1}
+    except iRODSException as e:
+        # Any other refusal is this landing's alone, and it would repeat on
+        # every run: on 2026-09-23 a completion marker whose only replica sat
+        # on a dead resource could not be unlinked, the collection then failed
+        # CAT_COLLECTION_NOT_EMPTY, and the uncaught error ended the run before
+        # any other ticket was reached. Report it and move on.
+        say(f"    FAILED to remove {landing_dir}: {describe_exc(e)}")
+        return {"present": 1, "failed": 1}
 
     return {"present": 1, "freed": size, "removed": 1}
 
@@ -942,7 +950,8 @@ def purge_ticket(
         with lock:
             done += 1
             if args.delete and (result["present"] or result["local_present"]):
-                note = " STALLED" if result["stalled"] else ""
+                note = (" STALLED" if result["stalled"]
+                        else " FAILED" if result["failed"] else "")
                 where = "".join(
                     (
                         "i" if result["present"] else "-",
@@ -1263,6 +1272,8 @@ def main() -> None:
                 note += f"  [{cand.held} landing(s) held, not eligible]"
             if result["stalled"]:
                 note += f"  [{result['stalled']} STALLED, re-run to retry]"
+            if result["failed"]:
+                note += f"  [{result['failed']} IRODS removal(s) FAILED]"
             if result["local_failed"]:
                 note += f"  [{result['local_failed']} local removal(s) FAILED]"
 
@@ -1281,7 +1292,7 @@ def main() -> None:
         # then re-raise so the log still gets the traceback and the exit is
         # non-zero.
         notify(args, f"Landing purge ({args.server}) FAILED after removing "
-                     f"{totals['removed']} collection(s): {type(e).__name__}: {e}")
+                     f"{totals['removed']} collection(s): {describe_exc(e)}")
         raise
     finally:
         sessions.close()
@@ -1356,7 +1367,7 @@ def main() -> None:
     # something: it is the one outcome where the run looks clean and silently
     # did less than it was asked to.
     if (totals["removed"] or totals["local_removed"] or totals["stalled"]
-            or totals["unchecked"]):
+            or totals["failed"] or totals["unchecked"]):
         summary = (f"Landing purge ({args.server}): removed "
                    f"{totals['removed']} landing collection(s) across "
                    f"{totals['tickets']} ticket(s), {human(totals['freed'])}")
@@ -1371,6 +1382,9 @@ def main() -> None:
                         f"UNVERIFIED on an administrator's decision")
         if totals["local_failed"]:
             summary += f"; {totals['local_failed']} local removal(s) failed"
+        if totals["failed"]:
+            summary += (f"; {totals['failed']} IRODS removal(s) FAILED and "
+                        f"will fail again until fixed by hand -- see the log")
         if totals["stalled"]:
             summary += (f"; {totals['stalled']} collection(s) stalled past "
                         f"{REMOVE_TIMEOUT}s and will be retried next run")
