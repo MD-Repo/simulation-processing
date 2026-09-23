@@ -75,6 +75,7 @@ class Args(NamedTuple):
     uv: str
     parallel: int
     limit: Optional[int]
+    allow_name_mismatch: bool = False
 
 
 # --------------------------------------------------
@@ -111,6 +112,15 @@ def get_args() -> Args:
                         help="This touches no shared resource, so it is "
                         "bounded by local CPU only")
     parser.add_argument("--limit", type=int, default=None, metavar="INT")
+    parser.add_argument(
+        "--allow-name-mismatch", action="store_true",
+        help="Pass --allow-name-mismatch to fix_ligand_smiles.py, so the "
+        "table's SMILES is written even where its ligand name disagrees "
+        "with the TOML's. Safe HERE because this is the judge: the verdict "
+        "compares that SMILES against the molecule in the bundle's own "
+        "coordinates. Its block/flag/pass TSV is what bulk_process_local.py "
+        "--preflight takes, and that is the only way the same flag may "
+        "reach a real run")
     args = parser.parse_args()
 
     record = args.record or os.path.join(
@@ -121,6 +131,7 @@ def get_args() -> Args:
         args.data_dir, args.work_dir, args.survey_tsv,
         tuple(args.go_classes), record, args.fix_smiles, args.smiles_table,
         args.script_dir, args.uv, args.parallel, args.limit,
+        args.allow_name_mismatch,
     )
 
 
@@ -186,11 +197,11 @@ def fill_smiles(local_dir: str, args: Args) -> None:
     """Run the same SMILES fill the real driver does, so the declared value
     compared here is the one that would actually be imported."""
 
-    subprocess.run(
-        [sys.executable, args.fix_smiles, local_dir,
-         "--table", args.smiles_table],
-        capture_output=True, text=True, timeout=300,
-    )
+    cmd = [sys.executable, args.fix_smiles, local_dir,
+           "--table", args.smiles_table]
+    if args.allow_name_mismatch:
+        cmd.append("--allow-name-mismatch")
+    subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 
 # --------------------------------------------------

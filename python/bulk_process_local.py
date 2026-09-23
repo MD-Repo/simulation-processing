@@ -193,6 +193,8 @@ class Args(NamedTuple):
     health_probe_objects: int
     max_trips: int
     toml_fix_dir: Optional[str]
+    allow_name_mismatch: bool = False
+    preflight_tsv: Optional[str] = None
 
 
 # --------------------------------------------------
@@ -236,6 +238,24 @@ def get_args() -> Args:
                         "delivery's value is non-blank and differs. BATCH 1 "
                         "ONLY -- measured over batch 2 it changes nothing. "
                         "Omitted, the overlay does not run at all")
+    parser.add_argument(
+        "--allow-name-mismatch", action="store_true",
+        help="Pass --allow-name-mismatch to fix_ligand_smiles.py, so the "
+        "table's SMILES is written even where its ligand name disagrees "
+        "with the TOML's. REQUIRES --preflight: the override is safe only "
+        "because preflight_ligands.py, run with the same flag, has already "
+        "checked that SMILES against the bundle's own coordinates. On its "
+        "own it would import whatever the table says, and PDBbind has been "
+        "wrong at least once (186l, MDR-40)",
+    )
+    parser.add_argument(
+        "--preflight", default=None, metavar="TSV", dest="preflight_tsv",
+        help="preflight_ligands.py's verdict record. When given, only "
+        "bundles whose latest verdict is pass or flag are eligible; block, "
+        "error and anything missing from it are skipped. A real run "
+        "checks ligands only AFTER import, so this is the gate that keeps "
+        "a block out of prod",
+    )
     parser.add_argument("--server", choices=["staging", "prod"],
                         default="prod",
                         help="Passed to mdr-process. Only meaningful for "
@@ -384,6 +404,13 @@ def get_args() -> Args:
     )
     args = parser.parse_args()
 
+    if args.allow_name_mismatch and not args.preflight_tsv:
+        parser.error("--allow-name-mismatch requires --preflight: the "
+                     "override is only safe on bundles the preflight has "
+                     "already checked against their coordinates")
+    if args.preflight_tsv and not os.path.isfile(args.preflight_tsv):
+        parser.error(f"--preflight {args.preflight_tsv}: no such file")
+
     log_dir = args.log_dir or os.path.join(
         os.path.dirname(os.path.abspath(args.work_dir)), "logs",
         "dryrun" if args.dry_run else args.server,
@@ -402,15 +429,18 @@ def get_args() -> Args:
         args.fault_window, args.max_window_faults,
         args.health_probe_objects, args.max_trips,
         args.toml_fix or None,
+        args.allow_name_mismatch, args.preflight_tsv,
     )
 
 
 # --------------------------------------------------
 def eligible_bundles(args: Args) -> list:
     """Bundle names from the survey whose classification is in go_classes,
-    minus anything already in the record file."""
+    minus anything already in the record file, and -- with --preflight --
+    minus anything the preflight did not pass or flag."""
 
     record = load_record(args.record_file)
+    verdicts = load_record(args.preflight_tsv) if args.preflight_tsv else None
     names = []
     with open(args.survey_tsv) as fh:
         next(fh, None)  # header
@@ -419,6 +449,9 @@ def eligible_bundles(args: Args) -> list:
             if len(parts) < 2:
                 continue
             bundle, classification = parts[0], parts[1]
+            if verdicts is not None and verdicts.get(bundle) not in (
+                    ligand_check.PASS, ligand_check.FLAG):
+                continue
             if classification in args.go_classes and bundle not in record:
                 names.append(bundle)
     return sorted(names)
@@ -757,11 +790,11 @@ def overlay_contributor_metadata(
 def fix_smiles(local_dir: str, args: Args) -> Tuple[bool, str]:
     """Real (non-dry-run) SMILES fill. Returns (ok, detail)."""
 
-    proc = subprocess.run(
-        [sys.executable, args.fix_smiles, local_dir,
-         "--table", args.smiles_table],
-        capture_output=True, text=True,
-    )
+    cmd = [sys.executable, args.fix_smiles, local_dir,
+           "--table", args.smiles_table]
+    if args.allow_name_mismatch:
+        cmd.append("--allow-name-mismatch")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     detail = " ".join((proc.stdout or "").split())[:300]
     return proc.returncode == 0, detail
 
