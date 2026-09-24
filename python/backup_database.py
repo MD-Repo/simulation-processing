@@ -94,7 +94,7 @@ from dotenv import load_dotenv
 from irods.session import iRODSSession
 from irods.meta import iRODSMeta
 
-from common import stamp
+from common import describe_exc, stamp
 
 # The restore path in terraform-mdrepo (ansible/roles/mdrepo-db/tasks/main.yaml)
 # fetches this name. Do not rename it.
@@ -917,8 +917,9 @@ def main() -> None:
                 for path, name in swift_targets:
                     upload_to_swift(path, args.swift_container, name, size, status)
             except Exception as e:
-                status(f"SWIFT FAILED: {e}")
-                failures.append(f"Swift: {e}")
+                detail = describe_exc(e)
+                status(f"SWIFT FAILED: {detail}")
+                failures.append(f"Swift: {detail}")
 
         if args.no_irods:
             status("Skipping the IRODS copy (--no-irods)")
@@ -968,8 +969,9 @@ def main() -> None:
                         "copies did not verify:\n  " + "\n  ".join(problems)
                     )
             except Exception as e:
-                status(f"IRODS FAILED: {e}")
-                failures.append(f"IRODS: {e}")
+                detail = describe_exc(e)
+                status(f"IRODS FAILED: {detail}")
+                failures.append(f"IRODS: {detail}")
 
     finally:
         if not args.keep_local:

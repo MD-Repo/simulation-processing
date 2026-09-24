@@ -43,6 +43,39 @@ CRON_STATE_ROOT = "/opt/mdrepo/state"
 EX_TEMPFAIL = 75
 
 
+def describe_exc(e: BaseException) -> str:
+    """Render an exception so the log names the fault
+
+    python-irodsclient raises its error classes with a bare None message, so an
+    f"{e}" renders the single word "None" and throws the diagnosis away. The
+    class name IS the diagnosis, and the numeric iRODS code sits on the class,
+    so "LOCKED_DATA_OBJECT_ACCESS(-406000)" costs one call and needs no
+    traceback. Non-iRODS exceptions keep their message.
+
+    Three failures are on the record for want of this:
+
+      2026-09-05  an IRODS failure in push_sim_files that is now unknowable
+      2026-09-15  push failures on MDR00099444/99447 recorded nothing about a
+                  LOCKED_DATA_OBJECT_ACCESS an admin then identified by hand
+      2026-09-22  the staging db backup logged "IRODS FAILED: None" and lost
+                  the identity of an error on the unlink before the put
+
+    Shared here rather than defined in each caller for the same reason as
+    TICKET_LOG_ROOT and EX_TEMPFAIL above -- it had already been written twice
+    in this directory and a third time in the Django app, and the third one
+    still prints the word "None" because it interpolates str(e) regardless.
+    Note this takes no iRODS import: it reads .code with getattr, so a caller
+    that must start without python-irodsclient installed can still use it.
+    """
+
+    label = type(e).__name__
+    code = getattr(e, "code", None)
+    if code is not None:
+        label = f"{label}({code})"
+    text = str(e)
+    return label if text in ("", "None") else f"{label}: {text}"
+
+
 # --------------------------------------------------
 def stamp() -> str:
     """UTC timestamp for a log line

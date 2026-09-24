@@ -26,6 +26,8 @@ from irods.session import iRODSSession
 from typing import Dict, List, NamedTuple, TextIO, Optional, Tuple
 from subprocess import getstatusoutput
 
+from common import describe_exc
+
 # Attempts per file before giving up
 NUM_RETRIES = 3
 
@@ -91,29 +93,6 @@ class Args(NamedTuple):
     transfer_threads: int
     readback_limit: int
     timeout: int
-
-
-# --------------------------------------------------
-def describe_exc(e: BaseException) -> str:
-    """Render an exception so the log names the fault.
-
-    python-irodsclient raises its error classes with a bare None message, so
-    an f"{e}" renders the single word "None" and throws the diagnosis away.
-    That is how the 2026-09-05 IRODS failure became unknowable, and how the
-    2026-09-15 push failures on MDR00099444/99447 recorded nothing about a
-    LOCKED_DATA_OBJECT_ACCESS that an admin then had to identify by hand.
-
-    The class name IS the diagnosis, and the numeric iRODS code sits on the
-    class, so "LOCKED_DATA_OBJECT_ACCESS(-406000)" costs one call and needs
-    no traceback. Non-iRODS exceptions keep their message.
-    """
-
-    label = type(e).__name__
-    code = getattr(e, "code", None)
-    if code is not None:
-        label = f"{label}({code})"
-    text = str(e)
-    return label if text in ("", "None") else f"{label}: {text}"
 
 
 # --------------------------------------------------

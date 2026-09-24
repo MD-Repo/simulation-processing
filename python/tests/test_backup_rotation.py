@@ -169,3 +169,4 @@ def test_empty_collection_is_a_problem():
     """No slots at all is not "nothing to check\""""
 
     assert check_rotation({}, date(2026, 9, 9), quiet) == 1
+
