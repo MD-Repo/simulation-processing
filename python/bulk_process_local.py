@@ -86,7 +86,7 @@ from process_bundles2 import append_record, load_record, run_mdr_process
 
 DATA_DIR_DEFAULT = "/media/volume/mdrepo_bd/ddd/data"
 WORK_DIR_DEFAULT = "/media/volume/mdrepo_bd/ddd/work"
-FIX_SMILES_DEFAULT = "/media/volume/mdrepo_bd/utils/python/fix_ligand_smiles.py"
+FIX_SMILES_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_ligand_smiles.py")
 TABLE_DEFAULT = os.path.expanduser("~/pdbbind_ligand_smiles.tsv")
 GO_CLASSES_DEFAULT = ("fixed", "already")
 

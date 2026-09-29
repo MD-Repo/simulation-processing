@@ -44,7 +44,7 @@ from common import stamp
 
 METADATA_NAME = "mdrepo-metadata.toml"
 DATA_DIR_DEFAULT = "/media/volume/mdrepo_bd/ddd/data"
-FIX_SMILES_DEFAULT = "/media/volume/mdrepo_bd/utils/python/fix_ligand_smiles.py"
+FIX_SMILES_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_ligand_smiles.py")
 TABLE_DEFAULT = os.path.expanduser("~/pdbbind_ligand_smiles.tsv")
 
 TALLY_KEYS = (

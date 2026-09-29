@@ -223,12 +223,11 @@ def get_args() -> Args:
 
     parser.add_argument(
         "--fix-smiles",
-        help="Path to fix_ligand_smiles.py. Invoked as a subprocess rather "
-        "than imported because it lives in the internal utils repo while "
-        "this file is in the public one; a missing script is a skip, not an "
-        "error, so this repo does not hard-depend on that one",
+        help="Path to fix_ligand_smiles.py (default: the copy beside this "
+        "script). Invoked as a subprocess; a missing script is a skip, not "
+        "an error",
         metavar="PATH",
-        default="/opt/mdrepo/utils/python/fix_ligand_smiles.py",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fix_ligand_smiles.py"),
     )
 
     parser.add_argument(
