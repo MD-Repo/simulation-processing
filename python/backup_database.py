@@ -69,9 +69,10 @@ role makes mduser the owner of every table in the public schema, so its dump is
 complete. Measured 2026-08-05: 1m18s for a 513 MB gzipped dump of the 1.2 GB
 production database. The upload, not the dump, is the long pole.
 
-VERSION MATTERS. The server is PostgreSQL 14 and the restore path uses the
-PG 14 client, so this defaults to the 14 client (--pg-dump), not the 16 one
-Ubuntu 24.04 ships. Dumping an older server with a newer client is supported;
+VERSION MATTERS. The server is PostgreSQL 15 (upgraded from 14 on
+2026-09-30, for Django 6.1) and the restore path uses the PG 15 client, so this
+defaults to the 15 client (--pg-dump), not the 16 one Ubuntu 24.04 ships. A 14
+client refuses to dump a 15 server. Dumping an older server with a newer client is supported;
 restoring a newer client's output into an older server is where it bites.
 """
 
@@ -131,8 +132,8 @@ SWIFT_CONTAINERS = {
     "staging": "mdrepo_staging_db_backups",
 }
 
-# The PG 14 client, matching the server; see the module docstring.
-DEFAULT_PG_DUMP = "/usr/lib/postgresql/14/bin/pg_dump"
+# The PG 15 client, matching the server; see the module docstring.
+DEFAULT_PG_DUMP = "/usr/lib/postgresql/15/bin/pg_dump"
 
 DEFAULT_WORK_DIR = "/opt/mdrepo/backups"
 
@@ -851,7 +852,7 @@ def main() -> None:
 
     if not os.path.exists(args.pg_dump):
         sys.exit(
-            f"No pg_dump at {args.pg_dump} -- install postgresql-client-14 or "
+            f"No pg_dump at {args.pg_dump} -- install postgresql-client-15 or "
             "pass --pg-dump"
         )
 
