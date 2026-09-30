@@ -83,6 +83,41 @@ def test_a_residue_without_hydrogens_is_left_to_openbabel():
     assert mol_id._bond_orders_from_hydrogens(mol) is None
 
 
+def test_a_residue_cut_from_a_chain_keeps_the_geometric_reading():
+    """An acetyl cap cut from its peptide, as a ligand selection cuts it: the
+    carbonyl carbon has lost its bond to the next residue's nitrogen. The
+    valences alone can only close it as an acylium, C#[O+], which is refused
+    -- the same reading that made a pyroglutamate a +2 ion."""
+
+    mol = _ob_from_pdb(
+        _pdb(
+            [
+                ("CH3", "C", 0.000, 0.000, 0.000),
+                ("C", "C", 1.520, 0.000, 0.000),
+                ("O", "O", 2.135, 1.065, 0.000),
+                ("H1", "H", -0.363, -1.028, 0.000),
+                ("H2", "H", -0.363, 0.514, 0.890),
+                ("H3", "H", -0.363, 0.514, -0.890),
+            ]
+        )
+    )
+
+    assert mol_id._bond_orders_from_hydrogens(mol) is None
+
+
+def test_bond_orders_the_search_cannot_settle_are_left_to_openbabel():
+    """Phytate with its twelve charges unwritten, as cpptraj writes a PDB: the
+    search for bond orders has every phosphate oxygen to choose among, and
+    without a bound runs for hours. It gives up within the iteration budget."""
+
+    got = mol_id.structure_to_smiles(
+        str(INPUTS / "phytate_embedded.pdb"), resname="IHP"
+    )
+    got = got[0] if isinstance(got, list) else got
+
+    assert got["formula"] == "C6H18O24P6"
+
+
 def test_charmm_ions_are_background():
     for resname in ("SOD", "POT", "CLA", "CAL", "CES", "LIT", "RUB", "BAR", "CAD"):
         assert mol_id._is_skipped_residue(resname), resname

@@ -530,6 +530,13 @@ def _smiles_from_coords(sel) -> dict:
 # than a single bond between the same two elements, by at least this much.
 _MULTIPLE_BOND_MARGIN = 0.05
 
+# The search for bond orders is exponential in the atoms whose valence it can
+# choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
+# phosphate oxygen a candidate for the double bond or the charge -- never
+# settles, and without a bound held a worker for hours. Past this it gives up
+# in about 0.1 s and OpenBabel's reading stands.
+_MAX_BOND_ORDER_ITERATIONS = 10000
+
 
 def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     """
@@ -545,14 +552,17 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     DetermineBondOrders finds it without reading an angle.
 
     The total charge is tried as the file's formal charges state it, then one
-    and two either side, and the first assignment that holds is kept. It is
-    refused -- and OpenBabel's reading stands -- when it leaves a radical, puts
-    a charge on carbon, or calls a bond double or triple that the frame holds
-    at single-bond length outside an aromatic ring. Those are what a
-    united-atom residue, whose carbons carry their hydrogens implicitly, would
-    otherwise be forced into. A residue with no hydrogens at all is left to
-    OpenBabel, as is one cut from a polymer, whose open valence no charge
-    explains.
+    either side, and the first assignment that holds is kept. It is refused --
+    and OpenBabel's reading stands -- when it leaves a radical, charges a
+    carbon, charges an oxygen positively, charges any atom by more than one,
+    or calls a bond double or triple that the frame holds at single-bond
+    length outside an aromatic ring. Those are what a residue with an open
+    valence is otherwise forced into: a united-atom residue, whose carbons
+    carry their hydrogens implicitly, or a residue cut from a polymer, whose
+    backbone carbonyl read as an acylium (C#[O+]) and whose pyroglutamate came
+    out a +2 ion. A residue with no hydrogens at all is left to OpenBabel, as
+    is one whose bond orders the search cannot settle within
+    _MAX_BOND_ORDER_ITERATIONS.
     """
     from rdkit.Chem import rdDetermineBonds
     from rdkit.Geometry import Point3D
@@ -576,18 +586,16 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
         rw.AddBond(i, j, Chem.BondType.SINGLE)
     rw.AddConformer(conf, assignId=True)
 
-    for charge in (stated, stated - 1, stated + 1, stated - 2, stated + 2):
+    for charge in (stated, stated - 1, stated + 1):
         m = Chem.Mol(rw)
         try:
-            rdDetermineBonds.DetermineBondOrders(m, charge=charge)
+            rdDetermineBonds.DetermineBondOrders(
+                m, charge=charge, maxIterations=_MAX_BOND_ORDER_ITERATIONS
+            )
             Chem.SanitizeMol(m)
         except Exception:
             continue
-        if any(
-            a.GetNumRadicalElectrons()
-            or (a.GetAtomicNum() == 6 and a.GetFormalCharge())
-            for a in m.GetAtoms()
-        ):
+        if any(_implausible(a) for a in m.GetAtoms()):
             continue
         if not _multiple_bonds_are_short(m):
             continue
@@ -599,6 +607,18 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
         if conv.ReadString(out, Chem.MolToMolBlock(m)):
             return out
     return None
+
+
+def _implausible(atom) -> bool:
+    """A radical or a charge no simulated ligand carries: on carbon, positive
+    on oxygen, or more than one on any atom."""
+    q = atom.GetFormalCharge()
+    return bool(
+        atom.GetNumRadicalElectrons()
+        or abs(q) > 1
+        or (q and atom.GetAtomicNum() == 6)
+        or (q > 0 and atom.GetAtomicNum() == 8)
+    )
 
 
 def _multiple_bonds_are_short(m) -> bool:
