@@ -1,0 +1,75 @@
+REMARK   1 VORAPAXAR (VPX), ONE COPY, FIRST FRAME OF A NAMD RUN WITH HYDROGEN MASS
+REMARK   1 REPARTITIONING: ZENODO 10.5281/ZENODO.17477539, CC-BY-4.0.
+HEADER    
+TITLE     MDANALYSIS FRAME 0: Created by PDBWriter
+CRYST1   81.317   81.317   81.317  90.00  90.00  90.00 P 1           1
+ATOM      1  C1  VPX X   1      57.121  36.767 -40.800  1.00  0.00      SYST C  
+ATOM      2  C2  VPX X   1      56.290  37.707 -41.594  1.00  0.00      SYST C  
+ATOM      3  O1  VPX X   1      55.969  37.174 -42.923  1.00  0.00      SYST O  
+ATOM      4  C3  VPX X   1      54.771  37.502 -43.454  1.00  0.00      SYST C  
+ATOM      5  O2  VPX X   1      53.862  38.078 -42.894  1.00  0.00      SYST O  
+ATOM      6  N1  VPX X   1      54.742  37.095 -44.782  1.00  0.00      SYST N  
+ATOM      7  C4  VPX X   1      53.800  37.553 -45.729  1.00  0.00      SYST C  
+ATOM      8  C5  VPX X   1      54.496  38.398 -46.818  1.00  0.00      SYST C  
+ATOM      9  C6  VPX X   1      52.985  36.383 -46.330  1.00  0.00      SYST C  
+ATOM     10  C7  VPX X   1      52.070  36.905 -47.372  1.00  0.00      SYST C  
+ATOM     11  C8  VPX X   1      52.659  37.803 -48.491  1.00  0.00      SYST C  
+ATOM     12  C9  VPX X   1      53.524  38.914 -47.882  1.00  0.00      SYST C  
+ATOM     13  C10 VPX X   1      54.149  39.664 -49.043  1.00  0.00      SYST C  
+ATOM     14  C11 VPX X   1      53.045  40.249 -49.955  1.00  0.00      SYST C  
+ATOM     15  C12 VPX X   1      53.830  40.830 -51.145  1.00  0.00      SYST C  
+ATOM     16  O3  VPX X   1      54.223  42.001 -51.318  1.00  0.00      SYST O  
+ATOM     17  O4  VPX X   1      54.100  39.697 -51.896  1.00  0.00      SYST O  
+ATOM     18  C13 VPX X   1      53.117  38.689 -51.546  1.00  0.00      SYST C  
+ATOM     19  C14 VPX X   1      52.367  38.383 -52.764  1.00  0.00      SYST C  
+ATOM     20  C15 VPX X   1      52.141  39.221 -50.561  1.00  0.00      SYST C  
+ATOM     21  C16 VPX X   1      51.528  38.333 -49.392  1.00  0.00      SYST C  
+ATOM     22  C17 VPX X   1      50.622  37.374 -50.131  1.00  0.00      SYST C  
+ATOM     23  C18 VPX X   1      49.304  37.579 -50.389  1.00  0.00      SYST C  
+ATOM     24  C19 VPX X   1      48.346  36.690 -51.048  1.00  0.00      SYST C  
+ATOM     25  C20 VPX X   1      48.407  35.956 -52.214  1.00  0.00      SYST C  
+ATOM     26  C21 VPX X   1      47.399  34.963 -52.442  1.00  0.00      SYST C  
+ATOM     27  N2  VPX X   1      47.266  36.599 -50.319  1.00  0.00      SYST N  
+ATOM     28  C22 VPX X   1      46.240  35.806 -50.570  1.00  0.00      SYST C  
+ATOM     29  C23 VPX X   1      46.274  34.947 -51.655  1.00  0.00      SYST C  
+ATOM     30  C24 VPX X   1      45.197  34.079 -51.929  1.00  0.00      SYST C  
+ATOM     31  C25 VPX X   1      44.421  34.076 -53.138  1.00  0.00      SYST C  
+ATOM     32  C26 VPX X   1      43.329  33.190 -53.187  1.00  0.00      SYST C  
+ATOM     33  F   VPX X   1      42.550  33.220 -54.285  1.00  0.00      SYST F  
+ATOM     34  C27 VPX X   1      42.902  32.399 -52.141  1.00  0.00      SYST C  
+ATOM     35  C28 VPX X   1      43.652  32.411 -50.924  1.00  0.00      SYST C  
+ATOM     36  C29 VPX X   1      44.776  33.161 -50.825  1.00  0.00      SYST C  
+ATOM     37  H1  VPX X   1      58.115  36.837 -41.291  1.00  0.00      SYST H  
+ATOM     38  H2  VPX X   1      56.715  35.759 -41.032  1.00  0.00      SYST H  
+ATOM     39  H3  VPX X   1      57.173  37.098 -39.741  1.00  0.00      SYST H  
+ATOM     40  H4  VPX X   1      56.737  38.709 -41.773  1.00  0.00      SYST H  
+ATOM     41  H5  VPX X   1      55.389  37.950 -40.992  1.00  0.00      SYST H  
+ATOM     42  H6  VPX X   1      55.402  36.404 -45.064  1.00  0.00      SYST H  
+ATOM     43  H7  VPX X   1      52.995  38.195 -45.311  1.00  0.00      SYST H  
+ATOM     44  H8  VPX X   1      55.265  37.720 -47.245  1.00  0.00      SYST H  
+ATOM     45  H9  VPX X   1      54.993  39.294 -46.388  1.00  0.00      SYST H  
+ATOM     46  H10 VPX X   1      52.398  35.894 -45.523  1.00  0.00      SYST H  
+ATOM     47  H11 VPX X   1      53.711  35.608 -46.658  1.00  0.00      SYST H  
+ATOM     48  H12 VPX X   1      51.271  37.543 -46.939  1.00  0.00      SYST H  
+ATOM     49  H13 VPX X   1      51.647  35.967 -47.789  1.00  0.00      SYST H  
+ATOM     50  H14 VPX X   1      53.281  37.048 -49.018  1.00  0.00      SYST H  
+ATOM     51  H15 VPX X   1      52.946  39.717 -47.377  1.00  0.00      SYST H  
+ATOM     52  H16 VPX X   1      54.767  38.913 -49.579  1.00  0.00      SYST H  
+ATOM     53  H17 VPX X   1      54.833  40.446 -48.648  1.00  0.00      SYST H  
+ATOM     54  H18 VPX X   1      52.373  41.027 -49.534  1.00  0.00      SYST H  
+ATOM     55  H19 VPX X   1      53.574  37.795 -51.097  1.00  0.00      SYST H  
+ATOM     56  H20 VPX X   1      53.051  37.900 -53.494  1.00  0.00      SYST H  
+ATOM     57  H21 VPX X   1      51.950  39.248 -53.322  1.00  0.00      SYST H  
+ATOM     58  H22 VPX X   1      51.616  37.573 -52.649  1.00  0.00      SYST H  
+ATOM     59  H23 VPX X   1      51.350  39.769 -51.116  1.00  0.00      SYST H  
+ATOM     60  H24 VPX X   1      50.805  38.933 -48.799  1.00  0.00      SYST H  
+ATOM     61  H25 VPX X   1      50.999  36.558 -50.764  1.00  0.00      SYST H  
+ATOM     62  H26 VPX X   1      48.930  38.452 -49.834  1.00  0.00      SYST H  
+ATOM     63  H27 VPX X   1      49.208  35.994 -52.937  1.00  0.00      SYST H  
+ATOM     64  H28 VPX X   1      47.418  34.333 -53.319  1.00  0.00      SYST H  
+ATOM     65  H29 VPX X   1      45.380  35.836 -49.916  1.00  0.00      SYST H  
+ATOM     66  H30 VPX X   1      44.700  34.570 -54.057  1.00  0.00      SYST H  
+ATOM     67  H31 VPX X   1      42.061  31.731 -52.250  1.00  0.00      SYST H  
+ATOM     68  H32 VPX X   1      43.462  31.654 -50.177  1.00  0.00      SYST H  
+ATOM     69  H33 VPX X   1      45.375  33.262 -49.932  1.00  0.00      SYST H  
+END

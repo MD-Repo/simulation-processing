@@ -278,6 +278,13 @@ _ION_NAMES = frozenset(
         "POT",
         "CLA",
         "MGY",
+        # CHARMM's names for the rest of its monatomic ions.
+        "CAL",
+        "CES",
+        "LIT",
+        "RUB",
+        "BAR",
+        "CAD",
     }
 )
 
@@ -514,9 +521,102 @@ def _smiles_from_coords(sel) -> dict:
         if mol.NumBonds() == 0:
             mol.ConnectTheDots()
         mol.PerceiveBondOrders()
-        return _mol_summary(mol)
+        return _mol_summary(_bond_orders_from_hydrogens(mol) or mol)
     finally:
         os.unlink(tmp_path)
+
+
+# A double or triple bond the hydrogens call for must be shorter in the frame
+# than a single bond between the same two elements, by at least this much.
+_MULTIPLE_BOND_MARGIN = 0.05
+
+
+def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
+    """
+    Bond orders settled by valence from the explicit hydrogens, on OpenBabel's
+    connectivity, or None to keep OpenBabel's geometric reading.
+
+    PerceiveBondOrders types each atom by its bond angles, and a simulated frame
+    bends them. Vorapaxar's vinyl carbons, 1.36 A apart with three neighbours
+    each, came out of a NAMD frame with angles OpenBabel took for sp3: the bond
+    was made single and each carbon given an implicit hydrogen, C29H35FN2O4 for
+    C29H33FN2O4. An all-atom simulation states every hydrogen, and with every
+    hydrogen in place the valences leave one assignment of bond orders; RDKit's
+    DetermineBondOrders finds it without reading an angle.
+
+    The total charge is tried as the file's formal charges state it, then one
+    and two either side, and the first assignment that holds is kept. It is
+    refused -- and OpenBabel's reading stands -- when it leaves a radical, puts
+    a charge on carbon, or calls a bond double or triple that the frame holds
+    at single-bond length outside an aromatic ring. Those are what a
+    united-atom residue, whose carbons carry their hydrogens implicitly, would
+    otherwise be forced into. A residue with no hydrogens at all is left to
+    OpenBabel, as is one cut from a polymer, whose open valence no charge
+    explains.
+    """
+    from rdkit.Chem import rdDetermineBonds
+    from rdkit.Geometry import Point3D
+
+    atoms = list(ob.OBMolAtomIter(mol))
+    if not any(a.GetAtomicNum() == 1 for a in atoms):
+        return None
+
+    rw = Chem.RWMol()
+    conf = Chem.Conformer(len(atoms))
+    stated = 0
+    for a in atoms:
+        ra = Chem.Atom(a.GetAtomicNum())
+        ra.SetFormalCharge(a.GetFormalCharge())
+        ra.SetNoImplicit(True)
+        stated += a.GetFormalCharge()
+        i = rw.AddAtom(ra)
+        conf.SetAtomPosition(i, Point3D(a.GetX(), a.GetY(), a.GetZ()))
+    for b in ob.OBMolBondIter(mol):
+        i, j = b.GetBeginAtomIdx() - 1, b.GetEndAtomIdx() - 1
+        rw.AddBond(i, j, Chem.BondType.SINGLE)
+    rw.AddConformer(conf, assignId=True)
+
+    for charge in (stated, stated - 1, stated + 1, stated - 2, stated + 2):
+        m = Chem.Mol(rw)
+        try:
+            rdDetermineBonds.DetermineBondOrders(m, charge=charge)
+            Chem.SanitizeMol(m)
+        except Exception:
+            continue
+        if any(
+            a.GetNumRadicalElectrons()
+            or (a.GetAtomicNum() == 6 and a.GetFormalCharge())
+            for a in m.GetAtoms()
+        ):
+            continue
+        if not _multiple_bonds_are_short(m):
+            continue
+
+        Chem.Kekulize(m, clearAromaticFlags=True)
+        conv = ob.OBConversion()
+        conv.SetInFormat("mol")
+        out = ob.OBMol()
+        if conv.ReadString(out, Chem.MolToMolBlock(m)):
+            return out
+    return None
+
+
+def _multiple_bonds_are_short(m) -> bool:
+    """Whether every double or triple bond of `m` outside an aromatic ring is
+    shorter in its conformer than a single bond between the same elements."""
+    table = Chem.GetPeriodicTable()
+    pos = m.GetConformer().GetPositions()
+    for bond in m.GetBonds():
+        if bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.SINGLE:
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        single = sum(
+            table.GetRcovalent(m.GetAtomWithIdx(k).GetAtomicNum())
+            for k in (i, j)
+        )
+        if np.linalg.norm(pos[i] - pos[j]) > single - _MULTIPLE_BOND_MARGIN:
+            return False
+    return True
 
 
 def _smiles_from_topology(sel) -> dict:

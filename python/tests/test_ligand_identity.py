@@ -51,15 +51,21 @@ def test_structure_file_name_points_at_a_file_that_exists(meta):
     assert (BUNDLE / meta["structure_file_name"]).is_file()
 
 
-def test_the_molecule_perceived_from_the_named_file_matches_what_was_recorded(
+def test_the_molecule_perceived_from_the_named_file_is_the_one_it_holds(
     meta, recorded
 ):
     """Closes the loop: TOML -> file name -> coordinates -> molecule.
 
-    Asserting against the bundle's own recorded JSON rather than a string typed
-    here means this also detects mol_id drifting away from what it produced at
-    import time -- which matters because get_inferred_ligands caches that file
-    and never regenerates it, so a drift would go unnoticed until a reprocess.
+    The file holds anthraquinone-2-sulfonate: seven hydrogens, every one on a
+    carbon, none on the sulfonate's oxygens. The recorded reading, from
+    OpenBabel's bond angles at import time, made the three S-O bonds single
+    and gave each oxygen an implicit hydrogen: C14H10O5S, three hydrogens the
+    file does not have. The bond orders now come from the explicit hydrogens
+    (mol_id._bond_orders_from_hydrogens), which leave only the anion.
+
+    The recorded JSON is kept as imported -- get_inferred_ligands caches it and
+    never regenerates it -- so it and a fresh reading now differ, by exactly
+    those three hydrogens and the charge, over the same heavy atoms.
     """
 
     got = mol_id.structure_to_smiles(
@@ -67,12 +73,35 @@ def test_the_molecule_perceived_from_the_named_file_matches_what_was_recorded(
     )
     got = got[0] if isinstance(got, list) else got
 
-    assert got["smiles"] == recorded["smiles"]
-    assert got["formula"] == recorded["formula"]
+    assert got["smiles"] == "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(=O)(=O)[O-]"
+    assert got["formula"] == "C14H7O5S-"
+    assert got["charge"] == -1
     assert got["num_heavy_atoms"] == recorded["num_heavy_atoms"]
+    assert recorded["formula"] == "C14H10O5S"
 
 
-def test_the_inchikey_survived_the_move_to_rdkit(meta, recorded):
+def test_the_perceived_skeleton_is_the_declared_one(meta):
+    """With the hydrogens deciding the bond orders, the perceived key's
+    skeleton block is the declared molecule's, and only the protonation flag
+    differs: the file simulates the sulfonate, the metadata declares the acid.
+    The geometric reading shared neither block."""
+
+    got = mol_id.structure_to_smiles(
+        str(BUNDLE / meta["structure_file_name"]), resname="LIG"
+    )
+    got = got[0] if isinstance(got, list) else got
+    declared = [lig["smiles"] for lig in meta["ligands"] if lig.get("smiles")]
+    want = mol_id._inchikey_from_smiles(declared[0])
+
+    assert got["inchikey"].split("-")[0] == want.split("-")[0]
+    assert (got["inchikey"][-1], want[-1]) == ("M", "N")
+    assert ligand_check.check(declared, [got["smiles"]]) == (
+        ligand_check.FLAG,
+        "ligand[0] protonation",
+    )
+
+
+def test_the_inchikey_survived_the_move_to_rdkit(recorded):
     """The recorded key was computed with OpenBabel's InChI 1.04 in August;
     InChIKeys now come from RDKit's 1.07.3.
 
@@ -81,15 +110,15 @@ def test_the_inchikey_survived_the_move_to_rdkit(meta, recorded):
     STEREO block only, none in the skeleton block, and none lost. So a stored
     key is still a reliable skeleton match and is no longer a reliable
     full-string match. This test is the canary for that boundary moving.
+
+    It keys the recorded SMILES, so that it measures the InChI implementation
+    alone and not how the molecule is perceived from its coordinates.
     """
 
-    got = mol_id.structure_to_smiles(
-        str(BUNDLE / meta["structure_file_name"]), resname="LIG"
-    )
-    got = got[0] if isinstance(got, list) else got
+    got = mol_id._inchikey_from_smiles(recorded["smiles"])
 
-    assert got["inchikey"] == recorded["inchikey"]
-    assert got["inchikey"].split("-")[0] == recorded["inchikey"].split("-")[0]
+    assert got == recorded["inchikey"]
+    assert got.split("-")[0] == recorded["inchikey"].split("-")[0]
 
 
 def test_declared_against_perceived_gives_the_expected_verdict(meta, recorded):
