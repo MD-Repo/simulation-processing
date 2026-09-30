@@ -69,9 +69,11 @@ Kept deliberately in step with `check_amber.py` in MD-Repo/preflight-checks,
 which is the contributor-facing tool: `scan_cell` and `scan_coordinates` are
 the same two rules, and a submitter who runs that tool must not be told their
 data is fine by one implementation and rejected by the other. Change one, change
-both, and keep the two test corpora agreeing. The jump rule (`find_jumps`) is
-NOT yet in `check_amber.py`; until it is, the two disagree on exactly the files
-it refuses.
+both, and keep the two test corpora agreeing. `check_simulations.py` in the
+same repo is the general successor (NetCDF, XTC, TRR and DCD, where
+`check_amber.py` reads NetCDF only), and it is the one the jump rule
+(`find_jumps`) should be added to; neither has it yet, so until then the
+submitter-side tools pass the files it refuses. MDR-69, preflight-checks#2.
 """
 
 import argparse
