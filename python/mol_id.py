@@ -742,8 +742,6 @@ def _attached_group(sel):
         g.AddBond(xa.GetIdx(), h.GetIdx(), 1)
     for i in sorted(set(range(len(gat))) - keep, reverse=True):
         g.DeleteAtom(gat[i])
-    for a in ob.OBMolAtomIter(g):
-        a.SetImplicitHCount(0)
     xi = xa.GetIdx()
 
     settled = _bond_orders_from_hydrogens(g) or g
