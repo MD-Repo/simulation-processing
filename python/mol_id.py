@@ -528,12 +528,13 @@ def _smiles_from_coords(sel) -> dict:
 
 # A double or triple bond the hydrogens call for must be shorter in the frame
 # than a single bond between the same two elements, by at least this much.
-# Double bonds in a frame sit 0.12-0.2 A under the summed covalent radii
-# (C=C 1.34-1.40 against 1.52, C=S 1.61-1.67 against 1.81); conjugated single
-# bonds only 0.03-0.07 under (a thioester's C-S at 1.74). At 0.05 a
-# palmitoyl thioester's C-S passed as C=S, and the acid came out as
-# C(=[SH+])[O-].
-_MULTIPLE_BOND_MARGIN = 0.10
+# This refuses what a united-atom residue forces, double bonds at full
+# single-bond length; it cannot tell a strained double bond from a
+# conjugated single one. In the processed frames genuine C=N run to 1.41 A
+# and C=C to 1.47 A, 0.05-0.10 under the summed radii, where a thioester's
+# C-S sits at 1.74 A, 0.07 under: a margin of 0.10 lost fourteen correct
+# readings to refuse that one.
+_MULTIPLE_BOND_MARGIN = 0.05
 
 # The search for bond orders is exponential in the atoms whose valence it can
 # choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
@@ -616,13 +617,24 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
 
 def _implausible(atom) -> bool:
     """A radical or a charge no simulated ligand carries: on carbon, positive
-    on oxygen, or more than one on any atom."""
+    on oxygen, positive on a double-bonded sulfur, or more than one on any
+    atom.
+
+    A double-bonded S+ is a charge-separated form, not a molecule: with a
+    thioacid's sulfur listed before its oxygen the valence search returns
+    C(=[SH+])[O-] for C(=O)S. A sulfonium's S+ has three single bonds and
+    stands."""
     q = atom.GetFormalCharge()
     return bool(
         atom.GetNumRadicalElectrons()
         or abs(q) > 1
         or (q and atom.GetAtomicNum() == 6)
         or (q > 0 and atom.GetAtomicNum() == 8)
+        or (
+            q > 0
+            and atom.GetAtomicNum() == 16
+            and any(b.GetBondType() != Chem.BondType.SINGLE for b in atom.GetBonds())
+        )
     )
 
 

@@ -118,12 +118,14 @@ def test_bond_orders_the_search_cannot_settle_are_left_to_openbabel():
     assert got["formula"] == "C6H18O24P6"
 
 
-def test_a_conjugated_single_bond_is_not_made_double():
+def test_a_thioacid_is_not_read_charge_separated():
     """Thioacetic acid, every hydrogen in place, its sulfur listed before its
     oxygen as a residue lists a cysteine's SG before an acyl's O. Given that
     order the valence search puts the double bond on sulfur,
-    C(=[SH+])[O-]; the frame holds that C-S at 1.74 A, single-bond length,
-    so the reading is refused and the acid stands."""
+    C(=[SH+])[O-] -- a charge-separated form, refused -- and the acid read
+    from the geometry stands. The C-S is set to the 1.74 A of the palmitoyl
+    thioester this was found on, which a length check cannot refuse without
+    refusing strained double bonds too."""
 
     from rdkit import Chem
     from rdkit.Chem import AllChem, rdMolTransforms
