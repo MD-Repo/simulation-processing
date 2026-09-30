@@ -118,6 +118,34 @@ def test_bond_orders_the_search_cannot_settle_are_left_to_openbabel():
     assert got["formula"] == "C6H18O24P6"
 
 
+def test_a_conjugated_single_bond_is_not_made_double():
+    """Thioacetic acid, every hydrogen in place, its sulfur listed before its
+    oxygen as a residue lists a cysteine's SG before an acyl's O. Given that
+    order the valence search puts the double bond on sulfur,
+    C(=[SH+])[O-]; the frame holds that C-S at 1.74 A, single-bond length,
+    so the reading is refused and the acid stands."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, rdMolTransforms
+
+    m = Chem.AddHs(Chem.MolFromSmiles("CC(=O)S"))
+    AllChem.EmbedMolecule(m, randomSeed=3)
+    heavy = sorted(
+        (a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() > 1),
+        key=lambda i: m.GetAtomWithIdx(i).GetSymbol() == "O",
+    )
+    hydrogens = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() == 1]
+    m = Chem.RenumberAtoms(m, heavy + hydrogens)
+    # The C-S of the palmitoyl thioester this was found on, in its frame.
+    rdMolTransforms.SetBondLength(m.GetConformer(), 1, 2, 1.74)
+    mol = _ob_from_pdb(Chem.MolToPDBBlock(m, flavor=2 | 8))
+
+    assert mol_id._bond_orders_from_hydrogens(mol) is None
+    conv = ob.OBConversion()
+    conv.SetOutFormat("can")
+    assert conv.WriteString(mol).split()[0] == "CC(=O)S"
+
+
 def test_charmm_ions_are_background():
     for resname in ("SOD", "POT", "CLA", "CAL", "CES", "LIT", "RUB", "BAR", "CAD"):
         assert mol_id._is_skipped_residue(resname), resname

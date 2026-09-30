@@ -528,7 +528,12 @@ def _smiles_from_coords(sel) -> dict:
 
 # A double or triple bond the hydrogens call for must be shorter in the frame
 # than a single bond between the same two elements, by at least this much.
-_MULTIPLE_BOND_MARGIN = 0.05
+# Double bonds in a frame sit 0.12-0.2 A under the summed covalent radii
+# (C=C 1.34-1.40 against 1.52, C=S 1.61-1.67 against 1.81); conjugated single
+# bonds only 0.03-0.07 under (a thioester's C-S at 1.74). At 0.05 a
+# palmitoyl thioester's C-S passed as C=S, and the acid came out as
+# C(=[SH+])[O-].
+_MULTIPLE_BOND_MARGIN = 0.10
 
 # The search for bond orders is exponential in the atoms whose valence it can
 # choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
