@@ -396,7 +396,8 @@ def find_ligand_resnames(universe) -> dict:
     """{resname: atom_count} for non-background residues in a Universe.
 
     A residue name is background by the lists above, or when every residue of
-    that name is joined into a polymer (see _polymer_residues).
+    that name is joined into a polymer (see _polymer_residues) and carries no
+    molecule attached to it (see _attached_group).
     """
     counts: dict = {}
     if not hasattr(universe.atoms, "resnames"):
@@ -410,7 +411,10 @@ def find_ligand_resnames(universe) -> dict:
     for n in list(counts):
         residues = universe.residues[universe.residues.resnames == n]
         if len(residues) and all(r.resindex in linked for r in residues):
-            del counts[n]
+            if not _has_coords(residues[0].atoms) or not _attached_group(
+                residues[0].atoms
+            ):
+                del counts[n]
     return counts
 
 
@@ -604,6 +608,13 @@ def _smiles_from_coords(sel) -> dict:
     OpenBabel's PDB reader handle it. This reuses OB's well-tested geometry-
     based bond and aromaticity perception.
     """
+    mol = _read_coords(sel)
+    return _mol_summary(_bond_orders_from_hydrogens(mol) or mol)
+
+
+def _read_coords(sel):
+    """The selection as an OBMol, its bonds and bond orders read by
+    OpenBabel from the coordinates. Atoms keep the selection's order."""
     fd, tmp_path = tempfile.mkstemp(suffix=".pdb")
     os.close(fd)
     try:
@@ -617,9 +628,133 @@ def _smiles_from_coords(sel) -> dict:
         if mol.NumBonds() == 0:
             mol.ConnectTheDots()
         mol.PerceiveBondOrders()
-        return _mol_summary(_bond_orders_from_hydrogens(mol) or mol)
+        return mol
     finally:
         os.unlink(tmp_path)
+
+
+# An amino acid's backbone atoms, by the names every force field gives them.
+_BACKBONE_ATOMS = frozenset({"N", "CA", "C", "O", "OXT", "OT1", "OT2"})
+# N, O, S, Se: where an amino acid's side chain can be joined to something.
+_SIDE_CHAIN_HETEROATOMS = frozenset({7, 8, 16, 34})
+# An attached group this size or larger is reported. Smaller ones -- a
+# phosphate, an acetyl, a methyl, a guanidino, gamma-carboxyglutamate's second
+# carboxylate -- are the residue's own modification, not a molecule on it.
+_MIN_ATTACHED_HEAVY_ATOMS = 6
+
+
+def _attached_group(sel):
+    """
+    A molecule attached to a chain residue through its side chain, as the
+    molecule free of it, with the side-chain atom's name, or None.
+
+    Some residues of a chain carry a molecule bonded to them: rhodopsin's
+    retinal on a lysine (LYR), a palmitoyl on a cysteine (CYSP). The residue is
+    part of the chain (_polymer_residues), but the molecule on it is what a
+    reader would call the ligand. The amino acid is taken to run out from CA,
+    through carbons, to the first N, O, S or Se; a group of at least
+    _MIN_ATTACHED_HEAVY_ATOMS heavy atoms hanging from that atom by a single
+    bond is the molecule.
+
+    Its bond orders are read with the side-chain atom still in place and a
+    hydrogen standing in for the rest of the amino acid, so that an all-atom
+    group is a whole molecule to _bond_orders_from_hydrogens. It is then
+    reported as released from the residue by hydrolysis: the side-chain atom
+    becomes an oxygen with the same bond to the group. A retinal Schiff base
+    (C=NZ) gives retinal (C=O); a palmitoyl thioester (C(=O)-SG) gives
+    palmitic acid.
+    """
+    names = [str(n) for n in sel.names]
+    if "CA" not in names:
+        return None
+    try:
+        mol = _read_coords(sel)
+    except Exception:
+        return None
+    atoms = list(ob.OBMolAtomIter(mol))
+    if len(atoms) != len(names):
+        return None
+    heavy = [a.GetAtomicNum() != 1 for a in atoms]
+    adj = {
+        i: [n.GetIdx() - 1 for n in ob.OBAtomAtomIter(a) if heavy[n.GetIdx() - 1]]
+        for i, a in enumerate(atoms)
+        if heavy[i]
+    }
+    ca = names.index("CA")
+    backbone = {i for i, n in enumerate(names) if heavy[i] and n in _BACKBONE_ATOMS}
+
+    # Carbons out from CA, stopping at the first heteroatoms.
+    amino, stack, joins = {ca}, [ca], []
+    while stack:
+        i = stack.pop()
+        for j in adj[i]:
+            if j in amino or j in backbone:
+                continue
+            amino.add(j)
+            if atoms[j].GetAtomicNum() in _SIDE_CHAIN_HETEROATOMS:
+                joins.append(j)
+            else:
+                stack.append(j)
+
+    best = None
+    for x in joins:
+        for y in adj[x]:
+            if y in amino or y in backbone:
+                continue
+            group, stack = {y}, [y]
+            while stack:
+                i = stack.pop()
+                for j in adj[i]:
+                    if j != x and j not in group:
+                        group.add(j)
+                        stack.append(j)
+            if group & (amino | backbone):
+                continue
+            if len(group) >= _MIN_ATTACHED_HEAVY_ATOMS and (
+                best is None or len(group) > len(best[2])
+            ):
+                best = (x, y, group)
+    if best is None:
+        return None
+    x, y, group = best
+
+    # The group, its hydrogens, the side-chain atom and its hydrogens, and a
+    # hydrogen where each of that atom's amino-acid neighbours was.
+    g = ob.OBMol(mol)
+    gat = list(ob.OBMolAtomIter(g))
+    keep = set(group) | {x}
+    keep |= {
+        i
+        for i, a in enumerate(atoms)
+        if not heavy[i]
+        and any((n.GetIdx() - 1) in keep for n in ob.OBAtomAtomIter(a))
+    }
+    xa = gat[x]
+    for w in adj[x]:
+        if w in group:
+            continue
+        here = np.array([xa.GetX(), xa.GetY(), xa.GetZ()])
+        there = np.array([gat[w].GetX(), gat[w].GetY(), gat[w].GetZ()])
+        at = here + (there - here) / np.linalg.norm(there - here)
+        h = g.NewAtom()
+        h.SetAtomicNum(1)
+        h.SetVector(*map(float, at))
+        g.AddBond(xa.GetIdx(), h.GetIdx(), 1)
+    for i in sorted(set(range(len(gat))) - keep, reverse=True):
+        g.DeleteAtom(gat[i])
+    for a in ob.OBMolAtomIter(g):
+        a.SetImplicitHCount(0)
+    xi = xa.GetIdx()
+
+    settled = _bond_orders_from_hydrogens(g) or g
+    xs = settled.GetAtom(xi)
+    for h in [n for n in ob.OBAtomAtomIter(xs) if n.GetAtomicNum() == 1]:
+        settled.DeleteAtom(h)
+    xs = settled.GetAtom(xi)
+    xs.SetAtomicNum(8)
+    xs.SetFormalCharge(0)
+    ob.OBAtomAssignTypicalImplicitHydrogens(xs)
+    return settled, names[x]
 
 
 # A double or triple bond the hydrogens call for must be shorter in the frame
@@ -811,16 +946,28 @@ def universe_to_smiles(universe, resname: str) -> dict:
         unique_resix = np.array(free)
     sel = all_match[all_match.resindices == unique_resix[0]]
 
-    has_coords = False
-    try:
-        pos = sel.positions
-        has_coords = pos is not None and len(pos) == len(sel)
-    except (mda.exceptions.NoDataError, AttributeError):
-        has_coords = False
+    has_coords = _has_coords(sel)
+
+    # A chain residue is read for the molecule attached to it, where one is.
+    if has_coords and int(unique_resix[0]) in linked:
+        attached = _attached_group(sel)
+        if attached is not None:
+            mol, join = attached
+            result = _mol_summary(mol)
+            result["cut_from"] = f"{resname} {join}"
+            return result
 
     return (
         _smiles_from_coords(sel) if has_coords else _smiles_from_topology(sel)
     )
+
+
+def _has_coords(sel) -> bool:
+    try:
+        pos = sel.positions
+        return pos is not None and len(pos) == len(sel)
+    except (mda.exceptions.NoDataError, AttributeError):
+        return False
 
 
 def structure_to_smiles(

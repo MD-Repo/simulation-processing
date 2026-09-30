@@ -102,3 +102,30 @@ def test_an_acetyl_cap_is_part_of_its_chain(tmp_path):
     )
 
     assert mol_id.find_ligand_resnames(_universe(path)) == {}
+
+
+def test_retinal_on_a_lysine_is_reported_as_retinal():
+    """Rhodopsin's chromophore: retinal joined to a lysine's NZ as a Schiff
+    base, the whole one chain residue (LYR). The lysine is the chain's; the
+    retinal is reported, as released from it -- C=NZ read back as C=O."""
+
+    got = mol_id.structure_to_smiles(str(INPUTS / "retinal_lysine_peptide.pdb"))
+
+    assert [g["resname"] for g in got] == ["LYR"]
+    assert got[0]["formula"] == "C20H28O"
+    assert got[0]["cut_from"] == "LYR NZ"
+    # retinal's skeleton; the stereo block follows the frame
+    assert got[0]["inchikey"].startswith("NCYCYZXNIZJOKI-")
+
+
+def test_a_palmitoyl_on_a_cysteine_is_reported_as_palmitic_acid():
+    """A palmitoyl thioester on a cysteine's SG, one chain residue (CYP): the
+    thioester read back as the acid."""
+
+    got = mol_id.structure_to_smiles(
+        str(INPUTS / "palmitoyl_cysteine_peptide.pdb")
+    )
+
+    assert [g["resname"] for g in got] == ["CYP"]
+    assert got[0]["smiles"] == "CCCCCCCCCCCCCCCC(=O)O"
+    assert got[0]["cut_from"] == "CYP SG"
