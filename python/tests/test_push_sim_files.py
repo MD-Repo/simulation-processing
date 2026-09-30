@@ -22,6 +22,7 @@ propagate, and neither may be allowed to read as verified.
 """
 
 import os
+import signal
 import sys
 
 import pytest
@@ -284,3 +285,34 @@ def test_stuck_object_is_queued_rather_than_skipped():
         can_skip = local_size == remote_size
 
     assert can_skip is False
+
+
+# --------------------------------------------------
+# tighten_deadline (MDR-73): the post-upload stretch gets a shorter deadline.
+@pytest.fixture
+def no_alarm():
+    signal.alarm(0)
+    yield
+    signal.alarm(0)
+    p.ABORT.clear()
+
+
+@pytest.mark.parametrize(
+    "armed, expected",
+    [
+        (3600, 600),  # an hour left: pulled in
+        (100, 100),  # already sooner: never extended
+        (0, 0),  # --timeout 0: stays off
+    ],
+)
+def test_tighten_deadline(no_alarm, armed, expected):
+    signal.alarm(armed)
+    p.tighten_deadline(600)
+    assert signal.alarm(0) == expected
+
+
+def test_tighten_deadline_leaves_the_abort_grace_alone(no_alarm):
+    p.ABORT.set()
+    signal.alarm(p.ABORT_GRACE)
+    p.tighten_deadline(10)
+    assert signal.alarm(0) == p.ABORT_GRACE

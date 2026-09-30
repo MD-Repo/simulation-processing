@@ -66,6 +66,12 @@ DEFAULT_TRANSFER_THREADS = 0
 READBACK_LIMIT = 64 * 1024 * 1024
 
 PUSH_TIMEOUT = 3600  # seconds
+# Once every upload has returned, what is left -- closing the session clones
+# and reading back or checksumming each file -- takes seconds on a healthy
+# push, so the deadline is pulled in to this. On 2026-09-23 the 3r24 re-push
+# went silent after its last upload had returned and held its slot ~40
+# minutes until it was killed, inside the hour above (MDR-73).
+POST_UPLOAD_TIMEOUT = 600  # seconds
 # What the graceful abort gets before the process leaves anyway. The wedged
 # case is exactly the one where waiting for transfer threads to wind down is
 # itself what hangs, so the deadline cannot depend on them cooperating.
@@ -498,8 +504,9 @@ def main() -> None:
                         sys.exit(message)
 
                     elapsed = humanize.precisedelta(dt.now() - start)
-                    print(f"Uploaded {len(upload)} file(s) in {elapsed}")
+                    print(f"Uploaded {len(upload)} file(s) in {elapsed}", flush=True)
         finally:
+            tighten_deadline(POST_UPLOAD_TIMEOUT)
             # Leaving clones open causes SYS_HEADER_READ_LEN_ERR
             while not sessions.empty():
                 sessions.get().cleanup()
@@ -509,7 +516,7 @@ def main() -> None:
         # Rust) keys off observed remote state, not off whether this particular
         # run uploaded cleanly. A partial push therefore leaves the simulation a
         # placeholder, and a later run that completes it clears the flag.
-        print("Verifying uploads")
+        print("Verifying uploads", flush=True)
         for target in targets:
             if target["location"] == "media":
                 present, remote_md5, how = verify_media(
@@ -586,6 +593,22 @@ def hard_exit(_signum, _frame) -> None:
     # os._exit rather than sys.exit: the threads this is escaping from are
     # not daemons, so a normal exit would block on the join that is stuck.
     os._exit(1)
+
+
+# --------------------------------------------------
+def tighten_deadline(limit: int) -> None:
+    """Bring the wall-clock deadline to at most `limit` seconds from now
+
+    Never extends it, and leaves it off when --timeout 0 turned it off. Once
+    the deadline has fired, the pending alarm is ABORT_GRACE's hard exit,
+    which is not this function's to move.
+    """
+
+    if ABORT.is_set():
+        return
+    remaining = signal.alarm(0)
+    if remaining:
+        signal.alarm(min(remaining, limit))
 
 
 # --------------------------------------------------
