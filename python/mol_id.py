@@ -393,7 +393,11 @@ def load_universe(path: str, fmt: Optional[str] = None):
 
 
 def find_ligand_resnames(universe) -> dict:
-    """{resname: atom_count} for non-background residues in a Universe."""
+    """{resname: atom_count} for non-background residues in a Universe.
+
+    A residue name is background by the lists above, or when every residue of
+    that name is joined into a polymer (see _polymer_residues).
+    """
     counts: dict = {}
     if not hasattr(universe.atoms, "resnames"):
         return counts
@@ -402,7 +406,99 @@ def find_ligand_resnames(universe) -> dict:
         n_str = str(n)
         if not _is_skipped_residue(n_str):
             counts[n_str] = int(c)
+    linked = _polymer_residues(universe, counts)
+    for n in list(counts):
+        residues = universe.residues[universe.residues.resnames == n]
+        if len(residues) and all(r.resindex in linked for r in residues):
+            del counts[n]
     return counts
+
+
+# Atom-name pairs that join a residue into a polymer, the residue's own atom
+# first: a peptide bond from either end, a phosphodiester from either end.
+_BACKBONE_LINKS = (
+    ("N", "C"),
+    ("C", "N"),
+    ("P", "O3'"),
+    ("P", "O3*"),
+    ("O3'", "P"),
+    ("O3*", "P"),
+)
+# A peptide C-N is 1.33 A and a phosphodiester P-O3' 1.61 A; the same atoms
+# unbonded do not come within 2.5 A.
+_LINK_CUTOFF = 1.9
+
+
+def _polymer_residues(universe, resnames) -> set:
+    """
+    Resindices of the residues named in `resnames` that are joined to another
+    residue by a peptide or phosphodiester bond: residues of a chain, not
+    molecules beside it.
+
+    A ligand is chosen by elimination, and the lists of standard residues can
+    never name every residue a chain may hold. The Gla domain of a
+    NAMD-simulated coagulation protein carries nine gamma-carboxyglutamates
+    (CGU). Taken for a ligand, the first was cut from its chain and read as
+    2-[(2S)-2-amino-3-oxopropyl]propanedioic acid -- its backbone carbonyl an
+    aldehyde, its carboxylates given hydrogens -- and, with no ligand
+    declared, published as the simulation's ligand. Across the processed
+    corpus the same befalls AIB, pyroglutamate (PCA), homoarginine (HRG), the
+    retinal-bound lysine (LYR) and an acetyl cap (ACE).
+
+    What makes a residue part of a chain is its backbone bond, whatever its
+    name. A ligand bonded to the protein through a side chain -- a covalent
+    inhibitor on a cysteine's sulfur or a lysine's NZ -- is not joined this
+    way and stays a ligand. Bonds come from the topology when it states them,
+    else from distances in the frame; with neither, nothing is excluded.
+    """
+    names = set(resnames)
+    atoms = universe.atoms
+    mine = atoms[np.isin(atoms.resnames.astype(str), list(names))]
+    linked: set = set()
+    if len(mine) == 0:
+        return linked
+
+    try:
+        bonds = mine.bonds
+    except (mda.exceptions.NoDataError, AttributeError):
+        bonds = None
+    if bonds is not None and len(bonds):
+        for bond in bonds:
+            a, b = bond.atoms
+            for x, y in ((a, b), (b, a)):
+                if (
+                    str(x.resname) in names
+                    and x.resindex != y.resindex
+                    and (x.name, y.name) in _BACKBONE_LINKS
+                ):
+                    linked.add(int(x.resindex))
+        return linked
+
+    try:
+        atoms.positions
+    except (mda.exceptions.NoDataError, AttributeError):
+        return linked
+    from MDAnalysis.lib.distances import capped_distance
+
+    box = universe.dimensions
+    if box is None or not np.all(box[:3] > 0):
+        box = None
+    for own, other in _BACKBONE_LINKS:
+        a = mine[mine.names == own]
+        b = atoms[atoms.names == other]
+        if len(a) == 0 or len(b) == 0:
+            continue
+        pairs = capped_distance(
+            a.positions,
+            b.positions,
+            _LINK_CUTOFF,
+            box=box,
+            return_distances=False,
+        )
+        for i, j in pairs:
+            if a[i].resindex != b[j].resindex:
+                linked.add(int(a[i].resindex))
+    return linked
 
 
 def resolve_target_resnames(
@@ -707,12 +803,13 @@ def universe_to_smiles(universe, resname: str) -> dict:
     # If multiple copies of the same residue name are present (e.g., many lipid
     # molecules in a full simulation box), use only the first residue instance so
     # that SMILES represents a single molecule rather than all copies concatenated.
+    # A copy joined into a polymer is passed over while a free one exists.
     unique_resix = np.unique(all_match.resindices)
-    sel = (
-        all_match[all_match.resindices == unique_resix[0]]
-        if len(unique_resix) > 1
-        else all_match
-    )
+    linked = _polymer_residues(universe, {str(resname)})
+    free = [r for r in unique_resix if int(r) not in linked]
+    if free:
+        unique_resix = np.array(free)
+    sel = all_match[all_match.resindices == unique_resix[0]]
 
     has_coords = False
     try:
