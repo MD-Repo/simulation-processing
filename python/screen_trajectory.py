@@ -58,11 +58,20 @@ of its trajectory to a silent truncation decompresses to a short, clean XTC
 and passes. That needs a declared frame count to compare against, which is a
 submission-format question rather than a screening one.
 
+The third rule is a jump: an atom that moves MAX_JUMP or more between two
+consecutive frames. DDD's damaged last frames move whole protein chains by one
+constant offset, often well under MAX_ABS_COORD, so the size test alone passed
+five of the twelve measured on 2026-09-30. A jump is not tested across a
+boundary in time (a gap or a clock restart, where joined runs meet), because
+between two runs the system can be anywhere. See `find_jumps`.
+
 Kept deliberately in step with `check_amber.py` in MD-Repo/preflight-checks,
 which is the contributor-facing tool: `scan_cell` and `scan_coordinates` are
 the same two rules, and a submitter who runs that tool must not be told their
 data is fine by one implementation and rejected by the other. Change one, change
-both, and keep the two test corpora agreeing.
+both, and keep the two test corpora agreeing. The jump rule (`find_jumps`) is
+NOT yet in `check_amber.py`; until it is, the two disagree on exactly the files
+it refuses.
 """
 
 import argparse
@@ -96,6 +105,24 @@ CHUNK_FRAMES = 256
 # trace a damaged frame leaves in an XTC. Without this, screening an XTC would
 # find nothing.
 MAX_ABS_COORD = 1.0e6
+
+# An atom that moves this far between consecutive frames has not moved: the
+# frame is damaged. DDD's damaged last frames shift whole protein chains by one
+# constant vector of 1e4-1e7 A, and five of the twelve measured never reach
+# MAX_ABS_COORD. Honest data moves far less: DDD at most 71.5 A per frame,
+# AMBER runs 8-11 A, and the wrapped OpenMM run MDR00088497 272 A, which is its
+# box diagonal -- an atom leaving one corner and coming back through the
+# opposite one. So the limit is this, or twice the frame's own box diagonal if
+# that is larger, which keeps a very large wrapped box from being refused.
+#
+# Why a jump and not a lower MAX_ABS_COORD: an unwrapped trajectory can drift
+# thousands of angstroms from the origin over microseconds, honestly, while
+# moving a few angstroms per frame.
+MAX_JUMP = 5.0e3
+
+# Two frames are consecutive in time when their spacing is within this share
+# of the file's regular step. float32 times wander in the last digits.
+STEP_TOLERANCE = 0.01
 
 # How many frame numbers to name in an error before summarising the rest. The
 # message goes into md_upload_instance_message, and a trajectory with thousands
@@ -219,23 +246,201 @@ def scan_cell(lengths, angles) -> List[int]:
 
 
 # --------------------------------------------------
-def scan_coordinates(coords) -> Tuple[List[int], List[int], List[int]]:
+def box_diagonal(lengths, angles) -> Optional[float]:
+    """
+    The longest distance a wrap can move an atom in one box, or None
+
+    Wrapping moves an atom by a sum of box vectors, at most one of each, so the
+    longest move is the longest of a+b+c, a+b-c, a-b+c and -a+b+c. For a
+    rectangular box that is the plain diagonal. No box -- zero, negative or
+    non-finite lengths, or angles that make no cell -- gives None.
+    """
+
+    lengths = np.asarray(lengths, dtype=np.float64)
+    angles = np.asarray(angles, dtype=np.float64)
+    if lengths.shape != (3,) or angles.shape != (3,):
+        return None
+    if not (np.isfinite(lengths).all() and np.isfinite(angles).all()):
+        return None
+    if (lengths <= 0).any() or (angles <= 0).any() or (angles >= 180).any():
+        return None
+
+    alpha, beta, gamma = np.radians(angles)
+    a_len, b_len, c_len = lengths
+    a = np.array([a_len, 0.0, 0.0])
+    b = np.array([b_len * np.cos(gamma), b_len * np.sin(gamma), 0.0])
+    cx = c_len * np.cos(beta)
+    cy = c_len * (np.cos(alpha) - np.cos(beta) * np.cos(gamma)) / np.sin(gamma)
+    cz_sq = c_len**2 - cx**2 - cy**2
+    if not np.isfinite(cz_sq) or cz_sq <= 0:
+        return None
+    c = np.array([cx, cy, np.sqrt(cz_sq)])
+
+    return float(max(np.linalg.norm(v) for v in (a + b + c, a + b - c, a - b + c, -a + b + c)))
+
+
+# --------------------------------------------------
+def jump_limit(diagonal: Optional[float]) -> float:
+    """MAX_JUMP, or twice the box diagonal when there is a box that large"""
+
+    if diagonal is None or not np.isfinite(diagonal) or diagonal <= 0:
+        return MAX_JUMP
+
+    return max(MAX_JUMP, 2.0 * float(diagonal))
+
+
+# --------------------------------------------------
+def regular_step(times) -> Optional[float]:
+    """
+    The file's usual spacing between frames, or None if time tells us nothing
+
+    The median, not the most common value: float32 times differ in the last
+    digits, so an exact count can split one real step into several. A file
+    with no times, or whose times do not advance (ticket 2339 wrote zeros),
+    gives None.
+    """
+
+    if times is None or len(times) < 2:
+        return None
+
+    step = float(np.median(np.diff(np.asarray(times, dtype=np.float64))))
+    if not np.isfinite(step) or step <= 0:
+        return None
+
+    return step
+
+
+# --------------------------------------------------
+def find_jumps(moves, times, diagonals) -> Tuple[List[int], List[int]]:
+    """
+    Frames whose atoms moved too far, and the time boundaries that excused one
+
+    `moves[i]` is the largest one-atom move from frame i-1 to frame i (0 for
+    frame 0). `diagonals[i]` is frame i's box diagonal, or None.
+
+    A trajectory may be several runs joined, and between two runs the system
+    can be anywhere, so a jump is not tested across a boundary in time: a step
+    longer than the regular one, or one that goes back (a clock restart). Only
+    a boundary into a block of two or more frames counts. Otherwise a frame
+    damaged in its time as well as its coordinates -- a garbage time on a
+    damaged last frame -- would excuse itself.
+
+    Without usable times nothing can show a boundary, so every step is tested.
+    A wrong refusal is loud and gets fixed; a missed defect is silent.
+    """
+
+    frames = len(moves)
+    step = regular_step(times)
+
+    irregular = [False] * frames
+    if step is not None:
+        spacing = np.diff(np.asarray(times, dtype=np.float64))
+        for i in range(1, frames):
+            irregular[i] = not abs(spacing[i - 1] - step) <= STEP_TOLERANCE * step
+
+    boundaries = [
+        i
+        for i in range(1, frames)
+        if irregular[i] and i + 1 < frames and not irregular[i + 1]
+    ]
+    excused = set(boundaries)
+
+    jumps = [
+        i
+        for i in range(1, frames)
+        if i not in excused
+        and moves[i] >= jump_limit(None if diagonals is None else diagonals[i])
+    ]
+
+    return jumps, boundaries
+
+
+# --------------------------------------------------
+def jump_note(frames: int, times, boundaries: List[int]) -> str:
+    """
+    What the jump test did, for the note: silent only when it tested every
+    step against a regular clock
+    """
+
+    if frames < 2:
+        return ""
+    if regular_step(times) is None:
+        return "; no usable frame times, jump test applied to every step"
+    if boundaries:
+        return (
+            f"; {len(boundaries) + 1} time segments (breaks at frames "
+            f"{format_runs(group_runs(boundaries))}), jump test not applied "
+            f"across them"
+        )
+
+    return ""
+
+
+# --------------------------------------------------
+def largest_moves(block, before) -> List[float]:
+    """
+    For each frame of a block, the largest one-atom move from the frame before
+
+    `before` is the last frame of the previous block, or None at the start of
+    the file, where the first frame's move is 0. A non-finite coordinate is
+    reported by its own rule, so its move counts as 0 here.
+    """
+
+    moves: List[float] = []
+    previous = before
+    for frame in block:
+        moves.append(0.0 if previous is None else largest_move(frame, previous))
+        previous = frame
+
+    return moves
+
+
+# --------------------------------------------------
+def largest_move(frame, before) -> float:
+    """
+    The largest one-atom move between two frames
+
+    Squared distances, and one square root at the end: this runs on every
+    frame of every trajectory, and a 400,000-atom frame is 400,000 of them.
+    """
+
+    with np.errstate(invalid="ignore", over="ignore"):
+        # float32 is plenty: the question is 5,000 A against a few hundred.
+        delta = np.subtract(frame, before, dtype=np.float32)
+        squared = np.einsum("ij,ij->i", delta, delta)
+    finite = squared[np.isfinite(squared)]
+
+    return float(np.sqrt(finite.max())) if finite.size else 0.0
+
+
+# --------------------------------------------------
+def scan_coordinates(coords, moves=None) -> Tuple[List[int], List[int], List[int]]:
     """
     Find all-zero frames and frames holding values that are not finite
 
     Both answers come out of one pass, because the coordinates are the only
     expensive thing this reads and there is no reason to read them twice. The
     two results never overlap: a frame of exact zeros is finite.
+
+    Given a list as `moves`, the same pass also appends each frame's largest
+    one-atom move from the frame before, for `find_jumps`. The last frame of
+    each block is carried into the next, so a jump at a block's first frame is
+    still measured.
     """
 
     zero: List[int] = []
     nonfinite: List[int] = []
     huge: List[int] = []
     total = coords.shape[0]
+    before = None
 
     for start in range(0, total, CHUNK_FRAMES):
         block = np.asarray(coords[start : start + CHUNK_FRAMES])
         flat = block.reshape(block.shape[0], -1)
+
+        if moves is not None:
+            moves.extend(largest_moves(block, before))
+            before = block[-1]
 
         finite = np.isfinite(flat).all(axis=1)
         for offset in np.where(~finite)[0]:
@@ -252,7 +457,7 @@ def scan_coordinates(coords) -> Tuple[List[int], List[int], List[int]]:
 
 
 # --------------------------------------------------
-def describe(name, frames, bad_cell, nonfinite, huge, zero) -> Optional[str]:
+def describe(name, frames, bad_cell, nonfinite, huge, zero, jumps=()) -> Optional[str]:
     """
     Turn frame indexes into the sentence that refuses the trajectory
 
@@ -277,6 +482,12 @@ def describe(name, frames, bad_cell, nonfinite, huge, zero) -> Optional[str]:
             f"{len(huge)} of {frames} frames hold coordinates of "
             f"{MAX_ABS_COORD:.0e} angstroms or more, which is not a position "
             f"(frames {format_runs(group_runs(huge))})"
+        )
+    if jumps:
+        problems.append(
+            f"{len(jumps)} of {frames} frames move an atom {MAX_JUMP:.0e} "
+            f"angstroms or more (or twice the box diagonal) from the frame "
+            f"before (frames {format_runs(group_runs(list(jumps)))})"
         )
     if zero:
         problems.append(
@@ -316,14 +527,34 @@ def screen_netcdf(trajectory: str, cell_only: bool) -> Verdict:
         zero: List[int] = []
         nonfinite: List[int] = []
         huge: List[int] = []
+        jumps: List[int] = []
+        boundaries: List[int] = []
+        times = None
+        if "time" in ncf.variables:
+            times = np.array(ncf.variables["time"][:], dtype=np.float64)
+
         if not cell_only:
-            zero, nonfinite, huge = scan_coordinates(coords)
+            moves: List[float] = []
+            zero, nonfinite, huge = scan_coordinates(coords, moves)
+
+            diagonals = None
+            if "cell_lengths" in ncf.variables and "cell_angles" in ncf.variables:
+                cell_lengths = np.array(ncf.variables["cell_lengths"][:])
+                cell_angles = np.array(ncf.variables["cell_angles"][:])
+                diagonals = [
+                    box_diagonal(lengths, angles)
+                    for lengths, angles in zip(cell_lengths, cell_angles)
+                ]
+            jumps, boundaries = find_jumps(moves, times, diagonals)
 
     how = "unit cell only" if cell_only else "cell and coordinates"
+    note = f"{name}: screened {frames} frames ({how}), no damaged frames"
+    if not cell_only:
+        note += jump_note(frames, times, boundaries)
 
     return Verdict(
-        describe(name, frames, bad_cell, nonfinite, huge, zero),
-        f"{name}: screened {frames} frames ({how}), no damaged frames",
+        describe(name, frames, bad_cell, nonfinite, huge, zero, jumps),
+        note,
     )
 
 
@@ -361,6 +592,10 @@ def screen_via_mdanalysis(trajectory: str) -> Verdict:
     huge: List[int] = []
     lengths: List[List[float]] = []
     angles: List[List[float]] = []
+    moves: List[float] = []
+    times: List[float] = []
+    diagonals: List[Optional[float]] = []
+    before = None
     frames = 0
 
     with warnings.catch_warnings():
@@ -368,6 +603,18 @@ def screen_via_mdanalysis(trajectory: str) -> Verdict:
         for step in universe.trajectory:
             frames += 1
             coords = np.asarray(step.positions, dtype=np.float64)
+
+            # DCD stores only a start and an interval, so its times always
+            # read back regular and every step of one is tested.
+            times.append(float(step.time))
+            positions = step.positions
+            moves.append(0.0 if before is None else largest_move(positions, before))
+            before = positions.copy()
+            diagonals.append(
+                None
+                if step.dimensions is None
+                else box_diagonal(step.dimensions[:3], step.dimensions[3:6])
+            )
 
             if not np.isfinite(coords).all():
                 nonfinite.append(step.frame)
@@ -388,11 +635,12 @@ def screen_via_mdanalysis(trajectory: str) -> Verdict:
         return Verdict(f"{name} holds no frames", "")
 
     bad_cell = scan_cell(lengths, angles)
+    jumps, boundaries = find_jumps(moves, times, diagonals)
 
     return Verdict(
-        describe(name, frames, bad_cell, nonfinite, huge, zero),
+        describe(name, frames, bad_cell, nonfinite, huge, zero, jumps),
         f"{name}: screened {frames} frames (cell and coordinates), "
-        f"no damaged frames",
+        f"no damaged frames" + jump_note(frames, times, boundaries),
     )
 
 

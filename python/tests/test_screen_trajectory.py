@@ -39,8 +39,13 @@ FRAMES = 6
 
 
 # --------------------------------------------------
-def write_nc(path, coords, lengths, angles):
-    """Write a minimal AMBER-convention NetCDF trajectory"""
+def write_nc(path, coords, lengths, angles, times="index"):
+    """
+    Write a minimal AMBER-convention NetCDF trajectory
+
+    `times` is the frame times in ps; the default is the frame index. None
+    leaves the time variable out, as contributor 289's MDR00048669 does.
+    """
 
     out = netcdf_file(str(path), "w", version=2)
     out.Conventions = "AMBER"
@@ -59,9 +64,13 @@ def write_nc(path, coords, lengths, angles):
     var = out.createVariable("cell_angular", "c", ("cell_angular", "label"))
     var[:] = np.array([list("alpha"), list("beta "), list("gamma")], dtype="c")
 
-    var = out.createVariable("time", "f", ("frame",))
-    var.units = "picosecond"
-    var[:] = np.arange(coords.shape[0], dtype=np.float32)
+    if times is not None:
+        var = out.createVariable("time", "f", ("frame",))
+        var.units = "picosecond"
+        if isinstance(times, str):
+            var[:] = np.arange(coords.shape[0], dtype=np.float32)
+        else:
+            var[:] = np.asarray(times, dtype=np.float32)
 
     var = out.createVariable(
         "coordinates", "f", ("frame", "atom", "spatial")
@@ -296,8 +305,14 @@ def test_an_ordinary_large_system_is_not_too_large():
 
 
 # --------------------------------------------------
-def write_via_mdanalysis(path, coords, dimensions):
-    """Write a trajectory in whatever format the extension names"""
+def write_via_mdanalysis(path, coords, dimensions, times=None):
+    """
+    Write a trajectory in whatever format the extension names
+
+    `times` sets each frame's time in ps. XTC and TRR store it as given; DCD
+    stores only a start and an interval, so it reads back as regular whatever
+    is passed.
+    """
 
     import MDAnalysis as mda
     from MDAnalysis.coordinates.memory import MemoryReader
@@ -305,7 +320,9 @@ def write_via_mdanalysis(path, coords, dimensions):
     universe = mda.Universe.empty(coords.shape[1], trajectory=True)
     universe.load_new(coords, format=MemoryReader, dimensions=dimensions)
     with mda.Writer(str(path), coords.shape[1]) as writer:
-        for _ in universe.trajectory:
+        for step in universe.trajectory:
+            if times is not None:
+                step.time = times[step.frame]
             writer.write(universe.atoms)
 
     return str(path)
@@ -383,3 +400,476 @@ def test_a_file_we_claim_to_read_but_cannot_open_is_refused(tmp_path):
 
     assert verdict.problem is not None
     assert "cannot be opened" in verdict.problem
+
+
+# ==================================================
+# Frame-to-frame jumps
+#
+# The proposed third coordinate rule (09-30, ddd host; kyclark-notes diary
+# 2026-09-30, "DDD HOST"). A frame is refused when any atom moves MAX_JUMP
+# (5,000 A) or more from the frame before -- or twice the frame's box
+# diagonal, if that is larger -- unless the step is a boundary between two
+# blocks of time. A one-frame block is never excused, and the absolute
+# 1e6 A limit still covers every frame.
+#
+# Why: DDD's damaged last frames move whole protein chains by one constant
+# offset of 1e4-1e7 A. Five of the twelve measured never reach 1e6 A, so
+# MAX_ABS_COORD passes them. Honest data measured the same day moves far less:
+# DDD at most 71.5 A per frame, contributor 289's AMBER runs 8-11 A, and the
+# wrapped OpenMM run MDR00088497 up to 272 A, its box diagonal.
+#
+# These tests are written ahead of the code; until the rule exists they fail.
+# ==================================================
+
+CHAIN = 20  # the first CHAIN atoms play the protein chain the damage moves
+
+
+# --------------------------------------------------
+def steady(frames=FRAMES, atoms=ATOMS, box=50.0):
+    """A trajectory whose atoms stay put apart from thermal noise"""
+
+    rng = np.random.default_rng(88497)
+    start = rng.uniform(5.0, box - 5.0, (atoms, 3))
+    noise = rng.normal(0.0, 0.3, (frames, atoms, 3))
+    coords = (start + noise).astype(np.float32)
+    lengths = np.full((frames, 3), box, dtype=np.float64)
+    angles = np.full((frames, 3), 90.0, dtype=np.float64)
+    return coords, lengths, angles
+
+
+# --------------------------------------------------
+def direction():
+    """A fixed direction for offsets, like the ones measured"""
+
+    v = np.array([37144.0, 81529.0, 233850.0])
+    return v / np.linalg.norm(v)
+
+
+# --------------------------------------------------
+def move_chain(coords, frame, distance):
+    """Move the first CHAIN atoms of one frame by one constant vector"""
+
+    coords[frame, :CHAIN] += (direction() * distance).astype(np.float32)
+
+
+# --------------------------------------------------
+def no_box(frames=FRAMES):
+    """Dimensions for a trajectory with no periodic box, as a .mdc decodes"""
+
+    return np.zeros((frames, 6), dtype=np.float32)
+
+
+# --------------------------------------------------
+# The rule, directly
+
+
+# --------------------------------------------------
+def test_the_jump_limit_has_a_floor_and_grows_with_the_box():
+    """5,000 A, or twice the box diagonal when that is larger"""
+
+    assert s.MAX_JUMP == 5.0e3
+    assert s.jump_limit(None) == s.MAX_JUMP
+    assert s.jump_limit(float("nan")) == s.MAX_JUMP
+    assert s.jump_limit(0.0) == s.MAX_JUMP
+    assert s.jump_limit(273.0) == s.MAX_JUMP
+    assert s.jump_limit(5196.2) == pytest.approx(2 * 5196.2)
+
+
+# --------------------------------------------------
+def test_a_jump_on_a_regular_step_is_found():
+    moves = [0.0, 4.0, 4.0, 4.0, 4.0, 250_425.0]
+    times = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+    jumps, boundaries = s.find_jumps(moves, times, None)
+
+    assert jumps == [5]
+    assert boundaries == []
+
+
+# --------------------------------------------------
+def test_a_jump_at_a_time_gap_is_excused():
+    """Two joined runs: the second block starts at frame 3 and has 3 frames"""
+
+    moves = [0.0, 4.0, 4.0, 20_000.0, 4.0, 4.0]
+    times = [0.0, 10.0, 20.0, 5000.0, 5010.0, 5020.0]
+
+    jumps, boundaries = s.find_jumps(moves, times, None)
+
+    assert jumps == []
+    assert boundaries == [3]
+
+
+# --------------------------------------------------
+def test_a_one_frame_block_at_the_end_is_not_excused():
+    """
+    A damaged last frame whose time is garbage too
+
+    If a time gap excused any jump, a frame damaged in both its coordinates
+    and its time would excuse itself. DDD's damaged last frames carry normal
+    times, but nothing guarantees the next contributor's will.
+    """
+
+    moves = [0.0, 4.0, 4.0, 4.0, 4.0, 250_425.0]
+    times = [0.0, 1.0, 2.0, 3.0, 4.0, 9.9e9]
+
+    jumps, _ = s.find_jumps(moves, times, None)
+
+    assert jumps == [5]
+
+
+# --------------------------------------------------
+def test_a_one_frame_block_in_the_middle_is_not_excused():
+    """
+    Frame 3 is damaged, time included, and frame 4 is back to normal
+
+    Frame 3 is a block of one, so its jump stands. The step back into frame 4
+    also looks like a boundary, and frames 4-5 are a real block, so that step
+    is excused -- which is fine, because frame 3 already refuses the file.
+    """
+
+    moves = [0.0, 4.0, 4.0, 250_425.0, 250_425.0, 4.0]
+    times = [0.0, 10.0, 20.0, -7.0e7, 40.0, 50.0]
+
+    jumps, boundaries = s.find_jumps(moves, times, None)
+
+    assert 3 in jumps
+    assert 3 not in boundaries
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("times", [None, [0.0] * 6])
+def test_with_no_usable_times_every_step_is_tested(times):
+    """
+    No time variable (MDR00048669), or every time zero (ticket 2339's frames)
+
+    Nothing can show a gap, so nothing is excused. A wrong refusal is loud and
+    gets fixed; a missed defect is silent.
+    """
+
+    moves = [0.0, 4.0, 4.0, 20_000.0, 4.0, 4.0]
+
+    jumps, boundaries = s.find_jumps(moves, times, None)
+
+    assert jumps == [3]
+    assert boundaries == []
+
+
+# --------------------------------------------------
+def test_rounding_in_the_times_is_not_a_gap():
+    """float32 times drift in the last digits; 1% of the step is allowed"""
+
+    moves = [0.0] + [4.0] * 5
+    times = [0.0, 10.0004, 19.9996, 30.0003, 40.0, 49.9998]
+
+    _, boundaries = s.find_jumps(moves, times, None)
+
+    assert boundaries == []
+
+
+# --------------------------------------------------
+def test_the_limit_follows_each_frames_box():
+    moves = [0.0, 5196.0, 20_000.0]
+    times = [0.0, 1.0, 2.0]
+    diagonals = [5196.2, 5196.2, 5196.2]
+
+    jumps, _ = s.find_jumps(moves, times, diagonals)
+
+    assert jumps == [2]
+
+
+# --------------------------------------------------
+# The shapes that reached us, through screen()
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize(
+    "distance,source",
+    [
+        (15_425.0, "3fa3 Pro_lig30"),
+        (20_603.0, "1m0o Pro_lig9"),
+        (29_443.0, "4bzs Pro_lig25"),
+        (178_431.0, "6of5 Pro_lig18"),
+        (250_425.0, "6mlh Pro_lig33"),
+    ],
+)
+def test_ddd_damaged_last_frames_the_old_screen_missed(tmp_path, distance, source):
+    """
+    The five of the twelve that stay under 1e6 A
+
+    Median offsets as measured on 09-30. In each, the last frame moves the
+    first chain(s) by one vector and leaves their shape intact.
+    """
+
+    coords, lengths, angles = steady()
+    move_chain(coords, FRAMES - 1, distance)
+    assert np.abs(coords).max() < s.MAX_ABS_COORD
+
+    path = write_nc(tmp_path / "ddd.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None, source
+    assert "from the frame before" in problem
+    assert f"frames {FRAMES - 1}" in problem
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["xtc", "trr", "dcd"])
+def test_ddd_damaged_last_frame_is_caught_in_every_format(tmp_path, ext):
+    """A .mdc is decoded to XTC with no box before the screen sees it"""
+
+    coords, _, _ = steady()
+    move_chain(coords, FRAMES - 1, 250_425.0)
+    path = write_via_mdanalysis(tmp_path / f"ddd.{ext}", coords, no_box())
+
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "from the frame before" in problem
+    assert f"frames {FRAMES - 1}" in problem
+
+
+# --------------------------------------------------
+def test_a_damaged_middle_frame_names_the_step_in_and_the_step_out(tmp_path):
+    coords, lengths, angles = steady()
+    move_chain(coords, 3, 20_000.0)
+
+    path = write_nc(tmp_path / "middle.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "frames 3-4" in problem
+
+
+# --------------------------------------------------
+def test_a_damaged_first_frame_is_named_by_the_step_after_it(tmp_path):
+    """Frame 0 has no frame before it, so the jump shows at frame 1"""
+
+    coords, lengths, angles = steady()
+    move_chain(coords, 0, 20_000.0)
+
+    path = write_nc(tmp_path / "first.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "frames 1" in problem
+
+
+# --------------------------------------------------
+def test_a_jump_across_a_read_chunk_is_caught(tmp_path):
+    """
+    NetCDF is read CHUNK_FRAMES at a time
+
+    The last frame of one chunk has to be carried into the next, or a jump at
+    the first frame of a chunk is never compared with anything.
+    """
+
+    frames = s.CHUNK_FRAMES + 10
+    coords, lengths, angles = steady(frames=frames)
+    coords[s.CHUNK_FRAMES:, :CHAIN] += (direction() * 20_000.0).astype(np.float32)
+
+    path = write_nc(tmp_path / "chunk.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert f"frames {s.CHUNK_FRAMES}" in problem
+
+
+# --------------------------------------------------
+# Honest data that must still pass
+
+
+# --------------------------------------------------
+def test_the_healthy_fixture_still_passes(clean):
+    """
+    healthy() places atoms at random each frame, so they move up to ~139 A
+    between frames -- more than real data, and still far under the limit
+    """
+
+    assert s.screen(clean).problem is None
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc"])
+def test_a_wrapped_trajectory_passes(tmp_path, ext):
+    """
+    MDR00088497: OpenMM, not unwrapped, 158 A box
+
+    Every step some atom leaves one face and comes back through the opposite
+    one; across a corner that is a whole box diagonal, 273 A.
+    """
+
+    box = 158.0
+    coords, lengths, angles = steady(box=box)
+    for frame in range(1, FRAMES, 2):
+        coords[frame, 0] += box
+
+    if ext == "nc":
+        path = write_nc(tmp_path / "wrapped.nc", coords, lengths, angles)
+    else:
+        path = write_via_mdanalysis(
+            tmp_path / "wrapped.xtc", coords, boxes(FRAMES, lengths=(box, box, box))
+        )
+
+    assert s.screen(path).problem is None
+
+
+# --------------------------------------------------
+def test_an_unwrapped_trajectory_far_from_the_origin_passes(tmp_path):
+    """
+    Unwrapped water can drift thousands of angstroms over microseconds
+
+    Why the rule is a jump and not a lower absolute limit: these coordinates
+    pass 20,000 A, and each step moves only 5 A.
+    """
+
+    coords, lengths, angles = steady()
+    for frame in range(FRAMES):
+        coords[frame] += np.float32(19_990.0 + 5.0 * frame)
+
+    path = write_nc(tmp_path / "drift.nc", coords, lengths, angles)
+
+    assert s.screen(path).problem is None
+
+
+# --------------------------------------------------
+def test_a_huge_box_raises_the_limit(tmp_path):
+    """A wrap across a 3,000 A box is a 5,196 A move, over the 5,000 floor"""
+
+    box = 3000.0
+    coords, lengths, angles = steady(box=box)
+    coords[3, 0] += box
+
+    path = write_nc(tmp_path / "hugebox.nc", coords, lengths, angles)
+
+    assert s.screen(path).problem is None
+
+
+# --------------------------------------------------
+def test_a_huge_box_does_not_excuse_what_it_cannot_explain(tmp_path):
+    box = 3000.0
+    coords, lengths, angles = steady(box=box)
+    move_chain(coords, FRAMES - 1, 20_000.0)
+
+    path = write_nc(tmp_path / "hugebox-bad.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "from the frame before" in problem
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr"])
+@pytest.mark.parametrize(
+    "times",
+    [
+        [0.0, 10.0, 20.0, 5000.0, 5010.0, 5020.0],
+        [0.0, 10.0, 20.0, 0.0, 10.0, 20.0],
+    ],
+    ids=["gap", "clock-restart"],
+)
+def test_joined_runs_pass_and_the_note_says_so(tmp_path, ext, times):
+    """
+    Two runs in one file: between them the system can be anywhere
+
+    The second block is moved 20,000 A. The pass must be visible in the log,
+    so the note names the time segments the jump test did not cross.
+    """
+
+    coords, lengths, angles = steady()
+    coords[3:, :CHAIN] += (direction() * 20_000.0).astype(np.float32)
+
+    if ext == "nc":
+        path = write_nc(tmp_path / "joined.nc", coords, lengths, angles, times)
+    else:
+        path = write_via_mdanalysis(
+            tmp_path / f"joined.{ext}", coords, boxes(FRAMES), times
+        )
+
+    verdict = s.screen(path)
+
+    assert verdict.problem is None
+    assert "time segments" in verdict.note
+
+
+# --------------------------------------------------
+def test_dcd_cannot_carry_a_gap_so_its_jumps_are_refused(tmp_path):
+    """
+    DCD stores a start and an interval, never per-frame times
+
+    Whatever times the writer was given, every step reads back as regular.
+    """
+
+    coords, _, _ = steady()
+    coords[3:, :CHAIN] += (direction() * 20_000.0).astype(np.float32)
+    times = [0.0, 10.0, 20.0, 5000.0, 5010.0, 5020.0]
+    path = write_via_mdanalysis(tmp_path / "joined.dcd", coords, boxes(FRAMES), times)
+
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "frames 3" in problem
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize(
+    "times",
+    [
+        [0.0, 1.0, 2.0, 3.0, 4.0, 9.9e9],
+        [0.0, 1.0, 2.0, 3.0, 4.0, 0.0],
+    ],
+    ids=["garbage-time", "zero-time"],
+)
+def test_a_damaged_last_frame_with_a_damaged_time_is_still_caught(tmp_path, times):
+    coords, lengths, angles = steady()
+    move_chain(coords, FRAMES - 1, 250_425.0)
+
+    path = write_nc(tmp_path / "lasttime.nc", coords, lengths, angles, times)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert f"frames {FRAMES - 1}" in problem
+
+
+# --------------------------------------------------
+def test_no_time_variable_tests_every_step_and_says_so(tmp_path):
+    """
+    Contributor 289's MDR00048669 has no time variable at all
+
+    A clean file passes, with the note saying no time was available; a jump
+    anywhere is refused, because nothing can show it is a gap.
+    """
+
+    coords, lengths, angles = steady()
+    path = write_nc(tmp_path / "notime.nc", coords, lengths, angles, times=None)
+
+    verdict = s.screen(path)
+    assert verdict.problem is None
+    assert "no usable frame times" in verdict.note
+
+    coords[3:, :CHAIN] += (direction() * 20_000.0).astype(np.float32)
+    path = write_nc(tmp_path / "notime-jump.nc", coords, lengths, angles, times=None)
+
+    problem = s.screen(path).problem
+    assert problem is not None
+    assert "frames 3" in problem
+
+
+# --------------------------------------------------
+def test_mdr00072113_last_frame_is_caught_by_its_box(tmp_path):
+    """
+    Contributor 289, 215 frames: the last frame's box is 0,0,0 and 844 of 860
+    atoms moved ~173 A. Public since before the screen existed. The cell rule
+    catches it today; this pins it so the jump rule cannot be credited with
+    it, or break it.
+    """
+
+    coords, lengths, angles = steady(box=52.3)
+    coords[FRAMES - 1] += np.float32(100.0)
+    lengths[FRAMES - 1] = 0.0
+
+    path = write_nc(tmp_path / "72113.nc", coords, lengths, angles)
+    problem = s.screen(path).problem
+
+    assert problem is not None
+    assert "not a box" in problem
+    assert f"frames {FRAMES - 1}" in problem
