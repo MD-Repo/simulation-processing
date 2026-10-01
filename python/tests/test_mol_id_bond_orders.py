@@ -122,10 +122,10 @@ def test_a_thioacid_is_not_read_charge_separated():
     """Thioacetic acid, every hydrogen in place, its sulfur listed before its
     oxygen as a residue lists a cysteine's SG before an acyl's O. Given that
     order the valence search puts the double bond on sulfur,
-    C(=[SH+])[O-] -- a charge-separated form, refused -- and the acid read
-    from the geometry stands. The C-S is set to the 1.74 A of the palmitoyl
-    thioester this was found on, which a length check cannot refuse without
-    refusing strained double bonds too."""
+    C(=[SH+])[O-] -- a charge-separated form, refused -- and the second pass,
+    with the sulfur last, reads the acid. The C-S is set to the 1.74 A of the
+    palmitoyl thioester this was found on, which a length check cannot refuse
+    without refusing strained double bonds too."""
 
     from rdkit import Chem
     from rdkit.Chem import AllChem, rdMolTransforms
@@ -142,10 +142,43 @@ def test_a_thioacid_is_not_read_charge_separated():
     rdMolTransforms.SetBondLength(m.GetConformer(), 1, 2, 1.74)
     mol = _ob_from_pdb(Chem.MolToPDBBlock(m, flavor=2 | 8))
 
-    assert mol_id._bond_orders_from_hydrogens(mol) is None
+    got = mol_id._bond_orders_from_hydrogens(mol)
+
+    assert got is not None
     conv = ob.OBConversion()
     conv.SetOutFormat("can")
-    assert conv.WriteString(mol).split()[0] == "CC(=O)S"
+    assert conv.WriteString(got).split()[0] == "CC(=O)S"
+
+
+def test_a_thiazole_listed_sulfur_first_is_read_on_a_second_pass():
+    """Thiazole-4-carboxamide with its sulfur listed first. In that order
+    every charge the search tries gives a form the checks refuse; with the
+    sulfur listed last it gives the thiazole. The atoms come back in the
+    order they went in."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    m = Chem.AddHs(Chem.MolFromSmiles("NC(=O)c1cscn1"))
+    AllChem.EmbedMolecule(m, randomSeed=5)
+    AllChem.MMFFOptimizeMolecule(m)
+    heavy = sorted(
+        (a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() > 1),
+        key=lambda i: m.GetAtomWithIdx(i).GetAtomicNum() != 16,
+    )
+    hydrogens = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() == 1]
+    m = Chem.RenumberAtoms(m, heavy + hydrogens)
+    mol = _ob_from_pdb(Chem.MolToPDBBlock(m, flavor=2 | 8))
+
+    got = mol_id._bond_orders_from_hydrogens(mol)
+
+    assert got is not None
+    conv = ob.OBConversion()
+    conv.SetOutFormat("can")
+    assert conv.WriteString(got).split()[0] == "NC(=O)c1cscn1"
+    assert [a.GetAtomicNum() for a in ob.OBMolAtomIter(got)] == [
+        a.GetAtomicNum() for a in ob.OBMolAtomIter(mol)
+    ]
 
 
 def test_charmm_ions_are_background():

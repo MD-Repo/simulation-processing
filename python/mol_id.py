@@ -569,8 +569,13 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     out a +2 ion. A residue with no hydrogens at all is left to OpenBabel, as
     is one whose bond orders the search cannot settle within
     _MAX_BOND_ORDER_ITERATIONS.
+
+    The search depends on atom order. With a sulfur listed ahead of the atoms
+    that should carry the double bonds, it returns charge-separated forms --
+    a thiazole as C=[S+]...[O-] -- which the checks refuse; when every charge
+    has been refused, the search runs once more with the sulfurs listed last
+    (see _sulfur_last).
     """
-    from rdkit.Chem import rdDetermineBonds
     from rdkit.Geometry import Point3D
 
     atoms = list(ob.OBMolAtomIter(mol))
@@ -592,8 +597,32 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
         rw.AddBond(i, j, Chem.BondType.SINGLE)
     rw.AddConformer(conf, assignId=True)
 
+    orders = [None]
+    if (sulfur_last := _sulfur_last(rw)) is not None:
+        orders.append(sulfur_last)
+    for order in orders:
+        m = _settled_bond_orders(rw, stated, order)
+        if m is None:
+            continue
+        Chem.Kekulize(m, clearAromaticFlags=True)
+        conv = ob.OBConversion()
+        conv.SetInFormat("mol")
+        out = ob.OBMol()
+        if conv.ReadString(out, Chem.MolToMolBlock(m)):
+            return out
+    return None
+
+
+def _settled_bond_orders(rw, stated: int, order):
+    """The first bond-order assignment for `rw` that holds, trying the stated
+    charge and then one either side, with its atoms in `order` while RDKit
+    searches (None for their own order) and in their own order after."""
+    from rdkit.Chem import rdDetermineBonds
+
     for charge in (stated, stated - 1, stated + 1):
         m = Chem.Mol(rw)
+        if order is not None:
+            m = Chem.RenumberAtoms(m, order)
         try:
             rdDetermineBonds.DetermineBondOrders(
                 m, charge=charge, maxIterations=_MAX_BOND_ORDER_ITERATIONS
@@ -605,14 +634,34 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
             continue
         if not _multiple_bonds_are_short(m):
             continue
-
-        Chem.Kekulize(m, clearAromaticFlags=True)
-        conv = ob.OBConversion()
-        conv.SetInFormat("mol")
-        out = ob.OBMol()
-        if conv.ReadString(out, Chem.MolToMolBlock(m)):
-            return out
+        if order is not None:
+            back = [0] * len(order)
+            for new, old in enumerate(order):
+                back[old] = new
+            m = Chem.RenumberAtoms(m, back)
+        return m
     return None
+
+
+def _sulfur_last(m) -> Optional[list]:
+    """
+    An atom order with every sulfur after every other atom, or None when that
+    is the order already.
+
+    DetermineBondOrders depends on atom order. Given a sulfur ahead of the
+    atoms that should take the double bonds, it puts one on the sulfur and
+    balances it with charges elsewhere: seven thiazole-bearing ligands in the
+    processed corpus came out in charge-separated forms with a C=[S+], all
+    refused by _implausible, so OpenBabel's reading stood: a nitro group
+    RDKit rejects, or a thiazole given hydrogens it does not have. With the
+    sulfurs last the same search finds the thiazole -- dasatinib with its
+    piperazine protonated, an aminothiazole with its nitro group as
+    [N+](=O)[O-].
+    """
+    sulfur = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() == 16]
+    rest = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() != 16]
+    order = rest + sulfur
+    return None if order == list(range(m.GetNumAtoms())) else order
 
 
 def _implausible(atom) -> bool:
