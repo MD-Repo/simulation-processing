@@ -464,6 +464,9 @@ _BACKBONE_LINKS = (
 # A peptide C-N is 1.33 A and a phosphodiester P-O3' 1.61 A; the same atoms
 # unbonded do not come within 2.5 A.
 _LINK_CUTOFF = 1.9
+# Atoms per block of the backbone-link search, which computes every distance
+# (see _backbone_links): a block of 1,024 against 20,000 partners is 160 MB.
+_LINK_SEARCH_BLOCK = 1024
 
 
 def _polymer_residues(universe, resnames) -> set:
@@ -561,21 +564,32 @@ def _backbone_links(universe) -> set:
     box = universe.dimensions
     if box is None or not np.all(box[:3] > 0):
         box = None
+    # Every distance, block by block. In a triclinic box MDAnalysis 2.10's
+    # nsgrid and pkdtree searches both drop pairs well inside the cutoff:
+    # MDR00020894, two RNA strands in a truncated octahedron, lost 7 of its
+    # 335 backbone links to nsgrid, among them the O3'-P bond (1.56 A) of a
+    # strand's first residue (G5), which was then reported as a ligand.
+    # Bonded pairs placed at random outside such a cell are missed at about 2%
+    # by nsgrid and 1% by pkdtree, wrapped into the cell or not; in a cubic
+    # box, and with bruteforce in any box, none are.
     for own, other in _BACKBONE_LINKS:
         a = atoms[names == own]
         b = atoms[names == other]
         if len(a) == 0 or len(b) == 0:
             continue
-        pairs = capped_distance(
-            a.positions,
-            b.positions,
-            _LINK_CUTOFF,
-            box=box,
-            return_distances=False,
-        )
-        for i, j in pairs:
-            if a[i].resindex != b[j].resindex:
-                edges.add((int(a[i].resindex), int(b[j].resindex)))
+        for start in range(0, len(a), _LINK_SEARCH_BLOCK):
+            block = a[start : start + _LINK_SEARCH_BLOCK]
+            pairs = capped_distance(
+                block.positions,
+                b.positions,
+                _LINK_CUTOFF,
+                box=box,
+                method="bruteforce",
+                return_distances=False,
+            )
+            for i, j in pairs:
+                if block[i].resindex != b[j].resindex:
+                    edges.add((int(block[i].resindex), int(b[j].resindex)))
     return edges
 
 

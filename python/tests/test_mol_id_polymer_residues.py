@@ -313,3 +313,36 @@ def test_notes_reach_stderr_for_mdr_process():
         f"{mol_id.NOTE_MARKER}Residue CGU 6 is joined into a polymer chain"
         in out.stderr
     )
+
+
+def test_backbone_links_are_all_found_in_a_triclinic_box():
+    """A 100-residue chain, each residue's C bonded to the next one's N at
+    1.33 A, outside the primary cell of a truncated octahedron. MDAnalysis
+    2.10's default nsgrid search, given every N and every C at once, misses
+    three of the 99 bonds in this layout; MDR00020894's RNA lost the O3'-P
+    bond of a strand's first residue the same way, and the residue was
+    reported as a ligand."""
+
+    n = 100
+    rng = np.random.default_rng(1)
+    positions, here = [], np.array([-30.0, -40.0, -70.0])
+    for k in range(n):
+        step = rng.normal(size=3)
+        n_atom = here + 1.33 * step / np.linalg.norm(step) if k else here
+        step = rng.normal(size=3)
+        here = n_atom + 2.45 * step / np.linalg.norm(step)
+        positions += [n_atom, here]
+
+    u = mda.Universe.empty(
+        2 * n, n_residues=n, atom_resindex=np.repeat(np.arange(n), 2), trajectory=True
+    )
+    u.add_TopologyAttr("names", ["N", "C"] * n)
+    u.add_TopologyAttr("resnames", ["XAA"] * n)
+    u.add_TopologyAttr("resids", np.arange(1, n + 1))
+    u.atoms.positions = np.array(positions, dtype=np.float32)
+    u.dimensions = [97.16, 97.16, 97.16, 109.47, 109.47, 109.47]
+
+    edges = mol_id._backbone_links(u)
+
+    missing = [k for k in range(n - 1) if (k + 1, k) not in edges]
+    assert missing == []
