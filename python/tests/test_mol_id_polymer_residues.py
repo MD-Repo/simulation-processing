@@ -129,3 +129,220 @@ def test_a_palmitoyl_on_a_cysteine_is_reported_as_palmitic_acid():
     assert [g["resname"] for g in got] == ["CYP"]
     assert got[0]["smiles"] == "CCCCCCCCCCCCCCCC(=O)O"
     assert got[0]["cut_from"] == "CYP SG"
+
+
+def _modified_peptide(tmp_path, middle, resname, join, group, double=False):
+    """Ala-X-Ala with `group` (SMILES, its first atom bonded to `join`) on
+    the middle residue's side chain, the whole residue named `resname`,
+    embedded with every hydrogen and written without CONECT records, as the
+    pipeline's minimal.pdb is."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    rw = Chem.RWMol(Chem.MolFromSequence(f"A{middle}A"))
+    at = None
+    for a in rw.GetAtoms():
+        info = a.GetPDBResidueInfo()
+        if info.GetResidueNumber() == 2:
+            info.SetResidueName(resname)
+            if info.GetName().strip() == join:
+                at = a.GetIdx()
+    grp = Chem.MolFromSmiles(group)
+    first = rw.GetNumAtoms()
+    for k, a in enumerate(grp.GetAtoms()):
+        i = rw.AddAtom(Chem.Atom(a.GetAtomicNum()))
+        rw.GetAtomWithIdx(i).SetMonomerInfo(
+            Chem.AtomPDBResidueInfo(
+                f" {a.GetSymbol()}X{k}"[:4].ljust(4),
+                residueName=resname,
+                residueNumber=2,
+                chainId="A",
+                isHeteroAtom=True,
+            )
+        )
+    for b in grp.GetBonds():
+        rw.AddBond(
+            b.GetBeginAtomIdx() + first,
+            b.GetEndAtomIdx() + first,
+            b.GetBondType(),
+        )
+    rw.AddBond(
+        at, first, Chem.BondType.DOUBLE if double else Chem.BondType.SINGLE
+    )
+    m = rw.GetMol()
+    Chem.SanitizeMol(m)
+    m = Chem.AddHs(m, addCoords=False, addResidueInfo=True)
+    # Each residue's atoms together, or MDAnalysis splits the residue.
+    order = sorted(
+        range(m.GetNumAtoms()),
+        key=lambda i: (
+            m.GetAtomWithIdx(i).GetPDBResidueInfo().GetResidueNumber(),
+            i,
+        ),
+    )
+    m = Chem.RenumberAtoms(m, order)
+    assert AllChem.EmbedMolecule(m, randomSeed=11) == 0
+    AllChem.MMFFOptimizeMolecule(m)
+    p = tmp_path / f"{resname}.pdb"
+    p.write_text(Chem.MolToPDBBlock(m, flavor=2))
+    return str(p)
+
+
+def test_conect_records_for_the_ligand_alone_still_find_the_peptide_bonds(
+    tmp_path,
+):
+    """The Gla fixture with CONECT records for vorapaxar only, as a file
+    written by a tool that bonds HETATM residues alone. Stated bonds used to
+    turn the distance check off, so the CGU were never linked; and asked of
+    CGU alone, the answer differed from asked of every candidate."""
+
+    lines = GLA.read_text().splitlines()
+    u = _universe(GLA)
+    vpx = u.select_atoms("resname VPX")
+    heavy = np.array([not n.startswith("H") for n in vpx.names])
+    d = np.linalg.norm(vpx.positions[:, None] - vpx.positions[None], axis=-1)
+    cut = np.where(heavy[:, None] & heavy[None], 1.9, 1.25)
+    conect = [
+        f"CONECT{vpx[i].id:5d}{vpx[j].id:5d}"
+        for i, j in zip(*np.nonzero(np.triu((d < cut) & (d > 0))))
+    ]
+    end = next(k for k, l in enumerate(lines) if l.startswith("END"))
+    path = tmp_path / "gla_conect.pdb"
+    path.write_text("\n".join(lines[:end] + conect + lines[end:]) + "\n")
+    u = _universe(path)
+    assert len(u.atoms.bonds) == len(conect)
+
+    assert set(mol_id.find_ligand_resnames(u)) == {"VPX"}
+    cgu = mol_id._polymer_residues(u, {"CGU"})
+    assert len(cgu) == 2
+    assert cgu <= mol_id._polymer_residues(u, {"CGU", "VPX"})
+
+
+def test_a_ligand_that_is_a_chain_of_nonstandard_residues_stays(tmp_path):
+    """Three nonstandard residues peptide-bonded to each other and to no
+    standard residue, as cyclosporin's are: a ligand, not a chain's
+    residues. It used to vanish, leaving "No ligand-like residue found"."""
+
+    path = _pdb(
+        tmp_path,
+        [
+            ("MLE", 1, "N", "N", 0.000, 0.000, 0.000),
+            ("MLE", 1, "CA", "C", 1.460, 0.000, 0.000),
+            ("MLE", 1, "C", "C", 2.000, 1.420, 0.000),
+            ("MVA", 2, "N", "N", 3.330, 1.420, 0.000),
+            ("MVA", 2, "CA", "C", 3.870, 2.840, 0.000),
+            ("MVA", 2, "C", "C", 5.330, 2.840, 0.000),
+            ("SAR", 3, "N", "N", 5.870, 4.260, 0.000),
+            ("SAR", 3, "CA", "C", 7.330, 4.260, 0.000),
+            ("SAR", 3, "C", "C", 7.870, 5.680, 0.000),
+        ],
+    )
+
+    u = _universe(path)
+    assert mol_id._polymer_residues(u, {"MLE", "MVA", "SAR"}) == set()
+    assert set(mol_id.find_ligand_resnames(u)) == {"MLE", "MVA", "SAR"}
+
+
+def test_a_thioether_is_not_released_as_an_alcohol(tmp_path):
+    """Farnesyl on a cysteine's SG by a thioether. Hydrolysis does not break
+    that bond; read as released, it would be farnesol, which no one put
+    there. Not recorded as a ligand, and said."""
+
+    path = _modified_peptide(
+        tmp_path, "C", "CYF", "SG", "CC=C(C)CCC=C(C)CCC=C(C)C"
+    )
+    notes = []
+
+    assert mol_id.find_ligand_resnames(_universe(path), notes) == {}
+    assert len(notes) == 1
+    assert "15 heavy atoms covalently bound at CYF SG" in notes[0]
+    assert "not one that hydrolysis would break" in notes[0]
+
+
+def test_biotin_on_a_lysine_is_released_by_its_amide(tmp_path):
+    """Biocytin: biotin's carboxyl as an amide on a lysine's NZ. Hydrolysed,
+    that is biotin."""
+
+    path = _modified_peptide(
+        tmp_path,
+        "K",
+        "BTK",
+        "NZ",
+        "C(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12",
+    )
+    notes = []
+    got = mol_id.structure_to_smiles(path, notes=notes)
+
+    assert [g["resname"] for g in got] == ["BTK"]
+    assert got[0]["formula"] == "C10H16N2O3S"
+    assert got[0]["cut_from"] == "BTK NZ"
+    assert any("C10H16N2O3S was found covalently bound" in n for n in notes)
+
+
+def test_a_small_modification_genetically_encoded_is_the_residue_own(
+    tmp_path,
+):
+    """Pyrrolysine's methylpyrroline-carbonyl, 8 heavy atoms on NZ: an amino
+    acid of the genetic code, not a ligand on a lysine. Passed over, and
+    said."""
+
+    path = _modified_peptide(tmp_path, "K", "PYL", "NZ", "C(=O)C1N=CCC1C")
+    notes = []
+
+    assert mol_id.find_ligand_resnames(_universe(path), notes) == {}
+    assert notes == [
+        "Residue PYL 2 is joined into a polymer chain, so it was not taken "
+        "for a ligand."
+    ]
+
+
+def test_notes_reach_stderr_for_mdr_process():
+    """mdr-process reads each note from a "[mdrepo] note=" line on stderr."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "mol_id.py", "smiles-from-structure", str(GLA)],
+        capture_output=True,
+        text=True,
+        cwd=pathlib.Path(mol_id.__file__).parent,
+    )
+
+    assert out.returncode == 0, out.stderr
+    assert (
+        f"{mol_id.NOTE_MARKER}Residue CGU 6 is joined into a polymer chain"
+        in out.stderr
+    )
+
+
+def test_backbone_links_are_all_found_in_a_triclinic_box():
+    """A 100-residue chain, each residue's C bonded to the next one's N at
+    1.33 A, outside the primary cell of a truncated octahedron. MDAnalysis
+    2.10's default nsgrid search, given every N and every C at once, misses
+    three of the 99 bonds in this layout; MDR00020894's RNA lost the O3'-P
+    bond of a strand's first residue the same way, and the residue was
+    reported as a ligand."""
+
+    n = 100
+    rng = np.random.default_rng(1)
+    positions, here = [], np.array([-30.0, -40.0, -70.0])
+    for k in range(n):
+        step = rng.normal(size=3)
+        n_atom = here + 1.33 * step / np.linalg.norm(step) if k else here
+        step = rng.normal(size=3)
+        here = n_atom + 2.45 * step / np.linalg.norm(step)
+        positions += [n_atom, here]
+
+    u = mda.Universe.empty(
+        2 * n, n_residues=n, atom_resindex=np.repeat(np.arange(n), 2), trajectory=True
+    )
+    u.add_TopologyAttr("names", ["N", "C"] * n)
+    u.add_TopologyAttr("resnames", ["XAA"] * n)
+    u.add_TopologyAttr("resids", np.arange(1, n + 1))
+    u.atoms.positions = np.array(positions, dtype=np.float32)
+    u.dimensions = [97.16, 97.16, 97.16, 109.47, 109.47, 109.47]
+
+    edges = mol_id._backbone_links(u)
+
+    missing = [k for k in range(n - 1) if (k + 1, k) not in edges]
+    assert missing == []

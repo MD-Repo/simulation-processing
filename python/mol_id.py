@@ -45,7 +45,7 @@ import textwrap
 import time
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import warnings
 
@@ -392,12 +392,13 @@ def load_universe(path: str, fmt: Optional[str] = None):
         return mda.Universe(path)
 
 
-def find_ligand_resnames(universe) -> dict:
+def find_ligand_resnames(universe, notes: Optional[list] = None) -> dict:
     """{resname: atom_count} for non-background residues in a Universe.
 
     A residue name is background by the lists above, or when every residue of
     that name is joined into a polymer (see _polymer_residues) and carries no
-    molecule attached to it (see _attached_group).
+    molecule attached to it that can be released (see _attached_group). Each
+    name passed over that way is said in `notes`, for the submitter.
     """
     counts: dict = {}
     if not hasattr(universe.atoms, "resnames"):
@@ -410,12 +411,44 @@ def find_ligand_resnames(universe) -> dict:
     linked = _polymer_residues(universe, counts)
     for n in list(counts):
         residues = universe.residues[universe.residues.resnames == n]
-        if len(residues) and all(r.resindex in linked for r in residues):
-            if not _has_coords(residues[0].atoms) or not _attached_group(
-                residues[0].atoms
-            ):
-                del counts[n]
+        if not (len(residues) and all(r.resindex in linked for r in residues)):
+            continue
+        first = residues[0]
+        where = f"{n} {first.resid}"
+        if not _has_coords(first.atoms):
+            del counts[n]
+            _note(
+                notes,
+                f"Residue {where} is joined into a polymer chain, so it was "
+                f"not taken for a ligand; with no coordinates, a molecule "
+                f"bonded to its side chain could not be looked for.",
+            )
+            continue
+        attached = _attached_group(first.atoms)
+        if attached is None:
+            del counts[n]
+            _note(
+                notes,
+                f"Residue {where} is joined into a polymer chain, so it was "
+                f"not taken for a ligand.",
+            )
+        elif attached.mol is None:
+            del counts[n]
+            _note(
+                notes,
+                f"Residue {where} carries a group of {attached.num_heavy} "
+                f"heavy atoms covalently bound at {n} {attached.join}, which "
+                f"was not recorded as a ligand: the bond is not one that "
+                f"hydrolysis would break, so the molecule it came from is not "
+                f"known. Declare the ligand in the metadata if it is one.",
+            )
     return counts
+
+
+def _note(notes: Optional[list], text: str) -> None:
+    """Add `text` to `notes`, once."""
+    if notes is not None and text not in notes:
+        notes.append(text)
 
 
 # Atom-name pairs that join a residue into a polymer, the residue's own atom
@@ -431,13 +464,16 @@ _BACKBONE_LINKS = (
 # A peptide C-N is 1.33 A and a phosphodiester P-O3' 1.61 A; the same atoms
 # unbonded do not come within 2.5 A.
 _LINK_CUTOFF = 1.9
+# Atoms per block of the backbone-link search, which computes every distance
+# (see _backbone_links): a block of 1,024 against 20,000 partners is 160 MB.
+_LINK_SEARCH_BLOCK = 1024
 
 
 def _polymer_residues(universe, resnames) -> set:
     """
-    Resindices of the residues named in `resnames` that are joined to another
-    residue by a peptide or phosphodiester bond: residues of a chain, not
-    molecules beside it.
+    Resindices of the residues named in `resnames` that are joined by a
+    peptide or phosphodiester bond into a chain holding at least one standard
+    amino acid or nucleotide: residues of a polymer, not molecules beside it.
 
     A ligand is chosen by elimination, and the lists of standard residues can
     never name every residue a chain may hold. The Gla domain of a
@@ -452,61 +488,113 @@ def _polymer_residues(universe, resnames) -> set:
     What makes a residue part of a chain is its backbone bond, whatever its
     name. A ligand bonded to the protein through a side chain -- a covalent
     inhibitor on a cysteine's sulfur or a lysine's NZ -- is not joined this
-    way and stays a ligand. Bonds come from the topology when it states them,
-    else from distances in the frame; with neither, nothing is excluded.
+    way and stays a ligand. So does a ligand that is itself a chain of
+    nonstandard residues, cyclosporin's for one, bonded to no standard
+    residue. Bonds come from the topology where it states them and from
+    distances in the frame, both: a file whose CONECT records cover only its
+    ligand still has its peptide bonds found. With neither, nothing is
+    excluded. The answer for a residue does not depend on which other names
+    are asked about.
     """
-    names = set(resnames)
+    names = {str(n) for n in resnames}
     atoms = universe.atoms
-    mine = atoms[np.isin(atoms.resnames.astype(str), list(names))]
-    linked: set = set()
-    if len(mine) == 0:
-        return linked
+    if (
+        not len(atoms)
+        or not np.isin(atoms.resnames.astype(str), list(names)).any()
+    ):
+        return set()
+
+    edges = _backbone_links(universe)
+    parent: dict = {}
+
+    def find(r):
+        while parent.setdefault(r, r) != r:
+            parent[r] = parent[parent[r]]
+            r = parent[r]
+        return r
+
+    for x, y in edges:
+        parent[find(x)] = find(y)
+
+    resnames_by_ix = universe.residues.resnames.astype(str)
+    anchored = {
+        find(r)
+        for r in list(parent)
+        if resnames_by_ix[r] in _AMINO_ACIDS
+        or resnames_by_ix[r] in _NUCLEOTIDES
+    }
+    return {
+        int(r)
+        for r in list(parent)
+        if resnames_by_ix[r] in names and find(r) in anchored
+    }
+
+
+def _backbone_links(universe) -> set:
+    """(resindex, resindex) for each backbone bond between two residues, from
+    the topology's stated bonds and from distances in the frame."""
+    atoms = universe.atoms
+    names = atoms.names.astype(str)
+    resix = atoms.resindices
+    edges: set = set()
 
     try:
-        bonds = mine.bonds
+        bonded = atoms.bonds.indices if len(atoms.bonds) else None
     except (mda.exceptions.NoDataError, AttributeError):
-        bonds = None
-    if bonds is not None and len(bonds):
-        for bond in bonds:
-            a, b = bond.atoms
-            for x, y in ((a, b), (b, a)):
-                if (
-                    str(x.resname) in names
-                    and x.resindex != y.resindex
-                    and (x.name, y.name) in _BACKBONE_LINKS
-                ):
-                    linked.add(int(x.resindex))
-        return linked
+        bonded = None
+    if bonded is not None:
+        i, j = bonded[:, 0], bonded[:, 1]
+        for own, other in _BACKBONE_LINKS:
+            for a, b in ((i, j), (j, i)):
+                hit = (
+                    (names[a] == own)
+                    & (names[b] == other)
+                    & (resix[a] != resix[b])
+                )
+                edges.update(
+                    zip(resix[a[hit]].tolist(), resix[b[hit]].tolist())
+                )
 
     try:
         atoms.positions
     except (mda.exceptions.NoDataError, AttributeError):
-        return linked
+        return edges
     from MDAnalysis.lib.distances import capped_distance
 
     box = universe.dimensions
     if box is None or not np.all(box[:3] > 0):
         box = None
+    # Every distance, block by block. In a triclinic box MDAnalysis 2.10's
+    # nsgrid and pkdtree searches both drop pairs well inside the cutoff:
+    # MDR00020894, two RNA strands in a truncated octahedron, lost 7 of its
+    # 335 backbone links to nsgrid, among them the O3'-P bond (1.56 A) of a
+    # strand's first residue (G5), which was then reported as a ligand.
+    # Bonded pairs placed at random outside such a cell are missed at about 2%
+    # by nsgrid and 1% by pkdtree, wrapped into the cell or not; in a cubic
+    # box, and with bruteforce in any box, none are.
     for own, other in _BACKBONE_LINKS:
-        a = mine[mine.names == own]
-        b = atoms[atoms.names == other]
+        a = atoms[names == own]
+        b = atoms[names == other]
         if len(a) == 0 or len(b) == 0:
             continue
-        pairs = capped_distance(
-            a.positions,
-            b.positions,
-            _LINK_CUTOFF,
-            box=box,
-            return_distances=False,
-        )
-        for i, j in pairs:
-            if a[i].resindex != b[j].resindex:
-                linked.add(int(a[i].resindex))
-    return linked
+        for start in range(0, len(a), _LINK_SEARCH_BLOCK):
+            block = a[start : start + _LINK_SEARCH_BLOCK]
+            pairs = capped_distance(
+                block.positions,
+                b.positions,
+                _LINK_CUTOFF,
+                box=box,
+                method="bruteforce",
+                return_distances=False,
+            )
+            for i, j in pairs:
+                if block[i].resindex != b[j].resindex:
+                    edges.add((int(block[i].resindex), int(b[j].resindex)))
+    return edges
 
 
 def resolve_target_resnames(
-    universe, path: str, resname: Optional[str]
+    universe, path: str, resname: Optional[str], notes: Optional[list] = None
 ) -> list:
     """
     Decide which residue name(s) to extract from a Universe.
@@ -527,7 +615,7 @@ def resolve_target_resnames(
     if resname is not None and resname in present:
         return [resname]
 
-    candidates = find_ligand_resnames(universe)
+    candidates = find_ligand_resnames(universe, notes)
     if resname is not None and not candidates:
         raise ValueError(
             f"No atoms with residue name '{resname}' in {path}, and no "
@@ -637,16 +725,30 @@ def _read_coords(sel):
 _BACKBONE_ATOMS = frozenset({"N", "CA", "C", "O", "OXT", "OT1", "OT2"})
 # N, O, S, Se: where an amino acid's side chain can be joined to something.
 _SIDE_CHAIN_HETEROATOMS = frozenset({7, 8, 16, 34})
-# An attached group this size or larger is reported. Smaller ones -- a
-# phosphate, an acetyl, a methyl, a guanidino, gamma-carboxyglutamate's second
-# carboxylate -- are the residue's own modification, not a molecule on it.
-_MIN_ATTACHED_HEAVY_ATOMS = 6
+# An attached group this size or larger is a molecule on the residue: retinal
+# (20 heavy atoms past the lysine's NZ), PLP (15), biotin (15), farnesyl and
+# myristoyl (15), lipoyl (11), palmitoyl (17). Smaller ones are the residue's
+# own modification: a phosphate, an acetyl, a methyl, a guanidino,
+# gamma-carboxyglutamate's second carboxylate, and the two residues the
+# genetic code itself carries on a lysine, hypusine's aminohydroxybutyl (6)
+# and pyrrolysine's methylpyrroline-carbonyl (8).
+_MIN_ATTACHED_HEAVY_ATOMS = 10
+
+
+class _Attached(NamedTuple):
+    """A group found on a chain residue's side chain. `mol` is the molecule
+    released from it, or None when the bond is not one hydrolysis breaks."""
+
+    mol: Optional["ob.OBMol"]
+    join: str
+    num_heavy: int
 
 
 def _attached_group(sel):
     """
     A molecule attached to a chain residue through its side chain, as the
-    molecule free of it, with the side-chain atom's name, or None.
+    molecule free of it, with the side-chain atom's name, or None when the
+    residue carries none.
 
     Some residues of a chain carry a molecule bonded to them: rhodopsin's
     retinal on a lysine (LYR), a palmitoyl on a cysteine (CYSP). The residue is
@@ -662,7 +764,13 @@ def _attached_group(sel):
     reported as released from the residue by hydrolysis: the side-chain atom
     becomes an oxygen with the same bond to the group. A retinal Schiff base
     (C=NZ) gives retinal (C=O); a palmitoyl thioester (C(=O)-SG) gives
-    palmitic acid.
+    palmitic acid; biotin's amide on NZ gives biotin.
+
+    That holds only for a bond hydrolysis breaks: a double bond to the
+    side-chain atom (an imine), or a single one to an acyl carbon (a
+    thioester, ester or amide). A group joined any other way -- a thioether
+    like farnesyl's, a Michael adduct on a cysteine -- would come back
+    hydroxylated, a molecule no one put there, so its `mol` is None.
     """
     names = [str(n) for n in sel.names]
     if "CA" not in names:
@@ -729,7 +837,7 @@ def _attached_group(sel):
         if not heavy[i]
         and any((n.GetIdx() - 1) in keep for n in ob.OBAtomAtomIter(a))
     }
-    xa = gat[x]
+    xa, ya = gat[x], gat[y]
     for w in adj[x]:
         if w in group:
             continue
@@ -742,9 +850,11 @@ def _attached_group(sel):
         g.AddBond(xa.GetIdx(), h.GetIdx(), 1)
     for i in sorted(set(range(len(gat))) - keep, reverse=True):
         g.DeleteAtom(gat[i])
-    xi = xa.GetIdx()
+    xi, yi = xa.GetIdx(), ya.GetIdx()
 
     settled = _bond_orders_from_hydrogens(g) or g
+    if not _hydrolysable(settled, xi, yi):
+        return _Attached(None, names[x], len(group))
     xs = settled.GetAtom(xi)
     for h in [n for n in ob.OBAtomAtomIter(xs) if n.GetAtomicNum() == 1]:
         settled.DeleteAtom(h)
@@ -752,7 +862,24 @@ def _attached_group(sel):
     xs.SetAtomicNum(8)
     xs.SetFormalCharge(0)
     ob.OBAtomAssignTypicalImplicitHydrogens(xs)
-    return settled, names[x]
+    return _Attached(settled, names[x], len(group))
+
+
+def _hydrolysable(mol, xi: int, yi: int) -> bool:
+    """Whether the bond from side-chain atom `xi` to the group's atom `yi`
+    (OpenBabel indices) is one hydrolysis breaks: double (an imine), or single
+    to a carbon double-bonded to an O, S or N (an acyl)."""
+    x, y = mol.GetAtom(xi), mol.GetAtom(yi)
+    bond = mol.GetBond(x, y)
+    if bond is None:
+        return False
+    if bond.GetBondOrder() == 2:
+        return True
+    return y.GetAtomicNum() == 6 and any(
+        b.GetBondOrder() == 2 and b.GetNbrAtom(y).GetAtomicNum() in (7, 8, 16)
+        for b in ob.OBAtomBondIter(y)
+        if b.GetNbrAtom(y).GetIdx() != xi
+    )
 
 
 # A double or triple bond the hydrogens call for must be shorter in the frame
@@ -917,7 +1044,9 @@ def _smiles_from_topology(sel) -> dict:
     return _mol_summary(mol)
 
 
-def universe_to_smiles(universe, resname: str) -> dict:
+def universe_to_smiles(
+    universe, resname: str, notes: Optional[list] = None
+) -> dict:
     """
     Extract atoms with `resname` from `universe` and return canonical SMILES
     plus summary. Dispatches to a coordinate-aware path when possible (which
@@ -949,10 +1078,16 @@ def universe_to_smiles(universe, resname: str) -> dict:
     # A chain residue is read for the molecule attached to it, where one is.
     if has_coords and int(unique_resix[0]) in linked:
         attached = _attached_group(sel)
-        if attached is not None:
-            mol, join = attached
-            result = _mol_summary(mol)
-            result["cut_from"] = f"{resname} {join}"
+        if attached is not None and attached.mol is not None:
+            result = _mol_summary(attached.mol)
+            result["cut_from"] = f"{resname} {attached.join}"
+            _note(
+                notes,
+                f"The ligand {result['formula']} was found covalently bound "
+                f"to residue {resname} {sel.residues[0].resid} at "
+                f"{attached.join}, part of a polymer chain. It is recorded as "
+                f"the molecule hydrolysis would release, not as bound.",
+            )
             return result
 
     return (
@@ -972,6 +1107,7 @@ def structure_to_smiles(
     path: str,
     fmt: Optional[str] = None,
     resname: Optional[str] = None,
+    notes: Optional[list] = None,
 ) -> list:
     """
     Universal pipeline: load any MDAnalysis-supported file (PDB, GRO, GROMACS
@@ -983,12 +1119,15 @@ def structure_to_smiles(
     fallback for binary inputs). If `resname` is None, every non-background
     residue is processed; if given, only that residue is processed (with a
     fallback to all non-background residues if it isn't present in the file).
+
+    What the submitter should hear of -- a residue passed over as part of a
+    chain, a ligand cut from one -- is added to `notes`.
     """
     universe = load_universe(path, fmt)
-    target_resnames = resolve_target_resnames(universe, path, resname)
+    target_resnames = resolve_target_resnames(universe, path, resname, notes)
     results = []
     for rn in target_resnames:
-        result = universe_to_smiles(universe, rn)
+        result = universe_to_smiles(universe, rn, notes)
         result["resname"] = rn
         results.append(result)
     return results
@@ -1425,10 +1564,23 @@ def main():
     _add_verbose_arg(p3)
 
     args = parser.parse_args()
+    notes: list = []
+    try:
+        _run(args, notes)
+    finally:
+        # One line each on stderr, for mdr-process to pass on as warnings.
+        for note in notes:
+            print(f"{NOTE_MARKER}{note}", file=sys.stderr)
 
+
+# The prefix of each note's line on stderr. mdr-process reads it.
+NOTE_MARKER = "[mdrepo] note="
+
+
+def _run(args, notes: list) -> None:
     if args.command == "smiles-from-structure":
         results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname
+            args.path, fmt=args.fmt, resname=args.resname, notes=notes
         )
         if args.verbose:
             print(json.dumps(results, indent=2))
@@ -1444,7 +1596,7 @@ def main():
 
     elif args.command == "both":
         struct_results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname
+            args.path, fmt=args.fmt, resname=args.resname, notes=notes
         )
         combined = [
             {"structure": sr, "name": smiles_to_name(sr["smiles"])}
