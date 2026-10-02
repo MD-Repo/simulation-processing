@@ -536,6 +536,17 @@ def _smiles_from_coords(sel) -> dict:
 # readings to refuse that one.
 _MULTIPLE_BOND_MARGIN = 0.05
 
+# A residue with explicit polar hydrogens but united-atom CH groups lets the
+# search make up the missing hydrogens with bond orders, and in a ring or a
+# vinyl group, already short, the margin above passes them: hydroquinone with
+# its ring CH united came back OC1=C=C=C(O)C#C1, every ring bond ~1.40 A.
+# What it forces is always a triple bond or a carbon with two double bonds,
+# and a real one is far shorter than a single bond: C#C 1.20 A and C#N 1.16
+# under sums of 1.52 and 1.47, an allene's or a ketene's C=C 1.31. These must
+# be under a single bond by this much.
+_TRIPLE_BOND_MARGIN = 0.25
+_CUMULATED_BOND_MARGIN = 0.20
+
 # The search for bond orders is exponential in the atoms whose valence it can
 # choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
 # phosphate oxygen a candidate for the double bond or the charge -- never
@@ -562,9 +573,11 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     and OpenBabel's reading stands -- when it leaves a radical, charges a
     carbon, charges an oxygen positively, charges any atom by more than one,
     or calls a bond double or triple that the frame holds at single-bond
-    length outside an aromatic ring. Those are what a residue with an open
-    valence is otherwise forced into: a united-atom residue, whose carbons
-    carry their hydrogens implicitly, or a residue cut from a polymer, whose
+    length outside an aromatic ring, or a bond triple or cumulated that the
+    frame holds at double- or aromatic-bond length. Those are what a residue
+    with an open valence is otherwise forced into: a united-atom residue,
+    whose carbons carry their hydrogens implicitly (all of them, or beside
+    explicit polar hydrogens), or a residue cut from a polymer, whose
     backbone carbonyl read as an acylium (C#[O+]) and whose pyroglutamate came
     out a +2 ion. A residue with no hydrogens at all is left to OpenBabel, as
     is one whose bond orders the search cannot settle within
@@ -689,9 +702,21 @@ def _implausible(atom) -> bool:
 
 def _multiple_bonds_are_short(m) -> bool:
     """Whether every double or triple bond of `m` outside an aromatic ring is
-    shorter in its conformer than a single bond between the same elements."""
+    shorter in its conformer than a single bond between the same elements: by
+    _TRIPLE_BOND_MARGIN for a triple bond, _CUMULATED_BOND_MARGIN for a double
+    bond on a carbon with two, and _MULTIPLE_BOND_MARGIN for the rest."""
     table = Chem.GetPeriodicTable()
     pos = m.GetConformer().GetPositions()
+
+    def cumulated(atom) -> bool:
+        return atom.GetAtomicNum() == 6 and (
+            sum(
+                b.GetBondType() == Chem.BondType.DOUBLE
+                for b in atom.GetBonds()
+            )
+            > 1
+        )
+
     for bond in m.GetBonds():
         if bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.SINGLE:
             continue
@@ -700,7 +725,13 @@ def _multiple_bonds_are_short(m) -> bool:
             table.GetRcovalent(m.GetAtomWithIdx(k).GetAtomicNum())
             for k in (i, j)
         )
-        if np.linalg.norm(pos[i] - pos[j]) > single - _MULTIPLE_BOND_MARGIN:
+        if bond.GetBondType() == Chem.BondType.TRIPLE:
+            margin = _TRIPLE_BOND_MARGIN
+        elif cumulated(bond.GetBeginAtom()) or cumulated(bond.GetEndAtom()):
+            margin = _CUMULATED_BOND_MARGIN
+        else:
+            margin = _MULTIPLE_BOND_MARGIN
+        if np.linalg.norm(pos[i] - pos[j]) > single - margin:
             return False
     return True
 

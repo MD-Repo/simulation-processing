@@ -184,3 +184,74 @@ def test_a_thiazole_listed_sulfur_first_is_read_on_a_second_pass():
 def test_charmm_ions_are_background():
     for resname in ("SOD", "POT", "CLA", "CAL", "CES", "LIT", "RUB", "BAR", "CAD"):
         assert mol_id._is_skipped_residue(resname), resname
+
+
+def _united_atom(smiles: str):
+    """`smiles` embedded with every hydrogen, then with its carbons' hydrogens
+    folded into them, as a united-atom force field writes it: an OBMol with
+    the real geometry and only the polar hydrogens."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    m = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    AllChem.EmbedMolecule(m, randomSeed=7)
+    AllChem.MMFFOptimizeMolecule(m)
+    pos = m.GetConformer().GetPositions()
+    atoms = [
+        (f"{a.GetSymbol()}{a.GetIdx() + 1}", a.GetSymbol(), *pos[a.GetIdx()])
+        for a in m.GetAtoms()
+        if not (
+            a.GetAtomicNum() == 1 and a.GetNeighbors()[0].GetAtomicNum() == 6
+        )
+    ]
+    return _ob_from_pdb(_pdb(atoms))
+
+
+def test_a_united_atom_aromatic_ring_keeps_the_geometric_reading():
+    """Hydroquinone with its ring CH united. The valences can only be met with
+    a triple bond and cumulated double bonds in the ring,
+    OC1=C=C=C(O)C#C1, at aromatic length, under a single bond's: refused by
+    their own lengths."""
+
+    assert (
+        mol_id._bond_orders_from_hydrogens(_united_atom("Oc1ccc(O)cc1"))
+        is None
+    )
+
+
+def test_a_united_atom_vinyl_keeps_the_geometric_reading():
+    """HO-CH=CH-OH with its CH united: the valences call for OC#CO, a triple
+    bond at double-bond length."""
+
+    assert mol_id._bond_orders_from_hydrogens(_united_atom("O/C=C/O")) is None
+
+
+def test_a_real_nitrile_and_alkyne_are_still_settled():
+    """The triple bonds a ligand does carry are far shorter than the ones a
+    united-atom residue forces, and stand."""
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    for smiles in ("N#Cc1ccccc1", "C#Cc1ccccc1"):
+        m = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        AllChem.EmbedMolecule(m, randomSeed=7)
+        AllChem.MMFFOptimizeMolecule(m)
+        pos = m.GetConformer().GetPositions()
+        mol = _ob_from_pdb(
+            _pdb(
+                [
+                    (
+                        f"{a.GetSymbol()}{a.GetIdx() + 1}",
+                        a.GetSymbol(),
+                        *pos[a.GetIdx()],
+                    )
+                    for a in m.GetAtoms()
+                ]
+            )
+        )
+        got = mol_id._bond_orders_from_hydrogens(mol)
+        assert got is not None, smiles
+        conv = ob.OBConversion()
+        conv.SetOutFormat("can")
+        assert "#" in conv.WriteString(got), smiles
