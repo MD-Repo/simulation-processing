@@ -198,7 +198,7 @@ def state_path(state_dir: str, label: str) -> str:
 
     Keyed on the label because that is the only name a cron line gives a job;
     two lines sharing a label share a state file, which is why the labels in
-    utils/cron/crontab are distinct per server.
+    operations/hosts/ops-box/crontab are distinct per server.
     """
 
     slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "job"
