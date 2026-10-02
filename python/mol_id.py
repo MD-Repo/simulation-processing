@@ -278,6 +278,13 @@ _ION_NAMES = frozenset(
         "POT",
         "CLA",
         "MGY",
+        # CHARMM's names for the rest of its monatomic ions.
+        "CAL",
+        "CES",
+        "LIT",
+        "RUB",
+        "BAR",
+        "CAD",
     }
 )
 
@@ -514,9 +521,219 @@ def _smiles_from_coords(sel) -> dict:
         if mol.NumBonds() == 0:
             mol.ConnectTheDots()
         mol.PerceiveBondOrders()
-        return _mol_summary(mol)
+        return _mol_summary(_bond_orders_from_hydrogens(mol) or mol)
     finally:
         os.unlink(tmp_path)
+
+
+# A double or triple bond the hydrogens call for must be shorter in the frame
+# than a single bond between the same two elements, by at least this much.
+# This refuses what a united-atom residue forces, double bonds at full
+# single-bond length; it cannot tell a strained double bond from a
+# conjugated single one. In the processed frames genuine C=N run to 1.41 A
+# and C=C to 1.47 A, 0.05-0.10 under the summed radii, where a thioester's
+# C-S sits at 1.74 A, 0.07 under: a margin of 0.10 lost fourteen correct
+# readings to refuse that one.
+_MULTIPLE_BOND_MARGIN = 0.05
+
+# A residue with explicit polar hydrogens but united-atom CH groups lets the
+# search make up the missing hydrogens with bond orders, and in a ring or a
+# vinyl group, already short, the margin above passes them: hydroquinone with
+# its ring CH united came back OC1=C=C=C(O)C#C1, every ring bond ~1.40 A.
+# What it forces is always a triple bond or a carbon with two double bonds,
+# and a real one is far shorter than a single bond: C#C 1.20 A and C#N 1.16
+# under sums of 1.52 and 1.47, an allene's or a ketene's C=C 1.31. These must
+# be under a single bond by this much.
+_TRIPLE_BOND_MARGIN = 0.25
+_CUMULATED_BOND_MARGIN = 0.20
+
+# The search for bond orders is exponential in the atoms whose valence it can
+# choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
+# phosphate oxygen a candidate for the double bond or the charge -- never
+# settles, and without a bound held a worker for hours. Past this it gives up
+# in about 0.1 s and OpenBabel's reading stands.
+_MAX_BOND_ORDER_ITERATIONS = 10000
+
+
+def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
+    """
+    Bond orders settled by valence from the explicit hydrogens, on OpenBabel's
+    connectivity, or None to keep OpenBabel's geometric reading.
+
+    PerceiveBondOrders types each atom by its bond angles, and a simulated frame
+    bends them. Vorapaxar's vinyl carbons, 1.36 A apart with three neighbours
+    each, came out of a NAMD frame with angles OpenBabel took for sp3: the bond
+    was made single and each carbon given an implicit hydrogen, C29H35FN2O4 for
+    C29H33FN2O4. An all-atom simulation states every hydrogen, and with every
+    hydrogen in place the valences leave one assignment of bond orders; RDKit's
+    DetermineBondOrders finds it without reading an angle.
+
+    The total charge is tried as the file's formal charges state it, then one
+    either side, and the first assignment that holds is kept. It is refused --
+    and OpenBabel's reading stands -- when it leaves a radical, charges a
+    carbon, charges an oxygen positively, charges any atom by more than one,
+    or calls a bond double or triple that the frame holds at single-bond
+    length outside an aromatic ring, or a bond triple or cumulated that the
+    frame holds at double- or aromatic-bond length. Those are what a residue
+    with an open valence is otherwise forced into: a united-atom residue,
+    whose carbons carry their hydrogens implicitly (all of them, or beside
+    explicit polar hydrogens), or a residue cut from a polymer, whose
+    backbone carbonyl read as an acylium (C#[O+]) and whose pyroglutamate came
+    out a +2 ion. A residue with no hydrogens at all is left to OpenBabel, as
+    is one whose bond orders the search cannot settle within
+    _MAX_BOND_ORDER_ITERATIONS.
+
+    The search depends on atom order. With a sulfur listed ahead of the atoms
+    that should carry the double bonds, it returns charge-separated forms --
+    a thiazole as C=[S+]...[O-] -- which the checks refuse; when every charge
+    has been refused, the search runs once more with the sulfurs listed last
+    (see _sulfur_last).
+    """
+    from rdkit.Geometry import Point3D
+
+    atoms = list(ob.OBMolAtomIter(mol))
+    if not any(a.GetAtomicNum() == 1 for a in atoms):
+        return None
+
+    rw = Chem.RWMol()
+    conf = Chem.Conformer(len(atoms))
+    stated = 0
+    for a in atoms:
+        ra = Chem.Atom(a.GetAtomicNum())
+        ra.SetFormalCharge(a.GetFormalCharge())
+        ra.SetNoImplicit(True)
+        stated += a.GetFormalCharge()
+        i = rw.AddAtom(ra)
+        conf.SetAtomPosition(i, Point3D(a.GetX(), a.GetY(), a.GetZ()))
+    for b in ob.OBMolBondIter(mol):
+        i, j = b.GetBeginAtomIdx() - 1, b.GetEndAtomIdx() - 1
+        rw.AddBond(i, j, Chem.BondType.SINGLE)
+    rw.AddConformer(conf, assignId=True)
+
+    orders = [None]
+    if (sulfur_last := _sulfur_last(rw)) is not None:
+        orders.append(sulfur_last)
+    for order in orders:
+        m = _settled_bond_orders(rw, stated, order)
+        if m is None:
+            continue
+        Chem.Kekulize(m, clearAromaticFlags=True)
+        conv = ob.OBConversion()
+        conv.SetInFormat("mol")
+        out = ob.OBMol()
+        if conv.ReadString(out, Chem.MolToMolBlock(m)):
+            return out
+    return None
+
+
+def _settled_bond_orders(rw, stated: int, order):
+    """The first bond-order assignment for `rw` that holds, trying the stated
+    charge and then one either side, with its atoms in `order` while RDKit
+    searches (None for their own order) and in their own order after."""
+    from rdkit.Chem import rdDetermineBonds
+
+    for charge in (stated, stated - 1, stated + 1):
+        m = Chem.Mol(rw)
+        if order is not None:
+            m = Chem.RenumberAtoms(m, order)
+        try:
+            rdDetermineBonds.DetermineBondOrders(
+                m, charge=charge, maxIterations=_MAX_BOND_ORDER_ITERATIONS
+            )
+            Chem.SanitizeMol(m)
+        except Exception:
+            continue
+        if any(_implausible(a) for a in m.GetAtoms()):
+            continue
+        if not _multiple_bonds_are_short(m):
+            continue
+        if order is not None:
+            back = [0] * len(order)
+            for new, old in enumerate(order):
+                back[old] = new
+            m = Chem.RenumberAtoms(m, back)
+        return m
+    return None
+
+
+def _sulfur_last(m) -> Optional[list]:
+    """
+    An atom order with every sulfur after every other atom, or None when that
+    is the order already.
+
+    DetermineBondOrders depends on atom order. Given a sulfur ahead of the
+    atoms that should take the double bonds, it puts one on the sulfur and
+    balances it with charges elsewhere: seven thiazole-bearing ligands in the
+    processed corpus came out in charge-separated forms with a C=[S+], all
+    refused by _implausible, so OpenBabel's reading stood: a nitro group
+    RDKit rejects, or a thiazole given hydrogens it does not have. With the
+    sulfurs last the same search finds the thiazole -- dasatinib with its
+    piperazine protonated, an aminothiazole with its nitro group as
+    [N+](=O)[O-].
+    """
+    sulfur = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() == 16]
+    rest = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() != 16]
+    order = rest + sulfur
+    return None if order == list(range(m.GetNumAtoms())) else order
+
+
+def _implausible(atom) -> bool:
+    """A radical or a charge no simulated ligand carries: on carbon, positive
+    on oxygen, positive on a double-bonded sulfur, or more than one on any
+    atom.
+
+    A double-bonded S+ is a charge-separated form, not a molecule: with a
+    thioacid's sulfur listed before its oxygen the valence search returns
+    C(=[SH+])[O-] for C(=O)S. A sulfonium's S+ has three single bonds and
+    stands."""
+    q = atom.GetFormalCharge()
+    return bool(
+        atom.GetNumRadicalElectrons()
+        or abs(q) > 1
+        or (q and atom.GetAtomicNum() == 6)
+        or (q > 0 and atom.GetAtomicNum() == 8)
+        or (
+            q > 0
+            and atom.GetAtomicNum() == 16
+            and any(b.GetBondType() != Chem.BondType.SINGLE for b in atom.GetBonds())
+        )
+    )
+
+
+def _multiple_bonds_are_short(m) -> bool:
+    """Whether every double or triple bond of `m` outside an aromatic ring is
+    shorter in its conformer than a single bond between the same elements: by
+    _TRIPLE_BOND_MARGIN for a triple bond, _CUMULATED_BOND_MARGIN for a double
+    bond on a carbon with two, and _MULTIPLE_BOND_MARGIN for the rest."""
+    table = Chem.GetPeriodicTable()
+    pos = m.GetConformer().GetPositions()
+
+    def cumulated(atom) -> bool:
+        return atom.GetAtomicNum() == 6 and (
+            sum(
+                b.GetBondType() == Chem.BondType.DOUBLE
+                for b in atom.GetBonds()
+            )
+            > 1
+        )
+
+    for bond in m.GetBonds():
+        if bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.SINGLE:
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        single = sum(
+            table.GetRcovalent(m.GetAtomWithIdx(k).GetAtomicNum())
+            for k in (i, j)
+        )
+        if bond.GetBondType() == Chem.BondType.TRIPLE:
+            margin = _TRIPLE_BOND_MARGIN
+        elif cumulated(bond.GetBeginAtom()) or cumulated(bond.GetEndAtom()):
+            margin = _CUMULATED_BOND_MARGIN
+        else:
+            margin = _MULTIPLE_BOND_MARGIN
+        if np.linalg.norm(pos[i] - pos[j]) > single - margin:
+            return False
+    return True
 
 
 def _smiles_from_topology(sel) -> dict:

@@ -1,0 +1,45 @@
+REMARK   1 PHYTATE, FULLY DEPROTONATED, EMBEDDED WITH RDKIT (RANDOMSEED 7);
+REMARK   1 NO FORMAL CHARGES WRITTEN, AS CPPTRAJ WRITES NONE.
+HETATM    1 C1   IHP A   1       1.423   0.027  -0.925  1.00  0.00           C  
+HETATM    2 O1   IHP A   1       1.252   0.026  -2.435  1.00  0.00           O  
+HETATM    3 P1   IHP A   1       2.389  -0.120  -3.663  1.00  0.00           P  
+HETATM    4 O2   IHP A   1       3.629   0.741  -3.406  1.00  0.00           O  
+HETATM    5 O3   IHP A   1       1.708   0.368  -4.970  1.00  0.00           O  
+HETATM    6 O4   IHP A   1       2.767  -1.593  -3.874  1.00  0.00           O  
+HETATM    7 C2   IHP A   1       0.851  -1.408  -0.230  1.00  0.00           C  
+HETATM    8 O5   IHP A   1       1.614  -1.810   1.010  1.00  0.00           O  
+HETATM    9 P2   IHP A   1       2.849  -2.934   1.208  1.00  0.00           P  
+HETATM   10 O6   IHP A   1       4.189  -2.343   0.748  1.00  0.00           O  
+HETATM   11 O7   IHP A   1       2.966  -3.217   2.731  1.00  0.00           O  
+HETATM   12 O8   IHP A   1       2.555  -4.255   0.488  1.00  0.00           O  
+HETATM   13 C3   IHP A   1      -0.845  -1.348   0.026  1.00  0.00           C  
+HETATM   14 O9   IHP A   1      -1.420  -2.677   0.447  1.00  0.00           O  
+HETATM   15 P3   IHP A   1      -2.363  -3.762  -0.426  1.00  0.00           P  
+HETATM   16 O10  IHP A   1      -2.602  -5.003   0.481  1.00  0.00           O  
+HETATM   17 O11  IHP A   1      -3.733  -3.161  -0.776  1.00  0.00           O  
+HETATM   18 O12  IHP A   1      -1.642  -4.223  -1.698  1.00  0.00           O  
+HETATM   19 C4   IHP A   1      -1.197  -0.042   1.048  1.00  0.00           C  
+HETATM   20 O13  IHP A   1      -2.577  -0.044   1.656  1.00  0.00           O  
+HETATM   21 P4   IHP A   1      -3.039   0.085   3.268  1.00  0.00           P  
+HETATM   22 O14  IHP A   1      -2.526   1.390   3.888  1.00  0.00           O  
+HETATM   23 O15  IHP A   1      -2.558  -1.121   4.088  1.00  0.00           O  
+HETATM   24 O16  IHP A   1      -4.594   0.101   3.305  1.00  0.00           O  
+HETATM   25 C5   IHP A   1      -0.835   1.419   0.222  1.00  0.00           C  
+HETATM   26 O17  IHP A   1      -1.786   1.693  -0.920  1.00  0.00           O  
+HETATM   27 P5   IHP A   1      -2.600   3.103  -1.339  1.00  0.00           P  
+HETATM   28 O18  IHP A   1      -3.240   3.789  -0.127  1.00  0.00           O  
+HETATM   29 O19  IHP A   1      -1.660   4.063  -2.082  1.00  0.00           O  
+HETATM   30 O20  IHP A   1      -3.725   2.700  -2.331  1.00  0.00           O  
+HETATM   31 C6   IHP A   1       0.793   1.482  -0.240  1.00  0.00           C  
+HETATM   32 O21  IHP A   1       1.679   1.969   0.894  1.00  0.00           O  
+HETATM   33 P6   IHP A   1       2.477   3.432   1.104  1.00  0.00           P  
+HETATM   34 O22  IHP A   1       1.509   4.503   1.627  1.00  0.00           O  
+HETATM   35 O23  IHP A   1       3.180   3.895  -0.176  1.00  0.00           O  
+HETATM   36 O24  IHP A   1       3.548   3.209   2.206  1.00  0.00           O  
+HETATM   37 H1   IHP A   1       2.505   0.052  -0.750  1.00  0.00           H  
+HETATM   38 H2   IHP A   1       1.019  -2.218  -0.949  1.00  0.00           H  
+HETATM   39 H3   IHP A   1      -1.310  -1.127  -0.942  1.00  0.00           H  
+HETATM   40 H4   IHP A   1      -0.508  -0.111   1.898  1.00  0.00           H  
+HETATM   41 H5   IHP A   1      -1.009   2.225   0.944  1.00  0.00           H  
+HETATM   42 H6   IHP A   1       0.868   2.244  -1.024  1.00  0.00           H  
+END
