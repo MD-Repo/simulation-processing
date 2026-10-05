@@ -477,7 +477,18 @@ def remove_existing(session, remote: str, status) -> None:
         return
 
     status(f"Removing existing {os.path.basename(remote)} before upload")
-    session.data_objects.unlink(remote)
+    try:
+        session.data_objects.unlink(remote)
+    except Exception as e:
+        # On 2026-10-05 the unlink raised UNIX_FILE_RENAME_ERR(-528002) after
+        # moving the object to trash, both replicas intact there; only the
+        # physical rename on one storage server failed. Treating that as fatal
+        # skipped the upload and left the slot empty. What matters here is
+        # whether the path is now free for a fresh put.
+        if session.data_objects.exists(remote):
+            raise
+        status(f"Unlink reported {describe_exc(e)}, but "
+               f"{os.path.basename(remote)} is gone; continuing")
 
 
 # --------------------------------------------------
