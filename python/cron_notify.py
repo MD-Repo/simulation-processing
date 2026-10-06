@@ -25,7 +25,9 @@ Wrap a cron line with this and a non-zero exit becomes a Slack message:
 Output is passed through unchanged, so the log keeps everything; Slack gets the
 label, the exit status and the tail. Success is silent -- a nightly "it worked"
 trains the channel to be ignored, which is the one thing a failure alert cannot
-afford.
+afford. The exception is --notify-success, for a rare job whose having run is
+itself the news (the monthly IRODS maintenance switch): a person has to act on
+it, so silence would be the failure.
 
 DEDUPLICATION, and why a high-frequency job needs it
 ----------------------------------------------------
@@ -107,6 +109,7 @@ class Args(NamedTuple):
     threshold: int
     repeat_after: float
     state_dir: str
+    notify_success: bool
     command: List[str]
 
 
@@ -162,6 +165,12 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--notify-success",
+        help="Also post to Slack when the command succeeds (rare jobs only)",
+        action="store_true",
+    )
+
+    parser.add_argument(
         "command",
         help="Command to run, after a '--'",
         nargs=argparse.REMAINDER,
@@ -188,6 +197,7 @@ def get_args() -> Args:
         threshold=args.threshold,
         repeat_after=args.repeat_after,
         state_dir=args.state_dir,
+        notify_success=args.notify_success,
         command=command,
     )
 
@@ -325,6 +335,13 @@ def main() -> None:
     now = datetime.now(timezone.utc)
 
     if code == 0:
+        if args.notify_success:
+            message = f"CRON OK: {args.label}"
+            tail = "\n".join(output.strip().splitlines()[-TAIL_LINES:])
+            if tail:
+                message += f"\n```\n{tail}\n```"
+            send_slack_message(message, base_url)
+
         failures = int(state.get("consecutive_failures", 0) or 0)
 
         # Only worth a word if somebody was told it was broken. A run that
