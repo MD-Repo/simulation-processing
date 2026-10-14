@@ -6,6 +6,7 @@ Purpose: Sample trajectory
 """
 
 import argparse
+import math
 import os
 import sys
 from typing import NamedTuple
@@ -106,6 +107,21 @@ def die(message: str, args: Args, num_frames: int = -1) -> None:
 
 
 # --------------------------------------------------
+def frames_to_sample(num_frames: int) -> range:
+    """
+    The frame indices to keep: at most TOTAL_FRAMES, evenly spaced, from the
+    first END_SAMPLE_FROM. The step rounds UP. It used to round down
+    (`end // TOTAL_FRAMES`), so 101-199 frames gave a step of 1 and kept them
+    all, and 999 kept 111: up to twice the cap (MDR00105114's preview has
+    184 frames, Ken 2026-10-14).
+    """
+
+    end_frame = min(num_frames, END_SAMPLE_FROM)
+    sample_rate = max(1, math.ceil(end_frame / TOTAL_FRAMES))
+    return range(0, end_frame, sample_rate)
+
+
+# --------------------------------------------------
 def main() -> None:
     """Make a jazz noise here"""
 
@@ -124,9 +140,8 @@ def main() -> None:
     if num_frames == 0:
         die("trajectory has 0 frames; nothing to sample", args, num_frames)
 
-    end_frame = min(num_frames, END_SAMPLE_FROM)
-    sample_rate = end_frame // TOTAL_FRAMES if end_frame > TOTAL_FRAMES else 1
-    sampled_frames = trajectory.trajectory[:end_frame][::sample_rate]
+    keep = frames_to_sample(num_frames)
+    sampled_frames = trajectory.trajectory[keep.start : keep.stop : keep.step]
 
     # Write to a temporary name and rename only on success.
     #
