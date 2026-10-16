@@ -208,7 +208,7 @@ def main() -> None:
     if written != want:
         cleanup(tmp_out)
         die(f"sample holds {written} frames, expected {want} from "
-            f"{num_frames} input frames at stride {sample_rate}", args,
+            f"{num_frames} input frames at stride {keep.step}", args,
             num_frames)
 
     try:
@@ -218,7 +218,7 @@ def main() -> None:
         die(f"failed to move sample into place: {e}", args, num_frames)
 
     print(f"Wrote {want} of {num_frames} frames to '{args.outfile}' "
-          f"(stride {sample_rate}, verified by reading it back)")
+          f"(stride {keep.step}, verified by reading it back)")
 
 
 # --------------------------------------------------
