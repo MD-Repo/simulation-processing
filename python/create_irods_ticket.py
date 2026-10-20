@@ -4,6 +4,10 @@ Author : Travis Wheeler <travis@traviswheeler.com>
 Date   : 2026-07-09
 Purpose: Create an unlimited-use iRODS ticket for a simulation's iRODS
          path and store it in md_simulation.irods_ticket.
+
+The ticket never expires and has unlimited uses, so a read ticket
+is only issued for a released simulation (approved, not embargoed, not a
+placeholder).
 """
 
 import argparse
@@ -14,7 +18,7 @@ import sys
 from dotenv import dotenv_values
 from irods.session import iRODSSession
 from irods.ticket import Ticket
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 
 class Args(NamedTuple):
@@ -79,6 +83,21 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
+def unreleased_reason(sim: Optional[dict]) -> Optional[str]:
+    """Why a simulation may not get a permanent read ticket, or None"""
+
+    if sim is None:
+        return "not in md_simulation"
+    if not sim["is_public"]:
+        return "not approved"
+    if sim["is_embargoed"]:
+        return "embargoed"
+    if sim["is_placeholder"]:
+        return "a placeholder"
+    return None
+
+
+# --------------------------------------------------
 def main() -> None:
     """Make a jazz noise here"""
 
@@ -101,6 +120,19 @@ def main() -> None:
     )
 
     mdrepo_id = f"MDR{args.simulation_id:08d}"
+
+    if args.permission == "read":
+        cur.execute(
+            """
+            select is_public, is_embargoed, is_placeholder
+            from   md_simulation
+            where  id=%s
+            """,
+            (args.simulation_id,),
+        )
+        if reason := unreleased_reason(cur.fetchone()):
+            sys.exit(f"{mdrepo_id} is {reason}: not issuing a read ticket")
+
     print(f"{mdrepo_id} -> {args.path}")
 
     with iRODSSession(irods_env_file=irods_env) as session:
