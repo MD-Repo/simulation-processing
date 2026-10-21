@@ -41,6 +41,12 @@ WHAT IS FIXED HERE
    replica IRODS picks, so that is a coin flip between yesterday's database and
    a month-old one. This cannot fix the replication itself -- that is
    CyVerse-side -- but it refuses to call a backup good while it is true.
+   What it can do is fill a MISSING replica: on 2026-10-21 all four objects
+   (prod and staging) were clean single replicas with no corral4 copy 15 hours
+   later, and a forced replica to taccRes landed at once. So when the wait runs
+   out short of a replica, the run forces one and verifies it -- and still
+   exits non-zero, because this check is the only thing that notices when
+   CyVerse's replication stops, and that stall reaches simulation data too.
 
 4. The upload time is recorded in metadata we control. The catalog's own
    timestamps proved untrustworthy: on 2026-08-05 `gocmd ls` showed
@@ -89,7 +95,7 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime, timezone
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from dotenv import load_dotenv
 from irods.session import iRODSSession
@@ -194,6 +200,11 @@ EXPECTED_REPLICAS = 2
 REPLICA_WAIT_SECONDS = 900
 REPLICA_POLL_SECONDS = 30
 
+# Where a missing replica is forced. The passthru ROOT, not the corral4 leaf:
+# healthy objects show hierarchy "taccRes;corral4", and naming the leaf
+# bypasses the passthru (utils/python/replicate_data_object.py, same choice).
+REPLICA_RESOURCE = "taccRes"
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -207,6 +218,7 @@ class Args(NamedTuple):
     no_irods: bool
     no_archive: bool
     put_timeout: int
+    force_replica: bool
     keep_local: bool
     verify_only: bool
     dry_run: bool
@@ -282,6 +294,13 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--no-force-replica",
+        help=f"When a replica is still missing after {REPLICA_WAIT_SECONDS}s, "
+        f"fail instead of forcing one onto {REPLICA_RESOURCE}",
+        action="store_true",
+    )
+
+    parser.add_argument(
         "--no-irods",
         help="Skip the IRODS copy (its writes go down; Swift's do not)",
         action="store_true",
@@ -328,6 +347,7 @@ def get_args() -> Args:
         no_irods=args.no_irods,
         no_archive=args.no_archive,
         put_timeout=args.put_timeout,
+        force_replica=not args.no_force_replica,
         keep_local=args.keep_local,
         verify_only=args.verify_only,
         dry_run=args.dry_run,
@@ -568,8 +588,9 @@ def wait_for_replicas(session, path: str, status):
 
 # --------------------------------------------------
 def check_replicas(session, path: str, expected_size: int, expected_md5: str,
-                   status) -> List[str]:
-    """Return a list of complaints about the stored object; empty means good
+                   status, force: bool = True) -> Tuple[List[str], bool]:
+    """Return complaints about the stored object (empty means good), and
+    whether a missing replica had to be forced onto REPLICA_RESOURCE
 
     On the checksum, not the size. A size test cannot see the two failures this
     is here to catch: an overwrite that leaves a stale replica of the *same*
@@ -586,6 +607,27 @@ def check_replicas(session, path: str, expected_size: int, expected_md5: str,
 
     obj = wait_for_replicas(session, path, status)
     problems = []
+    forced = False
+
+    # Only a replica that is missing outright. A bad or stale one on taccRes is
+    # a different failure, and replicating onto it is not a known fix.
+    if (force and len(obj.replicas) < EXPECTED_REPLICAS
+            and not any(REPLICA_RESOURCE in (r.resc_hier or "")
+                        for r in obj.replicas)):
+        status(
+            f"{os.path.basename(path)}: no {REPLICA_RESOURCE} replica after "
+            f"{REPLICA_WAIT_SECONDS}s, forcing one"
+        )
+        try:
+            session.data_objects.replicate(path, resource=REPLICA_RESOURCE)
+            forced = True
+        except Exception as e:
+            problems.append(
+                f"forcing a replica onto {REPLICA_RESOURCE} failed: "
+                f"{describe_exc(e)}"
+            )
+        # Re-fetch: the object in hand still holds the replica list from before.
+        obj = session.data_objects.get(path)
 
     if obj.size != expected_size:
         problems.append(f"object size {obj.size:,} != local {expected_size:,}")
@@ -593,7 +635,9 @@ def check_replicas(session, path: str, expected_size: int, expected_md5: str,
     if len(obj.replicas) < EXPECTED_REPLICAS:
         problems.append(
             f"only {len(obj.replicas)} replica(s) after "
-            f"{REPLICA_WAIT_SECONDS}s, expected {EXPECTED_REPLICAS}"
+            f"{REPLICA_WAIT_SECONDS}s"
+            + (" and a forced replica" if forced else "")
+            + f", expected {EXPECTED_REPLICAS}"
         )
 
     for repl in obj.replicas:
@@ -621,7 +665,7 @@ def check_replicas(session, path: str, expected_size: int, expected_md5: str,
         )
     )
 
-    return problems
+    return problems, forced
 
 
 # --------------------------------------------------
@@ -938,6 +982,7 @@ def main() -> None:
         else:
             try:
                 problems = []
+                forced = []
                 with irods_session() as session:
                     names = [o.name for o in
                              session.collections.get(args.collection).data_objects]
@@ -969,17 +1014,31 @@ def main() -> None:
                         remote = f"{args.collection}/{name}"
                         remove_existing(session, remote, status)
                         put_to_irods(path, args.collection, args.put_timeout, status)
-                        problems += [
-                            f"{name}: {p}" for p in
-                            check_replicas(session, remote, size, expected_md5,
-                                           status)
-                        ]
+                        found, was_forced = check_replicas(
+                            session, remote, size, expected_md5, status,
+                            force=args.force_replica)
+                        problems += [f"{name}: {p}" for p in found]
+                        if was_forced:
+                            forced.append(name)
                         stamp_metadata(session, remote, size, started)
 
                 if problems:
                     raise RuntimeError(
                         "copies did not verify:\n  " + "\n  ".join(problems)
                     )
+
+                # Every copy is good, but the night still fails: CyVerse's
+                # replication did not run, and nothing else would tell us.
+                if forced:
+                    detail = (
+                        f"CyVerse did not replicate {', '.join(forced)} within "
+                        f"{REPLICA_WAIT_SECONDS}s; forced onto "
+                        f"{REPLICA_RESOURCE} and verified, nothing to fix by "
+                        f"hand. Objects written by other jobs since may also "
+                        f"lack a corral4 copy"
+                    )
+                    status(f"IRODS REPLICAS FORCED: {detail}")
+                    failures.append(f"IRODS replication: {detail}")
             except Exception as e:
                 detail = describe_exc(e)
                 status(f"IRODS FAILED: {detail}")
