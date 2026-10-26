@@ -1354,14 +1354,17 @@ def _same_residue_name(a, b):
     return a == b or (a and b and (a.endswith(b) or b.endswith(a)))
 
 
-def _same_atom(a, b):
+def _same_atom(a, b, number=True):
     """Whether two atom records (from `pdb_atoms`) are the same atom: the
-    same atom name, residue number and insertion code, residue names that
-    agree as `_same_residue_name` does."""
+    same atom name and residue names that agree as `_same_residue_name`
+    does, and with `number` the same residue number and insertion code.
+    Not the number when the two files were numbered by different writers:
+    GROMACS renumbers water, ions and every other single-residue molecule
+    after the last chain residue (wrapping at 10000), so the submitter's
+    ion 999 is GROMACS's 13."""
     return (
         a[1] == b[1]
-        and a[3] == b[3]
-        and a[4] == b[4]
+        and (not number or (a[3] == b[3] and a[4] == b[4]))
         and _same_residue_name(a[2], b[2])
     )
 
@@ -1383,8 +1386,10 @@ def transfer_chain_ids(reference_pdb, target_pdb, output_pdb):
     `reference_pdb`, atom for atom.
 
     The two files must describe the same atoms in the same order: the same
-    count, and each pair the same atom name and residue (`_same_atom`). An
-    atom whose reference chain ID is blank keeps the target's. Returns
+    count, and each pair the same atom and residue name (`_same_atom`
+    without the residue number, which GROMACS reassigns to single-residue
+    molecules). An atom whose reference chain ID is blank keeps the
+    target's. Returns
     True when the IDs were transferred, False (and writes nothing) when the
     files are not atom for atom the same system.
 
@@ -1415,7 +1420,7 @@ def transfer_chain_ids(reference_pdb, target_pdb, output_pdb):
             "keeping the chain IDs GROMACS wrote"
         )
         return False
-    mismatched = sum(1 for a, b in zip(ref, tgt) if not _same_atom(a, b))
+    mismatched = sum(1 for a, b in zip(ref, tgt) if not _same_atom(a, b, number=False))
     if mismatched:
         verbose(
             f"Chain IDs not transferred: {mismatched} of {len(ref)} atoms differ "
@@ -1524,9 +1529,10 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
 
     full.pdb takes the submitter's chain IDs when their coordinate PDB is
     the same system atom for atom (`transfer_chain_ids`): that is where a
-    single moleculetype holding several chains, which GROMACS letters as
-    one molecule, gets its chains back. The file GROMACS wrote is kept as
-    full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
+    single moleculetype holding several chains gets its chains back
+    (GROMACS 2025.4 wrote no chain ID at all for a merged two-chain
+    protein with nothing but an ion beside it). The file GROMACS wrote is
+    kept as full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
     chain IDs and elements (`copy_pdb_columns`).
     """
 

@@ -101,6 +101,22 @@ def test_chains_merged_into_one_moleculetype_get_their_letters_back(tmp_path):
     assert chain_ids(out) == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2)]
 
 
+def test_gromacs_renumbering_of_ions_does_not_block_the_transfer(tmp_path):
+    """GROMACS renumbers single-residue molecules after the last chain
+    residue: the submitter's chloride 999 is residue 4 in full.pdb, and
+    the merged protein has no letters at all (seen with GROMACS 2025.4)"""
+
+    ref = tmp_path / "submitted.pdb"
+    full = tmp_path / "full.pdb"
+    write(ref, residues(TWO_CHAINS) + [atom(50, "CL1", "LIG", "X", 999, "Cl")])
+    write(full, residues([(" ", TWO_CHAINS[0][1]), (" ", TWO_CHAINS[1][1])]) + [
+        atom(50, "CL1", "LIG", " ", 4, "Cl")
+    ])
+    out = tmp_path / "out.pdb"
+    assert c.transfer_chain_ids(str(ref), str(full), str(out))
+    assert chain_ids(out) == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2), ("X", 4)]
+
+
 def test_a_blank_reference_chain_keeps_the_gromacs_letter(tmp_path):
     ref = tmp_path / "submitted.pdb"
     full = tmp_path / "full.pdb"
