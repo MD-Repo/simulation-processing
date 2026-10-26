@@ -36,10 +36,17 @@ def get_args():
 
 # --------------------------------------------------
 def generate_tpr_from_top(gro_file, top_file, outdir, gmx_path):
-    """Generate a TPR file from GRO and TOP files.
+    """Generate a TPR file from a structure file (.gro or .pdb) and a .top.
+
+    A TPR is what lets `trjconv -pbc mol` make molecules whole: the
+    alternative, cpptraj with the coordinate PDB as topology, takes its
+    bonds from distances, so a molecule broken across the box is two
+    molecules to it and autoimage leaves it broken (review SEQ-4, F6,
+    CONV-14: barnase+barstar in 10 fragments). grompp reads a .pdb as -c
+    as readily as a .gro.
 
     Args:
-        gro_file: Path to .gro structure file
+        gro_file: Path to the .gro or .pdb structure file
         top_file: Path to .top topology file (text format)
         outdir: Output directory for generated files
         gmx_path: Path to gmx executable
@@ -193,21 +200,36 @@ def main():
             if tpr_file:
                 verbose(f"Found TPR file alongside .top: {tpr_file}")
             else:
-                gro_file = find_matching_struct_for_top(
+                # A .gro beside the .top, else the submitted coordinate file
+                # (.pdb or .gro), else a .pdb beside the .top. A .top with a
+                # .pdb used to go straight to the cpptraj path, which cannot
+                # make molecules whole.
+                struct_file = find_matching_struct_for_top(
                     [topology_file, trajectory_file], ".gro"
                 )
-                if gro_file:
+                if (
+                    not struct_file
+                    and coordinate_file
+                    and coordinate_file.lower().endswith((".pdb", ".gro"))
+                    and os.path.isfile(coordinate_file)
+                ):
+                    struct_file = coordinate_file
+                if not struct_file:
+                    struct_file = find_matching_struct_for_top(
+                        [topology_file, trajectory_file], ".pdb"
+                    )
+                if struct_file:
                     verbose(
-                        f"No TPR found. Generating from {os.path.basename(topology_file)} + {os.path.basename(gro_file)}..."
+                        f"No TPR found. Generating from {os.path.basename(topology_file)} + {os.path.basename(struct_file)}..."
                     )
                     tpr_file = generate_tpr_from_top(
-                        gro_file, topology_file, args.outdir, gmx_path
+                        struct_file, topology_file, args.outdir, gmx_path
                     )
                     if not tpr_file:
                         warn("Could not generate TPR file. Some operations may fail.")
                 else:
                     warn(
-                        "No TPR or GRO found alongside .top file. Some operations may fail."
+                        "No TPR, GRO or PDB found alongside .top file. Some operations may fail."
                     )
 
         lipid_present = detect_lipids_gromacs(
@@ -1649,13 +1671,27 @@ def write_gromacs_bash(
                     warn(f"Could not generate PDB topology for cpptraj: {e}")
                     cpptraj_topo = None
 
+            # Image only when there is a cell to image in, as the Amber and
+            # NAMD paths do. This path cannot make a molecule broken across
+            # the box whole (its bonds come from distances), which is why
+            # main() now generates a TPR from a .top and any structure file
+            # before falling back to it.
+            box_present = True
+            if cpptraj_topo:
+                try:
+                    box_present = has_box(pt.iterload(trajfile, top=cpptraj_topo)[0])
+                except Exception as e:
+                    warn(f"Could not read the box of {trajfile}: {e}; imaging anyway")
+            if not box_present:
+                verbose("No box detected. Skipping autoimage...")
+
             cppin_wrap = os.path.join(outdir, "cpptraj_wrap.in")
             full_xtc_path = os.path.join(outdir, "full.xtc")
             full_pdb_path = os.path.join(outdir, "full.pdb")
             with open(cppin_wrap, "w") as cf:
                 cf.write(f"parm {cpptraj_topo}\n")
                 cf.write(f"trajin {trajfile}\n")
-                cf.write("autoimage\n")
+                cf.write(autoimage_action(box_present))
                 cf.write(f"trajout {full_xtc_path} xtc\n")
                 cf.write(f"trajout {full_pdb_path} pdb onlyframes 1\n")
                 cf.write("run\n")
