@@ -141,3 +141,58 @@ def test_a_single_bad_frame_is_caught():
 
         with pytest.raises(SystemExit):
             g.check_ceiling("RMSD", g.MAX_RMSD, vals)
+
+
+# --------------------------------------------------
+def _pdb(records):
+    """A one-frame structure: records are (name, resname, resid, element)"""
+    lines = ["CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1\n"]
+    for i, (name, resname, resid, element) in enumerate(records):
+        x = 3.8 * i
+        lines.append(
+            f"ATOM  {i + 1:>5} {name:<4} {resname:>3} A{resid:>4}    "
+            f"{x:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00          {element:>2}\n"
+        )
+    lines.append("END\n")
+    return "".join(lines)
+
+
+def test_calcium_ions_are_not_alpha_carbons(tmp_path):
+    """Amber's Ca2+ is residue CA, atom CA (review TQ-03). Three residues
+    and two ions: three atoms, not five"""
+    import MDAnalysis as mda
+
+    pdb = tmp_path / "minimal.pdb"
+    records = []
+    for resid in (1, 2, 3):
+        records += [("N", "ALA", resid, "N"), ("CA", "ALA", resid, "C"), ("C", "ALA", resid, "C")]
+    records += [("CA", "CA", 4, "Ca"), ("CA", "CA", 5, "Ca")]
+    pdb.write_text(_pdb(records))
+
+    u = mda.Universe(str(pdb))
+    assert len(u.select_atoms("name CA")) == 5
+    atoms = g.analysis_atoms(u)
+    assert len(atoms) == 3
+    assert set(atoms.resnames) == {"ALA"}
+
+
+def test_nucleic_acids_are_measured_on_phosphorus(tmp_path):
+    import MDAnalysis as mda
+
+    pdb = tmp_path / "minimal.pdb"
+    records = []
+    for resid, res in enumerate(("DC", "DG", "DC"), start=1):
+        records += [("P", res, resid, "P"), ("C4'", res, resid, "C"), ("O3'", res, resid, "O")]
+    records += [("NA", "NA", 9, "Na")]
+    pdb.write_text(_pdb(records))
+    atoms = g.analysis_atoms(mda.Universe(str(pdb)))
+    assert len(atoms) == 3
+    assert set(atoms.names) == {"P"}
+
+
+def test_a_coarse_grained_model_uses_every_atom(tmp_path):
+    import MDAnalysis as mda
+
+    pdb = tmp_path / "minimal.pdb"
+    pdb.write_text(_pdb([("A", "A", 1, "C"), ("A", "A", 2, "C")]))
+    assert len(g.analysis_atoms(mda.Universe(str(pdb)))) == 2

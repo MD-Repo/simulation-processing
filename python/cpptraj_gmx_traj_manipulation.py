@@ -749,7 +749,7 @@ def process_stripped_trajectory(
     outdir,
     strip_mask,
     prefix,
-    fit_mask="@CA,C,N",
+    fit_mask=None,
     sampling_ps=None,
     box_present=False,
 ):
@@ -774,6 +774,8 @@ def process_stripped_trajectory(
         tuple: (xtc_path, pdb_path, ref_path) or (None, None, None) on failure
     """
 
+    if fit_mask is None:
+        fit_mask = backbone_fit_mask({"CA", "C", "N"})
     output_xtc = os.path.join(outdir, f"{prefix}.xtc")
     output_pdb = os.path.join(outdir, f"{prefix}.pdb")
     ref_pdb = os.path.join(outdir, f"{prefix}_ref.pdb")
@@ -894,7 +896,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     # the two paths disagree about whether there is a cell to image in.
     box_present = has_box(first_frame)
     atom_names = {atom.name for atom in traj.top.atoms}
-    fit_mask = "@CA,C,N" if atom_names & {"CA", "C", "N"} else "@*"
+    fit_mask = backbone_fit_mask(atom_names)
     if fit_mask == "@*":
         verbose(
             "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
@@ -1135,7 +1137,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             box_present = False
             has_lipid = False
         atom_names = {atom.name for atom in traj.top.atoms}
-        fit_mask = "@CA,C,N" if atom_names & {"CA", "C", "N"} else "@*"
+        fit_mask = backbone_fit_mask(atom_names)
         if fit_mask == "@*":
             verbose(
                 "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
@@ -1145,7 +1147,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
         warn("Proceeding without box/lipid detection...")
         box_present = False
         has_lipid = False
-        fit_mask = "@CA,C,N"
+        fit_mask = backbone_fit_mask({"CA", "C", "N"})
 
     # Write conf files
     conf_pdb = os.path.join(outdir, "conf.pdb")
@@ -1854,6 +1856,15 @@ KNOWN_WATER = [
     "SPC",
     "SOL",
 ]
+# Monatomic ions by the residue names the force fields give them: Amber's
+# ion libraries (`Na+`, `Ca2+`, and the older `CA`, `ZN`, `IOD`), CHARMM's
+# (SOD, POT, CLA, CAL, ZN2, CES, LIT, RUB, BAR, CAD) and GROMACS's
+# (NA, CL, K, CA, MG, ZN, CU, and `CA2+`, `ZN2+`, `CU2+`). Stripped from
+# minimal.* and excluded from the RMS fit. Amber's calcium in particular is
+# residue CA, atom CA: not here, it stayed in minimal.pdb and the fit mask
+# `@CA,C,N`, the principal axes and get_rmsd_rmsf's `name CA` all counted
+# the freely diffusing ion as an alpha carbon, inflating the published RMSD
+# and giving the RMSF one entry per ion (review CONV-3, TQ-03).
 KNOWN_IONS = [
     "NA",
     "CL",
@@ -1867,6 +1878,51 @@ KNOWN_IONS = [
     "MG",  # Amber-style ion names
     "Na+",
     "Cl-",  # Case variants
+    "MG2+",
+    "POT",
+    "CA",
+    "Ca2+",
+    "CA2+",
+    "CAL",
+    "ZN",
+    "Zn2+",
+    "ZN2",
+    "ZN2+",
+    "LI",
+    "Li+",
+    "LIT",
+    "RB",
+    "Rb+",
+    "RUB",
+    "CS",
+    "Cs+",
+    "CES",
+    "F",
+    "F-",
+    "BR",
+    "Br-",
+    "IOD",
+    "I-",
+    "SR",
+    "Sr2+",
+    "BA",
+    "Ba2+",
+    "BAR",
+    "CD",
+    "Cd2+",
+    "CAD",
+    "CU",
+    "CU1",
+    "Cu+",
+    "Cu2+",
+    "CU1+",
+    "CU2+",
+    "MN",
+    "Mn2+",
+    "NI",
+    "Ni2+",
+    "Fe2+",
+    "Fe3+",
 ]
 KNOWN_LIPIDS = [
     "DPPC",
@@ -1878,6 +1934,21 @@ KNOWN_LIPIDS = [
     "DSPC",
     "CHOL",
 ]
+
+
+# --------------------------------------------------
+def backbone_fit_mask(atom_names):
+    """The cpptraj mask the RMS fit and principal axes are measured on
+
+    The backbone CA, C and N of the polymer residues: not an ion named like
+    one (Amber's calcium is residue CA, atom CA) and not a lipid (CHARMM's
+    choline nitrogen is atom N). `@*` when there is no backbone to fit on,
+    a coarse-grained model.
+    """
+
+    if not atom_names & {"CA", "C", "N"}:
+        return "@*"
+    return "@CA,C,N&!:" + ",".join(KNOWN_IONS + KNOWN_LIPIDS)
 
 
 # --------------------------------------------------

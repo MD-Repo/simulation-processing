@@ -127,15 +127,37 @@ def check_ceiling(type_: str, max_allowed: float, vals: List[float]) -> None:
 
 
 # --------------------------------------------------
+def analysis_atoms(universe):
+    """The atoms RMSD and RMSF are measured on
+
+    The alpha carbons of the protein, else the phosphorus of the nucleic
+    acid, else every atom (a coarse-grained model). `name CA` alone is not
+    it: Amber's calcium ion is residue CA, atom CA, so a simulation with
+    CaCl2 or a bound calcium measured its RMSD on the protein plus freely
+    diffusing ions (stored max 12.3 A against 0.29 A protein-only on the
+    review's test system) and stored an RMSF vector with one entry per ion
+    appended to the residues (review TQ-03).
+    """
+
+    for selection, what in (
+        ("protein and name CA", "protein CA"),
+        ("nucleic and name P", "nucleic P"),
+    ):
+        atoms = universe.select_atoms(selection)
+        if len(atoms):
+            print(f"[*] RMSD/RMSF on {len(atoms)} {what} atoms")
+            return atoms
+    print("[!] No protein CA or nucleic P atoms found; using all atoms (CG model)")
+    return universe.select_atoms("all")
+
+
+# --------------------------------------------------
 def main() -> None:
     """Make a jazz noise here"""
 
     args = get_args()
     universe = mda.Universe(args.structure, args.trajectory)
-    traj = universe.select_atoms("name CA")
-    if len(traj) == 0:
-        traj = universe.select_atoms("all")
-        print("[!] No CA atoms found; using all atoms for RMSD/RMSF (CG model)")
+    traj = analysis_atoms(universe)
 
     # Check the ceilings against every value, and decimate only on the way
     # into the JSON. See check_ceiling() for why that order matters.
