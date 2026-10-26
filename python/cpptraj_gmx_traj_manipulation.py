@@ -288,6 +288,13 @@ def main():
             + " -- see the cpptraj output above for the reason"
         )
 
+    mismatches = check_atom_counts(args.outdir)
+    if mismatches:
+        sys.exit(
+            "the converted files do not describe the same atoms: "
+            + "; ".join(mismatches)
+        )
+
 
 # --------------------------------------------------
 def verbose(msg):
@@ -798,7 +805,7 @@ def process_stripped_trajectory(
         f.write(f"principal {fit_mask} dorotation\n")
         f.write("rotate z 90\n")
         f.write("rotate x -90\n")
-        f.write(f"trajout {ref_pdb} pdb\n")
+        f.write(f"trajout {ref_pdb} pdb include_ep\n")
         f.write("run\n")
     rv, _ = run_cpptraj(cppin_ref, f"{prefix} reference")
     if rv != 0:
@@ -825,7 +832,7 @@ def process_stripped_trajectory(
         f.write(f"rms ref [rotref] {fit_mask}\n")
         f.write(time_action(sampling_ps))
         f.write(f"trajout {output_xtc} xtc\n")
-        f.write(f"trajout {output_pdb} pdb onlyframes 1\n")
+        f.write(f"trajout {output_pdb} pdb include_ep onlyframes 1\n")
         f.write("run\n")
     rv, _ = run_cpptraj(cppin_traj, prefix)
     if rv != 0:
@@ -928,7 +935,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     with open(cppin_frame0, "w") as f:
         f.write(f"parm {topology_file}\n")
         f.write(f"trajin {trajectory_file} 1 1\n")
-        f.write(f"trajout {traj_pdb} pdb\n")
+        f.write(f"trajout {traj_pdb} pdb include_ep\n")
         f.write("run\n")
     # This output used to go to /dev/null. It is the only place the source
     # trajectory is read before conversion rewrites its timing, so it is the
@@ -984,7 +991,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
             # f.write(f"trajout {full_cif} cif onlyframes 1\n")
-            f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
+            f.write(f"trajout {full_pdb} pdb include_ep onlyframes 1\n")
             f.write("run\n")
         run_cpptraj(cppin_full, "full")
     else:
@@ -1092,7 +1099,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {trajectory_file} 1 1\n")
         else:
             f.write(f"trajin {coordinate_file} 1 1\n")
-        f.write(f"trajout {traj_pdb} pdb\n")
+        f.write(f"trajout {traj_pdb} pdb include_ep\n")
         f.write("run\n")
     _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
@@ -1158,7 +1165,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {trajectory_file} 1 1\n")
         else:
             f.write(f"trajin {coordinate_file}\n")
-        f.write(f"trajout {conf_pdb} pdb onlyframes 1\n")
+        f.write(f"trajout {conf_pdb} pdb include_ep onlyframes 1\n")
         f.write("run\n")
     run_cpptraj(cppin_conf, "conf extraction", fatal=False)
     fix_pdb_element_symbols(conf_pdb)
@@ -1224,7 +1231,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"rms first {fit_mask}\n")
             f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
-            f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
+            f.write(f"trajout {full_pdb} pdb include_ep onlyframes 1\n")
             f.write("run\n")
         run_cpptraj(cppin_full, "full")
         fix_pdb_element_symbols(full_pdb)
@@ -1634,6 +1641,14 @@ def write_gromacs_bash(
                 "-dump 0 -n $OUTDIR/index_prestripped.ndx <<EOF\n"
                 "$PRESTRIPPED_GROUP\nEOF\n\n"
             )
+            # full.gro was written above from the whole TPR; a pre-stripped
+            # trajectory's full.xtc and full.pdb hold only the saved group,
+            # so write full.gro from the same frame and group (CONV-6)
+            f.write(
+                "  $GMX trjconv -s $TOP -f $OUTDIR/full.xtc -o $OUTDIR/full.gro "
+                "-dump 0 -n $OUTDIR/index_prestripped.ndx <<EOF\n"
+                "$PRESTRIPPED_GROUP\nEOF\n\n"
+            )
             f.write("else\n")
             f.write(
                 "  $GMX trjconv -s $TOP -f $OUTDIR/full.xtc -o $OUTDIR/full.pdb "
@@ -1695,7 +1710,7 @@ def write_gromacs_bash(
                 cf.write(f"trajin {trajfile}\n")
                 cf.write(autoimage_action(box_present))
                 cf.write(f"trajout {full_xtc_path} xtc\n")
-                cf.write(f"trajout {full_pdb_path} pdb onlyframes 1\n")
+                cf.write(f"trajout {full_pdb_path} pdb include_ep onlyframes 1\n")
                 cf.write("run\n")
 
             f.write("echo '[*] Wrapping trajectory with cpptraj autoimage'\n")
@@ -1934,6 +1949,68 @@ KNOWN_LIPIDS = [
     "DSPC",
     "CHOL",
 ]
+
+
+# --------------------------------------------------
+def pdb_atom_count(path):
+    """ATOM/HETATM records in the first MODEL"""
+    return len(pdb_atoms(path))
+
+
+def gro_atom_count(path):
+    """The count on a .gro's second line"""
+    with open(path) as fh:
+        fh.readline()
+        return int(fh.readline().strip())
+
+
+def xtc_atom_count(path):
+    """The atom count from an XTC's first frame header: the magic 1995 and
+    then natoms, both big-endian 32-bit integers"""
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if len(head) < 8:
+        raise ValueError(f"{path}: too short to be an XTC")
+    magic, natoms = struct.unpack(">ii", head)
+    if magic != 1995:
+        raise ValueError(f"{path}: magic {magic} is not an XTC's 1995")
+    return natoms
+
+
+def check_atom_counts(outdir, prefixes=("full", "minimal", "minimal_lipid")):
+    """The ways the converted structure and trajectory files disagree on
+    how many atoms there are, one line each; empty when they agree.
+
+    For each prefix whose .pdb, .gro and .xtc all exist, the three counts
+    must be equal: every consumer pairs the .pdb or .gro with the .xtc, and
+    MDAnalysis refuses a pair that differs ("don't have the same number of
+    atoms"). cpptraj dropped extra points (Amber TIP4P-Ew/OPC water sites,
+    CHARMM lone pairs) from PDB output unless told `include_ep`, so a
+    full.pdb could not be paired with its full.xtc, silently when the only
+    sites were in stripped water (review CONV-2). Nothing checked, so the
+    pair was published.
+    """
+
+    problems = []
+    for prefix in prefixes:
+        paths = {ext: os.path.join(outdir, f"{prefix}.{ext}") for ext in ("pdb", "gro", "xtc")}
+        if not all(os.path.isfile(p) for p in paths.values()):
+            continue
+        try:
+            counts = {
+                "pdb": pdb_atom_count(paths["pdb"]),
+                "gro": gro_atom_count(paths["gro"]),
+                "xtc": xtc_atom_count(paths["xtc"]),
+            }
+        except (OSError, ValueError) as e:
+            problems.append(f"{prefix}: {e}")
+            continue
+        if len(set(counts.values())) > 1:
+            problems.append(
+                f"{prefix}.pdb has {counts['pdb']} atoms, {prefix}.gro "
+                f"{counts['gro']}, {prefix}.xtc {counts['xtc']}"
+            )
+    return problems
 
 
 # --------------------------------------------------
