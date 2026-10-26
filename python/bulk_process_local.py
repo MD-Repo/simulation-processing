@@ -67,6 +67,7 @@ Purpose: Phase B/D of the ddd/HANDOFF survey-first plan (see
 import argparse
 import collections
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -1038,6 +1039,12 @@ def seed_inferred_ligands(local_dir: str, args: Args) -> List[str]:
     byte; resolve_ligands() stores the DECLARED ligand when one is present
     and uses the inference only to verify it. This corrects how their data
     is READ, not their data.
+
+    mdr-process 0.19.0 reuses inferred_ligands.json only for the mol_id.py
+    and structure recorded beside it in inferred_ligands.inputs.json. The
+    record written here names the mol_id.py that ran and no structure: the
+    file was made from another structure on purpose, so a different
+    minimal.pdb does not invalidate it, but a changed mol_id.py still does.
     """
 
     meta_path = os.path.join(local_dir, METADATA_NAME)
@@ -1074,7 +1081,22 @@ def seed_inferred_ligands(local_dir: str, args: Args) -> List[str]:
         if proc.returncode != 0 and not os.path.isfile(out_json):
             return []
 
+    write_inferred_ligand_inputs(
+        os.path.join(processed, "inferred_ligands.inputs.json"),
+        os.path.join(args.script_dir, "mol_id.py"),
+    )
     return fixes
+
+
+def write_inferred_ligand_inputs(path: str, mol_id_path: str) -> None:
+    """The inputs record for a seeded inferred_ligands.json: the mol_id.py
+    that ran (by SHA-256), and no structure. The same shape as
+    InferredLigandInputs in mdr-process's process.rs."""
+    with open(mol_id_path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    with open(path, "w") as fh:
+        json.dump({"mol_id_sha256": digest, "structure_sha256": None}, fh, indent=2)
+        fh.write("\n")
 
 
 # --------------------------------------------------
