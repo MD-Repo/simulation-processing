@@ -227,22 +227,7 @@ def main():
         rv, out = subprocess.getstatusoutput(bash_script)
         if rv == 0:
             verbose("GROMACS processing completed.")
-
-            # Restore chain IDs from original coordinate file if provided
-            if coordinate_file and coordinate_file.endswith(".pdb"):
-                verbose("Restoring chain IDs from original PDB...")
-                pdb_files = ["full.pdb", "minimal.pdb"]
-                if lipid_present:
-                    pdb_files.append("minimal_lipid.pdb")
-
-                for pdb_file in pdb_files:
-                    pdb_path = os.path.join(args.outdir, pdb_file)
-                    if os.path.isfile(pdb_path):
-                        # Create backup
-                        backup_path = pdb_path.replace(".pdb", "_nochain.pdb")
-                        shutil.copy(pdb_path, backup_path)
-                        # Restore chain IDs
-                        restore_chain_ids(coordinate_file, backup_path, pdb_path)
+            label_gromacs_pdbs(args.outdir, coordinate_file, lipid_present)
         else:
             sys.exit(f"Failed to run '{bash_script}':\n{out}")
 
@@ -1307,68 +1292,215 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
 
 
 # --------------------------------------------------
-def restore_chain_ids(reference_pdb, target_pdb, output_pdb):
-    """Restore chain IDs from reference PDB to target PDB
+def pdb_atoms(path):
+    """The ATOM/HETATM records of the first MODEL of `path`, in order, as
+    (line index, atom name, residue name, residue number, insertion code)
+    with the names trimmed and upper-cased."""
+    atoms = []
+    with open(path) as fh:
+        for i, line in enumerate(fh):
+            if line.startswith("ENDMDL"):
+                break
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            atoms.append(
+                (
+                    i,
+                    line[12:16].strip().upper(),
+                    line[17:21].strip().upper(),
+                    line[22:26].strip(),
+                    line[26:27],
+                )
+            )
+    return atoms
 
-    Args:
-        reference_pdb: Original PDB file with chain information
-        target_pdb: GROMACS-generated PDB without chain info
-        output_pdb: Output PDB with restored chain IDs
+
+def _same_residue_name(a, b):
+    """Whether two writers' residue names are one residue's. GROMACS reads a
+    4-character name cpptraj wrote in columns 17-20 from columns 18-21, so
+    POPC comes back as OPC; a name that is a suffix of the other is the
+    same residue."""
+    return a == b or (a and b and (a.endswith(b) or b.endswith(a)))
+
+
+def _same_atom(a, b):
+    """Whether two atom records (from `pdb_atoms`) are the same atom: the
+    same atom name, residue number and insertion code, residue names that
+    agree as `_same_residue_name` does."""
+    return (
+        a[1] == b[1]
+        and a[3] == b[3]
+        and a[4] == b[4]
+        and _same_residue_name(a[2], b[2])
+    )
+
+
+def _with_columns(line, chain_id=None, element=None):
+    """`line` with its chain ID (column 22) and element (columns 77-78)
+    replaced where given. A line shorter than 78 columns is padded."""
+    line = line.rstrip("\n")
+    if chain_id is not None:
+        line = line[:21] + chain_id + line[22:]
+    if element is not None:
+        line = line.ljust(78)
+        line = line[:76] + element.rjust(2) + line[78:]
+    return line + "\n"
+
+
+def transfer_chain_ids(reference_pdb, target_pdb, output_pdb):
+    """Write `target_pdb` to `output_pdb` with the chain IDs of
+    `reference_pdb`, atom for atom.
+
+    The two files must describe the same atoms in the same order: the same
+    count, and each pair the same atom name and residue (`_same_atom`). An
+    atom whose reference chain ID is blank keeps the target's. Returns
+    True when the IDs were transferred, False (and writes nothing) when the
+    files are not atom for atom the same system.
+
+    Why atom for atom and nothing looser: the step this replaces mapped
+    residue NUMBER to chain ID, last writer wins, and rewrote every residue
+    with that number. GROMACS already writes correct chain IDs from the
+    TPR, one letter per molecule with each chain's own numbering, and the
+    pdb2gmx default restarts every chain at 1, so the map relabelled chain
+    A's residues 1-8 as chain B and the splitter then cut A in two (review
+    CONV-1/SEQ-1; a 2-chain system came out as 3 chains, barnase+barstar
+    as 5). Where the IDs cannot be matched atom for atom, GROMACS's own
+    are the ones to keep.
     """
 
     if not reference_pdb or not os.path.isfile(reference_pdb):
-        verbose(f"No reference PDB provided or file doesn't exist: {reference_pdb}")
+        verbose(f"No reference PDB to take chain IDs from: {reference_pdb}")
         return False
-
     if not os.path.isfile(target_pdb):
         verbose(f"Target PDB doesn't exist: {target_pdb}")
         return False
 
-    # Build chain mapping from reference PDB: resnum -> chain_id
-    chain_map = {}
-    with open(reference_pdb, "r") as f:
-        for line in f:
-            if line.startswith("ATOM") or line.startswith("HETATM"):
-                try:
-                    resnum = int(line[22:26].strip())
-                    chain_id = line[21:22].strip()
-                    if chain_id:  # Only if chain ID exists
-                        chain_map[resnum] = chain_id
-                except (ValueError, IndexError):
-                    continue
-
-    if not chain_map:
-        verbose("No chain information found in reference PDB")
+    ref = pdb_atoms(reference_pdb)
+    tgt = pdb_atoms(target_pdb)
+    if len(ref) != len(tgt):
+        verbose(
+            f"Chain IDs not transferred: {os.path.basename(reference_pdb)} has "
+            f"{len(ref)} atoms, {os.path.basename(target_pdb)} has {len(tgt)}; "
+            "keeping the chain IDs GROMACS wrote"
+        )
+        return False
+    mismatched = sum(1 for a, b in zip(ref, tgt) if not _same_atom(a, b))
+    if mismatched:
+        verbose(
+            f"Chain IDs not transferred: {mismatched} of {len(ref)} atoms differ "
+            f"between {os.path.basename(reference_pdb)} and "
+            f"{os.path.basename(target_pdb)}; keeping the chain IDs GROMACS wrote"
+        )
         return False
 
-    verbose(f"Found chain info for {len(chain_map)} residues in reference PDB")
+    with open(reference_pdb) as fh:
+        ref_lines = fh.read().splitlines()
+    chain_ids = [ref_lines[a[0]][21:22] for a in ref]
 
-    # Apply chain IDs to target PDB
-    fixed_lines = []
-    fixed_count = 0
-    with open(target_pdb, "r") as f:
-        for line in f:
-            if line.startswith("ATOM") or line.startswith("HETATM"):
-                try:
-                    resnum = int(line[22:26].strip())
-                    if resnum in chain_map:
-                        # Replace chain ID (column 21, 0-indexed position 21)
-                        new_line = line[:21] + chain_map[resnum] + line[22:]
-                        fixed_lines.append(new_line)
-                        fixed_count += 1
-                    else:
-                        fixed_lines.append(line)
-                except (ValueError, IndexError):
-                    fixed_lines.append(line)
-            else:
-                fixed_lines.append(line)
-
-    # Write output
-    with open(output_pdb, "w") as f:
-        f.writelines(fixed_lines)
-
-    verbose(f"Restored chain IDs for {fixed_count} atoms -> {output_pdb}")
+    changed = 0
+    out = []
+    with open(target_pdb) as fh:
+        lines = fh.read().splitlines(keepends=True)
+    by_line = {t[0]: k for k, t in enumerate(tgt)}
+    for i, line in enumerate(lines):
+        k = by_line.get(i)
+        if k is None or chain_ids[k] == " ":
+            out.append(line)
+            continue
+        if line[21:22] != chain_ids[k]:
+            changed += 1
+        out.append(_with_columns(line, chain_id=chain_ids[k]))
+    with open(output_pdb, "w") as fh:
+        fh.writelines(out)
+    verbose(
+        f"Chain IDs from {os.path.basename(reference_pdb)}: {changed} of "
+        f"{len(tgt)} atoms relabelled -> {output_pdb}"
+    )
     return True
+
+
+def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
+    """Rewrite `target_pdb`, a subset of `source_pdb`'s atoms in the same
+    order (minimal.pdb from full.pdb), with the source's chain IDs and
+    element symbols.
+
+    The target's atoms are matched to the source's in order, each to the
+    next source atom that is the same atom (`_same_atom`). A target atom
+    that cannot be matched leaves the file untouched; returns whether the
+    columns were copied.
+    """
+
+    if not (os.path.isfile(source_pdb) and os.path.isfile(target_pdb)):
+        return False
+    src = pdb_atoms(source_pdb)
+    tgt = pdb_atoms(target_pdb)
+    with open(source_pdb) as fh:
+        src_lines = fh.read().splitlines()
+
+    matched = []
+    j = 0
+    for atom in tgt:
+        while j < len(src) and not _same_atom(src[j], atom):
+            j += 1
+        if j == len(src):
+            warn(
+                f"{os.path.basename(target_pdb)}: atom {atom[1]} {atom[2]} "
+                f"{atom[3]} not found in order in {os.path.basename(source_pdb)}; "
+                "its chain IDs and elements are left as written"
+            )
+            return False
+        matched.append(src_lines[src[j][0]])
+        j += 1
+
+    changed = 0
+    out = []
+    with open(target_pdb) as fh:
+        lines = fh.read().splitlines(keepends=True)
+    by_line = {t[0]: k for k, t in enumerate(tgt)}
+    for i, line in enumerate(lines):
+        k = by_line.get(i)
+        if k is None:
+            out.append(line)
+            continue
+        src_line = matched[k]
+        new_chain = src_line[21:22] if chain_id else None
+        new_element = src_line[76:78].strip() if element else None
+        if new_element == "":
+            new_element = None
+        new_line = _with_columns(line, chain_id=new_chain, element=new_element)
+        if new_line != line:
+            changed += 1
+        out.append(new_line)
+    with open(target_pdb, "w") as fh:
+        fh.writelines(out)
+    verbose(
+        f"{os.path.basename(target_pdb)}: chain IDs and elements from "
+        f"{os.path.basename(source_pdb)}, {changed} of {len(tgt)} atoms changed"
+    )
+    return True
+
+
+def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
+    """Chain IDs and elements for the PDBs the GROMACS script wrote.
+
+    full.pdb takes the submitter's chain IDs when their coordinate PDB is
+    the same system atom for atom (`transfer_chain_ids`): that is where a
+    single moleculetype holding several chains, which GROMACS letters as
+    one molecule, gets its chains back. The file GROMACS wrote is kept as
+    full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
+    chain IDs (`copy_pdb_columns`).
+    """
+
+    full_pdb = os.path.join(outdir, "full.pdb")
+    if coordinate_file and coordinate_file.endswith(".pdb") and os.path.isfile(full_pdb):
+        verbose("Taking chain IDs from the submitted PDB...")
+        gmx_copy = os.path.join(outdir, "full.gmx.pdb")
+        shutil.copy(full_pdb, gmx_copy)
+        if not transfer_chain_ids(coordinate_file, gmx_copy, full_pdb):
+            os.remove(gmx_copy)
+
+    for name in ["minimal.pdb"] + (["minimal_lipid.pdb"] if lipid_present else []):
+        copy_pdb_columns(full_pdb, os.path.join(outdir, name), element=False)
 
 
 # --------------------------------------------------
