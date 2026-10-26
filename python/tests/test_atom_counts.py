@@ -8,18 +8,38 @@ run failed; a PSF with lone pairs published a full.pdb that MDAnalysis
 refuses to pair with its full.xtc. Nothing compared the counts.
 """
 
-import os
 import re
 import struct
+import importlib.util
+import os
 import sys
 import types
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-for _name in ("pytraj", "parmed"):
-    sys.modules.setdefault(_name, types.ModuleType(_name))
+def _load_module():
+    """Import the script with its conda-only dependencies stubbed out, only
+    while its body runs: a stub left in sys.modules breaks MDAnalysis for
+    every later test in the process (see test_dcd_sampling.py)."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    planted = [
+        name
+        for name in ("pytraj", "parmed")
+        if sys.modules.setdefault(name, types.ModuleType(name)).__spec__ is None
+    ]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "cpptraj_gmx_traj_manipulation",
+            os.path.join(here, "cpptraj_gmx_traj_manipulation.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name in planted:
+            sys.modules.pop(name, None)
 
-import cpptraj_gmx_traj_manipulation as c  # noqa: E402
+
+c = _load_module()
 
 
 # --------------------------------------------------
@@ -37,7 +57,9 @@ def write_gro(path, n):
     with open(path, "w") as fh:
         fh.write(f"title\n{n:>5}\n")
         for i in range(n):
-            fh.write(f"{i + 1:>5}ALA     CA{i + 1:>5}{0.0:>8.3f}{0.0:>8.3f}{0.0:>8.3f}\n")
+            fh.write(
+                f"{i + 1:>5}ALA     CA{i + 1:>5}{0.0:>8.3f}{0.0:>8.3f}{0.0:>8.3f}\n"
+            )
         fh.write("   4.00000   4.00000   4.00000\n")
 
 

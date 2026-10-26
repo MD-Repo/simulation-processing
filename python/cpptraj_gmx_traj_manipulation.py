@@ -1537,7 +1537,11 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
     """
 
     full_pdb = os.path.join(outdir, "full.pdb")
-    if coordinate_file and coordinate_file.endswith(".pdb") and os.path.isfile(full_pdb):
+    if (
+        coordinate_file
+        and coordinate_file.endswith(".pdb")
+        and os.path.isfile(full_pdb)
+    ):
         verbose("Taking chain IDs from the submitted PDB...")
         gmx_copy = os.path.join(outdir, "full.gmx.pdb")
         shutil.copy(full_pdb, gmx_copy)
@@ -1999,7 +2003,9 @@ def check_atom_counts(outdir, prefixes=("full", "minimal", "minimal_lipid")):
 
     problems = []
     for prefix in prefixes:
-        paths = {ext: os.path.join(outdir, f"{prefix}.{ext}") for ext in ("pdb", "gro", "xtc")}
+        paths = {
+            ext: os.path.join(outdir, f"{prefix}.{ext}") for ext in ("pdb", "gro", "xtc")
+        }
         if not all(os.path.isfile(p) for p in paths.values()):
             continue
         try:

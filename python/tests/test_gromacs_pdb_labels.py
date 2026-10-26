@@ -9,18 +9,36 @@ B 1-8 / A 9-12 / B 1-8 and the splitter cut chain A in two (review
 CONV-1, SEQ-1). The transfer is now atom for atom or not at all.
 """
 
+import importlib.util
 import os
 import sys
 import types
 
-import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def _load_module():
+    """Import the script with its conda-only dependencies stubbed out, only
+    while its body runs: a stub left in sys.modules breaks MDAnalysis for
+    every later test in the process (see test_dcd_sampling.py)."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    planted = [
+        name
+        for name in ("pytraj", "parmed")
+        if sys.modules.setdefault(name, types.ModuleType(name)).__spec__ is None
+    ]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "cpptraj_gmx_traj_manipulation",
+            os.path.join(here, "cpptraj_gmx_traj_manipulation.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name in planted:
+            sys.modules.pop(name, None)
 
-for _name in ("pytraj", "parmed"):
-    sys.modules.setdefault(_name, types.ModuleType(_name))
 
-import cpptraj_gmx_traj_manipulation as c  # noqa: E402
+c = _load_module()
 
 
 # --------------------------------------------------
@@ -82,7 +100,11 @@ def test_gromacs_chain_ids_survive_restarted_numbering(tmp_path):
 
     assert c.transfer_chain_ids(str(ref), str(full), str(tmp_path / "out.pdb"))
     assert chain_ids(tmp_path / "out.pdb") == [
-        ("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2),
+        ("A", 1),
+        ("A", 2),
+        ("A", 3),
+        ("B", 1),
+        ("B", 2),
     ]
 
 
@@ -109,12 +131,21 @@ def test_gromacs_renumbering_of_ions_does_not_block_the_transfer(tmp_path):
     ref = tmp_path / "submitted.pdb"
     full = tmp_path / "full.pdb"
     write(ref, residues(TWO_CHAINS) + [atom(50, "CL1", "LIG", "X", 999, "Cl")])
-    write(full, residues([(" ", TWO_CHAINS[0][1]), (" ", TWO_CHAINS[1][1])]) + [
-        atom(50, "CL1", "LIG", " ", 4, "Cl")
-    ])
+    write(
+        full,
+        residues([(" ", TWO_CHAINS[0][1]), (" ", TWO_CHAINS[1][1])])
+        + [atom(50, "CL1", "LIG", " ", 4, "Cl")],
+    )
     out = tmp_path / "out.pdb"
     assert c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert chain_ids(out) == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2), ("X", 4)]
+    assert chain_ids(out) == [
+        ("A", 1),
+        ("A", 2),
+        ("A", 3),
+        ("B", 1),
+        ("B", 2),
+        ("X", 4),
+    ]
 
 
 def test_a_blank_reference_chain_keeps_the_gromacs_letter(tmp_path):
@@ -143,7 +174,10 @@ def test_a_reference_of_other_atoms_is_not_applied(tmp_path):
     assert not out.exists()
 
     # The same count, but not the same atoms
-    other = [("A", [("MET", 1), ("ALA", 2), ("LYS", 3)]), ("B", [("TRP", 1), ("SER", 2)])]
+    other = [
+        ("A", [("MET", 1), ("ALA", 2), ("LYS", 3)]),
+        ("B", [("TRP", 1), ("SER", 2)]),
+    ]
     write(ref, residues(other))
     assert not c.transfer_chain_ids(str(ref), str(full.with_name("x.pdb")), str(out))
     write(full, residues(TWO_CHAINS))
@@ -190,15 +224,29 @@ def test_minimal_takes_the_elements_trjconv_wrote_from_the_tpr(tmp_path):
     full = tmp_path / "full.pdb"
     minimal = tmp_path / "minimal.pdb"
     ligand = [
-        ("C1", "C"), ("CL1", "Cl"), ("BR1", "Br"), ("SE1", "Se"), ("FE1", "Fe"), ("ZN1", "Zn"),
+        ("C1", "C"),
+        ("CL1", "Cl"),
+        ("BR1", "Br"),
+        ("SE1", "Se"),
+        ("FE1", "Fe"),
+        ("ZN1", "Zn"),
     ]
-    write(full, residues(TWO_CHAINS) + [
-        atom(60 + i, name, "LIG", "A", 9, el) for i, (name, el) in enumerate(ligand)
-    ])
+    write(
+        full,
+        residues(TWO_CHAINS)
+        + [
+            atom(60 + i, name, "LIG", "A", 9, el) for i, (name, el) in enumerate(ligand)
+        ],
+    )
     broken = {"C": "C", "Cl": "C", "Br": "B", "Se": "S", "Fe": "F", "Zn": ""}
-    write(minimal, [atom(1, "CA", "MET", "A", 1, "C")] + [
-        atom(2 + i, name, "LIG", "A", 9, broken[el]) for i, (name, el) in enumerate(ligand)
-    ])
+    write(
+        minimal,
+        [atom(1, "CA", "MET", "A", 1, "C")]
+        + [
+            atom(2 + i, name, "LIG", "A", 9, broken[el])
+            for i, (name, el) in enumerate(ligand)
+        ],
+    )
 
     assert c.copy_pdb_columns(str(full), str(minimal))
     assert elements(minimal) == ["C", "C", "Cl", "Br", "Se", "Fe", "Zn"]
@@ -219,7 +267,9 @@ def test_an_atom_missing_from_full_pdb_leaves_minimal_untouched(tmp_path):
     full = tmp_path / "full.pdb"
     minimal = tmp_path / "minimal.pdb"
     write(full, residues(TWO_CHAINS))
-    write(minimal, [atom(1, "CA", "MET", " ", 1, "C"), atom(2, "CA", "TRP", " ", 9, "C")])
+    write(
+        minimal, [atom(1, "CA", "MET", " ", 1, "C"), atom(2, "CA", "TRP", " ", 9, "C")]
+    )
     before = minimal.read_text()
     assert not c.copy_pdb_columns(str(full), str(minimal))
     assert minimal.read_text() == before
@@ -228,13 +278,31 @@ def test_an_atom_missing_from_full_pdb_leaves_minimal_untouched(tmp_path):
 def test_label_gromacs_pdbs_keeps_the_gromacs_full_pdb(tmp_path):
     ref = tmp_path / "submitted.pdb"
     write(ref, residues(TWO_CHAINS))
-    write(tmp_path / "full.pdb", residues([("A", TWO_CHAINS[0][1]), ("A", TWO_CHAINS[1][1])]))
-    write(tmp_path / "minimal.pdb", [atom(1, "CA", "MET", "A", 1, "C"), atom(2, "CA", "SER", "A", 2, "C")])
+    write(
+        tmp_path / "full.pdb",
+        residues([("A", TWO_CHAINS[0][1]), ("A", TWO_CHAINS[1][1])]),
+    )
+    write(
+        tmp_path / "minimal.pdb",
+        [atom(1, "CA", "MET", "A", 1, "C"), atom(2, "CA", "SER", "A", 2, "C")],
+    )
 
     c.label_gromacs_pdbs(str(tmp_path), str(ref), lipid_present=False)
 
-    assert chain_ids(tmp_path / "full.pdb") == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2)]
-    assert chain_ids(tmp_path / "full.gmx.pdb") == [("A", 1), ("A", 2), ("A", 3), ("A", 1), ("A", 2)]
+    assert chain_ids(tmp_path / "full.pdb") == [
+        ("A", 1),
+        ("A", 2),
+        ("A", 3),
+        ("B", 1),
+        ("B", 2),
+    ]
+    assert chain_ids(tmp_path / "full.gmx.pdb") == [
+        ("A", 1),
+        ("A", 2),
+        ("A", 3),
+        ("A", 1),
+        ("A", 2),
+    ]
     assert chain_ids(tmp_path / "minimal.pdb") == [("A", 1), ("B", 2)]
 
 
@@ -243,7 +311,10 @@ def test_label_gromacs_pdbs_without_a_pdb_coordinate_file(tmp_path):
     minimal.pdb still takes them from full.pdb"""
 
     write(tmp_path / "full.pdb", residues(TWO_CHAINS))
-    write(tmp_path / "minimal.pdb", [atom(1, "CA", "MET", " ", 1, "C"), atom(2, "CA", "SER", " ", 2, "C")])
+    write(
+        tmp_path / "minimal.pdb",
+        [atom(1, "CA", "MET", " ", 1, "C"), atom(2, "CA", "SER", " ", 2, "C")],
+    )
     c.label_gromacs_pdbs(str(tmp_path), str(tmp_path / "conf.gro"), lipid_present=False)
     assert not (tmp_path / "full.gmx.pdb").exists()
     assert chain_ids(tmp_path / "minimal.pdb") == [("A", 1), ("B", 2)]

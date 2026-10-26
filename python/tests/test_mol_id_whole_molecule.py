@@ -41,7 +41,9 @@ def _wrapped_copy(tmp_path):
     return out
 
 
-def test_a_ligand_split_across_the_box_reads_as_the_unwrapped_one(tmp_path, monkeypatch):
+def test_a_ligand_split_across_the_box_reads_as_the_unwrapped_one(
+    tmp_path, monkeypatch
+):
     (whole,) = mol_id.structure_to_smiles(str(VPX))
     (split,) = mol_id.structure_to_smiles(str(_wrapped_copy(tmp_path)))
     assert split["inchikey"] == whole["inchikey"]
@@ -69,10 +71,14 @@ def test_a_molecule_longer_than_half_the_box_is_walked_along_its_bonds(tmp_path)
     minimum-image shift would, atoms past 5 A would fold back"""
     pdb = tmp_path / "chain.pdb"
     xs = [0.5, 2.0, 3.5, 5.0, 6.5 - 10.0, 8.0 - 10.0]
-    text = "CRYST1   10.000   10.000   10.000  90.00  90.00  90.00 P 1\n" + "".join(
-        f"HETATM{i + 1:5d}  C{i + 1:<2} LIG A   1    {x:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
-        for i, x in enumerate(xs)
-    ) + "END\n"
+    text = (
+        "CRYST1   10.000   10.000   10.000  90.00  90.00  90.00 P 1\n"
+        + "".join(
+            f"HETATM{i + 1:5d}  C{i + 1:<2} LIG A   1    {x:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
+            for i, x in enumerate(xs)
+        )
+        + "END\n"
+    )
     pdb.write_text(text)
     u = mda.Universe(str(pdb))
     got = mol_id._whole_positions(u.atoms)
