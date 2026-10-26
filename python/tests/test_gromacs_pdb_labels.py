@@ -158,6 +158,47 @@ def test_minimal_takes_full_pdb_columns_in_order(tmp_path):
     assert chain_ids(minimal) == [("A", 1), ("A", 3), ("B", 2), ("C", 7)]
 
 
+def elements(path):
+    return [
+        line[76:78].strip()
+        for line in open(path)
+        if line.startswith(("ATOM", "HETATM"))
+    ]
+
+
+def test_minimal_takes_the_elements_trjconv_wrote_from_the_tpr(tmp_path):
+    """editconf re-derives elements from atom names: CL1 -> C, BR1 -> B,
+    SE1 -> S, FE1 -> F (review F1). full.pdb, from the TPR's atomic
+    numbers, has them right; minimal.pdb takes them atom for atom"""
+
+    full = tmp_path / "full.pdb"
+    minimal = tmp_path / "minimal.pdb"
+    ligand = [
+        ("C1", "C"), ("CL1", "Cl"), ("BR1", "Br"), ("SE1", "Se"), ("FE1", "Fe"), ("ZN1", "Zn"),
+    ]
+    write(full, residues(TWO_CHAINS) + [
+        atom(60 + i, name, "LIG", "A", 9, el) for i, (name, el) in enumerate(ligand)
+    ])
+    broken = {"C": "C", "Cl": "C", "Br": "B", "Se": "S", "Fe": "F", "Zn": ""}
+    write(minimal, [atom(1, "CA", "MET", "A", 1, "C")] + [
+        atom(2 + i, name, "LIG", "A", 9, broken[el]) for i, (name, el) in enumerate(ligand)
+    ])
+
+    assert c.copy_pdb_columns(str(full), str(minimal))
+    assert elements(minimal) == ["C", "C", "Cl", "Br", "Se", "Fe", "Zn"]
+    assert chain_ids(minimal) == [("A", 1), ("A", 9)]
+
+
+def test_a_blank_source_element_leaves_the_target_element(tmp_path):
+    full = tmp_path / "full.pdb"
+    minimal = tmp_path / "minimal.pdb"
+    write(full, [atom(1, "CA", "MET", "A", 1, "")])
+    write(minimal, [atom(1, "CA", "MET", " ", 1, "C")])
+    assert c.copy_pdb_columns(str(full), str(minimal))
+    assert elements(minimal) == ["C"]
+    assert chain_ids(minimal) == [("A", 1)]
+
+
 def test_an_atom_missing_from_full_pdb_leaves_minimal_untouched(tmp_path):
     full = tmp_path / "full.pdb"
     minimal = tmp_path / "minimal.pdb"

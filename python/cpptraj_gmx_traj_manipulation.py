@@ -1428,6 +1428,14 @@ def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
     next source atom that is the same atom (`_same_atom`). A target atom
     that cannot be matched leaves the file untouched; returns whether the
     columns were copied.
+
+    Elements are copied because `gmx editconf`, which rotates minimal.pdb
+    to its principal axes, re-derives every element from the atom name:
+    CL1 becomes C, BR1 becomes B, SE1 S and FE1 F, and mol_id then inferred
+    a ligand's chlorine as a methyl (review F1; 52 of 206 corpus minimal.pdb
+    files with CL* ligand atoms carried C). full.pdb is written by trjconv
+    from the TPR's atomic numbers and is right; on the no-TPR path it is
+    cpptraj's, from the coordinate PDB's own element column.
     """
 
     if not (os.path.isfile(source_pdb) and os.path.isfile(target_pdb)):
@@ -1488,7 +1496,7 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
     single moleculetype holding several chains, which GROMACS letters as
     one molecule, gets its chains back. The file GROMACS wrote is kept as
     full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
-    chain IDs (`copy_pdb_columns`).
+    chain IDs and elements (`copy_pdb_columns`).
     """
 
     full_pdb = os.path.join(outdir, "full.pdb")
@@ -1500,7 +1508,7 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
             os.remove(gmx_copy)
 
     for name in ["minimal.pdb"] + (["minimal_lipid.pdb"] if lipid_present else []):
-        copy_pdb_columns(full_pdb, os.path.join(outdir, name), element=False)
+        copy_pdb_columns(full_pdb, os.path.join(outdir, name))
 
 
 # --------------------------------------------------
