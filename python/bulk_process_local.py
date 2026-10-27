@@ -195,6 +195,7 @@ class Args(NamedTuple):
     toml_fix_dir: Optional[str]
     allow_name_mismatch: bool = False
     preflight_tsv: Optional[str] = None
+    replace_mismatched_name: bool = False
 
 
 # --------------------------------------------------
@@ -247,6 +248,14 @@ def get_args() -> Args:
         "checked that SMILES against the bundle's own coordinates. On its "
         "own it would import whatever the table says, and PDBbind has been "
         "wrong at least once (186l, MDR-40)",
+    )
+    parser.add_argument(
+        "--replace-mismatched-name", action="store_true",
+        help="Pass --replace-mismatched-name to fix_ligand_smiles.py, so a "
+        "TOML ligand name that disagrees with the table's is replaced by the "
+        "table's (the submitter's kept in a comment). REQUIRES "
+        "--allow-name-mismatch, and so --preflight: the table's name is right "
+        "only where the coordinates have confirmed the table's molecule",
     )
     parser.add_argument(
         "--preflight", default=None, metavar="TSV", dest="preflight_tsv",
@@ -408,6 +417,10 @@ def get_args() -> Args:
         parser.error("--allow-name-mismatch requires --preflight: the "
                      "override is only safe on bundles the preflight has "
                      "already checked against their coordinates")
+    if args.replace_mismatched_name and not args.allow_name_mismatch:
+        parser.error("--replace-mismatched-name requires "
+                     "--allow-name-mismatch: without it a disagreeing name "
+                     "is skipped, so there is nothing to replace")
     if args.preflight_tsv and not os.path.isfile(args.preflight_tsv):
         parser.error(f"--preflight {args.preflight_tsv}: no such file")
 
@@ -430,6 +443,7 @@ def get_args() -> Args:
         args.health_probe_objects, args.max_trips,
         args.toml_fix or None,
         args.allow_name_mismatch, args.preflight_tsv,
+        args.replace_mismatched_name,
     )
 
 
@@ -794,6 +808,8 @@ def fix_smiles(local_dir: str, args: Args) -> Tuple[bool, str]:
            "--table", args.smiles_table]
     if args.allow_name_mismatch:
         cmd.append("--allow-name-mismatch")
+    if args.replace_mismatched_name:
+        cmd.append("--replace-mismatched-name")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     detail = " ".join((proc.stdout or "").split())[:300]
     return proc.returncode == 0, detail

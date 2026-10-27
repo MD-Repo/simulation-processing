@@ -85,6 +85,7 @@ class Args(NamedTuple):
     smiles: Optional[str]
     source: Optional[str]
     replace: bool
+    replace_name: bool = False
 
 
 # --------------------------------------------------
@@ -125,8 +126,23 @@ def get_args() -> Args:
                              "written as `s`, which is a real value as far as "
                              "TOML is concerned, so the ordinary fill path "
                              "refuses it on purpose.")
+    parser.add_argument("--replace-mismatched-name", action="store_true",
+                        dest="replace_name",
+                        help="Where the TOML's ligand name disagrees with the "
+                             "table's, write the table's name too, keeping "
+                             "the submitter's in a comment. Only valid with "
+                             "--allow-name-mismatch, and only safe where "
+                             "preflight_ligands.py has confirmed the table's "
+                             "molecule against the coordinates: then the "
+                             "submitter's name is about a different molecule "
+                             "(the DDD exporter named another HET group from "
+                             "the same entry in ~950 bundles; Ken, 2026-10-27)")
     args = parser.parse_args()
 
+    if args.replace_name and not args.allow_name_mismatch:
+        parser.error("--replace-mismatched-name is only valid with "
+                     "--allow-name-mismatch; without it a disagreeing name "
+                     "is skipped, so there is nothing to replace")
     if args.replace and not args.smiles:
         parser.error("--replace is only valid with --smiles; there is no "
                      "table path that should ever overwrite a real value")
@@ -146,7 +162,7 @@ def get_args() -> Args:
 
     return Args(args.target, args.table, args.dry_run,
                 args.allow_name_mismatch, args.smiles, args.source,
-                args.replace)
+                args.replace, args.replace_name)
 
 
 # --------------------------------------------------
@@ -215,7 +231,9 @@ def find_toml(target: str) -> Optional[str]:
 # --------------------------------------------------
 def insert_smiles(text: str, smiles: str, source: str,
                   replace: bool = False,
-                  name: str = "", name_source: str = "") -> Tuple[str, int]:
+                  name: str = "", name_source: str = "",
+                  replace_name: bool = False,
+                  replaced_source: str = "") -> Tuple[str, int]:
     """Add "smiles = ..." to the one [[ligands]] table that lacks it.
 
     Returns (new_text, line_number). Walks the file as lines and tracks which
@@ -235,7 +253,9 @@ def insert_smiles(text: str, smiles: str, source: str,
     With `name`, a BLANK name in the same table is filled too, under its own
     provenance comment. A name the submitter did give is never touched, even
     if it disagrees with `name` -- that disagreement is the name check's
-    business, not this function's.
+    business, not this function's -- unless `replace_name` is set: then a
+    name that differs from `name` (ignoring case) is replaced as well, and
+    `replaced_source`, with the submitter's name appended, goes above it.
     """
 
     lines = text.split("\n")
@@ -302,9 +322,19 @@ def insert_smiles(text: str, smiles: str, source: str,
 
     if name and name_at is not None:
         value = lines[name_at].split("=", 1)[-1].strip()
+        try:
+            old = toml.loads(f"v = {value}")["v"]
+        except Exception:
+            old = value
+        note = None
         if value in ('""', "''"):
+            note = name_source
+        elif replace_name and str(old).strip().lower() != name.lower():
+            # One line: the comment must not let the old name break out of it.
+            note = f"{replaced_source}: {' '.join(str(old).split())}"
+        if note is not None:
             lines[name_at] = f"{indent}name = {toml_basic(name)}"
-            lines.insert(name_at, f"{indent}# {name_source}")
+            lines.insert(name_at, f"{indent}# {note}")
             if smiles_at is not None and smiles_at > name_at:
                 smiles_at += 1
             name_at += 1
@@ -436,10 +466,18 @@ def main() -> None:
             f"{os.path.basename(args.table)} "
             f"(pdb_id {pdb_id}); the submitter left it blank"
         )
+        replaced_source = (
+            f"name replaced by fix_ligand_smiles.py on "
+            f"{date.today().isoformat()} from "
+            f"{os.path.basename(args.table)} "
+            f"(pdb_id {pdb_id}); the submitter's name, which names a "
+            f"different molecule, was"
+        )
         try:
             new_text, line_no = insert_smiles(
                 text, entry.smiles, source, args.replace,
-                "" if args.smiles else entry.ligand_name, name_source)
+                "" if args.smiles else entry.ligand_name, name_source,
+                args.replace_name, replaced_source)
         except ValueError as err:
             print(f"  !! {path}: {err}")
             tally["ambiguous"] += 1
@@ -455,7 +493,8 @@ def main() -> None:
                    if l.get("smiles")]
             if entry.smiles not in got:
                 raise ValueError("value did not survive the round trip")
-            named = new_text.count(name_source) == 1
+            named = (new_text.count(name_source)
+                     + new_text.count(replaced_source)) == 1
             if named and entry.ligand_name not in [
                     l.get("name") for l in check.get("ligands", [])]:
                 raise ValueError("name did not survive the round trip")
@@ -468,7 +507,8 @@ def main() -> None:
               f"       + line {line_no - 1}: # {source}\n"
               f"       + line {line_no}: smiles = {toml_literal(entry.smiles)}")
         if named:
-            print(f"       + name = {toml_basic(entry.ligand_name)}")
+            verb = "replaced" if replaced_source in new_text else "filled"
+            print(f"       + name = {toml_basic(entry.ligand_name)} ({verb})")
             tally["named"] += 1
         if args.dry_run and not os.path.exists(f"{path}.orig"):
             print(f"       would save the original to {path}.orig")
