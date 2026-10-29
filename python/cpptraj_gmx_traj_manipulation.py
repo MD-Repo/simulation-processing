@@ -1881,15 +1881,6 @@ KNOWN_WATER = [
     "SPC",
     "SOL",
 ]
-# Monatomic ions by the residue names the force fields give them: Amber's
-# ion libraries (`Na+`, `Ca2+`, and the older `CA`, `ZN`, `IOD`), CHARMM's
-# (SOD, POT, CLA, CAL, ZN2, CES, LIT, RUB, BAR, CAD) and GROMACS's
-# (NA, CL, K, CA, MG, ZN, CU, and `CA2+`, `ZN2+`, `CU2+`). Stripped from
-# minimal.* and excluded from the RMS fit. Amber's calcium in particular is
-# residue CA, atom CA: not here, it stayed in minimal.pdb and the fit mask
-# `@CA,C,N`, the principal axes and get_rmsd_rmsf's `name CA` all counted
-# the freely diffusing ion as an alpha carbon, inflating the published RMSD
-# and giving the RMSF one entry per ion (review CONV-3, TQ-03).
 KNOWN_IONS = [
     "NA",
     "CL",
@@ -1903,6 +1894,17 @@ KNOWN_IONS = [
     "MG",  # Amber-style ion names
     "Na+",
     "Cl-",  # Case variants
+]
+# The ions the RMS fit and principal axes must not be measured on: the
+# stripped ones above plus the other monatomic ions by the residue names
+# Amber (`Ca2+`, and the older `CA`, `ZN`, `IOD`), CHARMM (POT, CAL, ZN2,
+# CES, LIT, RUB, BAR, CAD) and GROMACS (CA, ZN, CU, `CA2+`, `ZN2+`, `CU2+`)
+# give them. These stay in minimal.*: a bound Zn2+ or Ca2+ is part of the
+# structure, and whether to strip more ions is a policy decision
+# (review #8). But Amber's calcium is residue CA, atom CA, so left in the
+# fit mask `@CA,C,N` a freely diffusing ion was fitted and measured as an
+# alpha carbon (review CONV-3, TQ-03).
+FIT_EXCLUDED_IONS = KNOWN_IONS + [
     "MG2+",
     "POT",
     "CA",
@@ -2037,7 +2039,7 @@ def backbone_fit_mask(atom_names):
 
     if not atom_names & {"CA", "C", "N"}:
         return "@*"
-    return "@CA,C,N&!:" + ",".join(KNOWN_IONS + KNOWN_LIPIDS)
+    return "@CA,C,N&!:" + ",".join(FIT_EXCLUDED_IONS + KNOWN_LIPIDS)
 
 
 # --------------------------------------------------
