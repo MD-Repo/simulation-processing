@@ -700,12 +700,83 @@ def _smiles_from_coords(sel) -> dict:
     return _mol_summary(_bond_orders_from_hydrogens(mol) or mol)
 
 
+# Two atoms this close (A) are bonded for the purpose of making a molecule
+# whole: every covalent bond between the elements a ligand holds (C-I 2.14,
+# S-S 2.05) and nothing a periodic image could mimic.
+_WHOLE_BOND_CUTOFF = 2.2
+
+
+def _whole_positions(sel):
+    """`sel`'s positions with its molecule made whole across the periodic
+    boundary, or None when there is no box or nothing to move.
+
+    An XTC stores atoms wrapped into the cell, not molecules, and the
+    TPR-less GROMACS path (cpptraj with the coordinate PDB as topology)
+    keeps them so. OpenBabel then perceives bonds from the coordinates and
+    reads a ligand split across the box as two fragments with the ring
+    destroyed and the valences filled: ibuprofen as
+    CC(=C)[C@H](C(=O)O)C.CC(CC(=C)C)C, C13H24O2 (review F6).
+
+    Atoms within `_WHOLE_BOND_CUTOFF` under the minimum image are taken as
+    bonded and walked from the first atom of each connected piece, each
+    atom placed in the image nearest the atom it was reached from. That
+    makes a molecule of any size whole (a chain longer than half the box
+    included, which a single shift to the image nearest one atom would
+    break). An atom reached from nothing keeps its place.
+    """
+    box = sel.universe.dimensions
+    if box is None or not np.all(box[:3] > 0) or len(sel) < 2:
+        return None
+    from MDAnalysis.lib.distances import capped_distance, minimize_vectors
+
+    pos = sel.positions
+    pairs = capped_distance(
+        pos,
+        pos,
+        _WHOLE_BOND_CUTOFF,
+        box=box,
+        method="bruteforce",
+        return_distances=False,
+    )
+    adjacent = [[] for _ in range(len(pos))]
+    for i, j in pairs:
+        if i != j:
+            adjacent[i].append(int(j))
+            adjacent[j].append(int(i))
+
+    out = pos.copy()
+    placed = np.zeros(len(pos), dtype=bool)
+    for start in range(len(pos)):
+        if placed[start]:
+            continue
+        placed[start] = True
+        queue = [start]
+        while queue:
+            i = queue.pop()
+            for j in adjacent[i]:
+                if placed[j]:
+                    continue
+                step = minimize_vectors((pos[j] - out[i]).reshape(1, 3), box)[0]
+                out[j] = out[i] + step
+                placed[j] = True
+                queue.append(j)
+    if np.allclose(out, pos):
+        return None
+    return out
+
+
 def _read_coords(sel):
     """The selection as an OBMol, its bonds and bond orders read by
-    OpenBabel from the coordinates. Atoms keep the selection's order."""
+    OpenBabel from the coordinates. Atoms keep the selection's order. The
+    molecule is written whole (`_whole_positions`); the selection's own
+    positions are left as they were."""
     fd, tmp_path = tempfile.mkstemp(suffix=".pdb")
     os.close(fd)
+    whole = _whole_positions(sel)
+    original = sel.positions.copy() if whole is not None else None
     try:
+        if whole is not None:
+            sel.positions = whole
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             sel.write(tmp_path)
@@ -718,6 +789,8 @@ def _read_coords(sel):
         mol.PerceiveBondOrders()
         return mol
     finally:
+        if original is not None:
+            sel.positions = original
         os.unlink(tmp_path)
 
 

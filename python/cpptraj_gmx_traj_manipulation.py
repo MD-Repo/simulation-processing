@@ -36,10 +36,17 @@ def get_args():
 
 # --------------------------------------------------
 def generate_tpr_from_top(gro_file, top_file, outdir, gmx_path):
-    """Generate a TPR file from GRO and TOP files.
+    """Generate a TPR file from a structure file (.gro or .pdb) and a .top.
+
+    A TPR is what lets `trjconv -pbc mol` make molecules whole: the
+    alternative, cpptraj with the coordinate PDB as topology, takes its
+    bonds from distances, so a molecule broken across the box is two
+    molecules to it and autoimage leaves it broken (review SEQ-4, F6,
+    CONV-14: barnase+barstar in 10 fragments). grompp reads a .pdb as -c
+    as readily as a .gro.
 
     Args:
-        gro_file: Path to .gro structure file
+        gro_file: Path to the .gro or .pdb structure file
         top_file: Path to .top topology file (text format)
         outdir: Output directory for generated files
         gmx_path: Path to gmx executable
@@ -193,21 +200,36 @@ def main():
             if tpr_file:
                 verbose(f"Found TPR file alongside .top: {tpr_file}")
             else:
-                gro_file = find_matching_struct_for_top(
+                # A .gro beside the .top, else the submitted coordinate file
+                # (.pdb or .gro), else a .pdb beside the .top. A .top with a
+                # .pdb used to go straight to the cpptraj path, which cannot
+                # make molecules whole.
+                struct_file = find_matching_struct_for_top(
                     [topology_file, trajectory_file], ".gro"
                 )
-                if gro_file:
+                if (
+                    not struct_file
+                    and coordinate_file
+                    and coordinate_file.lower().endswith((".pdb", ".gro"))
+                    and os.path.isfile(coordinate_file)
+                ):
+                    struct_file = coordinate_file
+                if not struct_file:
+                    struct_file = find_matching_struct_for_top(
+                        [topology_file, trajectory_file], ".pdb"
+                    )
+                if struct_file:
                     verbose(
-                        f"No TPR found. Generating from {os.path.basename(topology_file)} + {os.path.basename(gro_file)}..."
+                        f"No TPR found. Generating from {os.path.basename(topology_file)} + {os.path.basename(struct_file)}..."
                     )
                     tpr_file = generate_tpr_from_top(
-                        gro_file, topology_file, args.outdir, gmx_path
+                        struct_file, topology_file, args.outdir, gmx_path
                     )
                     if not tpr_file:
                         warn("Could not generate TPR file. Some operations may fail.")
                 else:
                     warn(
-                        "No TPR or GRO found alongside .top file. Some operations may fail."
+                        "No TPR, GRO or PDB found alongside .top file. Some operations may fail."
                     )
 
         lipid_present = detect_lipids_gromacs(
@@ -227,22 +249,7 @@ def main():
         rv, out = subprocess.getstatusoutput(bash_script)
         if rv == 0:
             verbose("GROMACS processing completed.")
-
-            # Restore chain IDs from original coordinate file if provided
-            if coordinate_file and coordinate_file.endswith(".pdb"):
-                verbose("Restoring chain IDs from original PDB...")
-                pdb_files = ["full.pdb", "minimal.pdb"]
-                if lipid_present:
-                    pdb_files.append("minimal_lipid.pdb")
-
-                for pdb_file in pdb_files:
-                    pdb_path = os.path.join(args.outdir, pdb_file)
-                    if os.path.isfile(pdb_path):
-                        # Create backup
-                        backup_path = pdb_path.replace(".pdb", "_nochain.pdb")
-                        shutil.copy(pdb_path, backup_path)
-                        # Restore chain IDs
-                        restore_chain_ids(coordinate_file, backup_path, pdb_path)
+            label_gromacs_pdbs(args.outdir, coordinate_file, lipid_present)
         else:
             sys.exit(f"Failed to run '{bash_script}':\n{out}")
 
@@ -279,6 +286,13 @@ def main():
             "cpptraj failed during processing: "
             + "; ".join(CPPTRAJ_FAILURES)
             + " -- see the cpptraj output above for the reason"
+        )
+
+    mismatches = check_atom_counts(args.outdir)
+    if mismatches:
+        sys.exit(
+            "the converted files do not describe the same atoms: "
+            + "; ".join(mismatches)
         )
 
 
@@ -742,7 +756,7 @@ def process_stripped_trajectory(
     outdir,
     strip_mask,
     prefix,
-    fit_mask="@CA,C,N",
+    fit_mask=None,
     sampling_ps=None,
     box_present=False,
 ):
@@ -767,6 +781,8 @@ def process_stripped_trajectory(
         tuple: (xtc_path, pdb_path, ref_path) or (None, None, None) on failure
     """
 
+    if fit_mask is None:
+        fit_mask = backbone_fit_mask({"CA", "C", "N"})
     output_xtc = os.path.join(outdir, f"{prefix}.xtc")
     output_pdb = os.path.join(outdir, f"{prefix}.pdb")
     ref_pdb = os.path.join(outdir, f"{prefix}_ref.pdb")
@@ -789,7 +805,7 @@ def process_stripped_trajectory(
         f.write(f"principal {fit_mask} dorotation\n")
         f.write("rotate z 90\n")
         f.write("rotate x -90\n")
-        f.write(f"trajout {ref_pdb} pdb\n")
+        f.write(f"trajout {ref_pdb} pdb include_ep\n")
         f.write("run\n")
     rv, _ = run_cpptraj(cppin_ref, f"{prefix} reference")
     if rv != 0:
@@ -816,7 +832,7 @@ def process_stripped_trajectory(
         f.write(f"rms ref [rotref] {fit_mask}\n")
         f.write(time_action(sampling_ps))
         f.write(f"trajout {output_xtc} xtc\n")
-        f.write(f"trajout {output_pdb} pdb onlyframes 1\n")
+        f.write(f"trajout {output_pdb} pdb include_ep onlyframes 1\n")
         f.write("run\n")
     rv, _ = run_cpptraj(cppin_traj, prefix)
     if rv != 0:
@@ -887,7 +903,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     # the two paths disagree about whether there is a cell to image in.
     box_present = has_box(first_frame)
     atom_names = {atom.name for atom in traj.top.atoms}
-    fit_mask = "@CA,C,N" if atom_names & {"CA", "C", "N"} else "@*"
+    fit_mask = backbone_fit_mask(atom_names)
     if fit_mask == "@*":
         verbose(
             "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
@@ -919,7 +935,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
     with open(cppin_frame0, "w") as f:
         f.write(f"parm {topology_file}\n")
         f.write(f"trajin {trajectory_file} 1 1\n")
-        f.write(f"trajout {traj_pdb} pdb\n")
+        f.write(f"trajout {traj_pdb} pdb include_ep\n")
         f.write("run\n")
     # This output used to go to /dev/null. It is the only place the source
     # trajectory is read before conversion rewrites its timing, so it is the
@@ -975,7 +991,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
             # f.write(f"trajout {full_cif} cif onlyframes 1\n")
-            f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
+            f.write(f"trajout {full_pdb} pdb include_ep onlyframes 1\n")
             f.write("run\n")
         run_cpptraj(cppin_full, "full")
     else:
@@ -1083,7 +1099,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {trajectory_file} 1 1\n")
         else:
             f.write(f"trajin {coordinate_file} 1 1\n")
-        f.write(f"trajout {traj_pdb} pdb\n")
+        f.write(f"trajout {traj_pdb} pdb include_ep\n")
         f.write("run\n")
     _, frame0_out = run_cpptraj(cppin_frame0, "frame extraction", fatal=False)
     report_time_axis(trajectory_has_time_axis(frame0_out))
@@ -1128,7 +1144,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             box_present = False
             has_lipid = False
         atom_names = {atom.name for atom in traj.top.atoms}
-        fit_mask = "@CA,C,N" if atom_names & {"CA", "C", "N"} else "@*"
+        fit_mask = backbone_fit_mask(atom_names)
         if fit_mask == "@*":
             verbose(
                 "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
@@ -1138,7 +1154,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
         warn("Proceeding without box/lipid detection...")
         box_present = False
         has_lipid = False
-        fit_mask = "@CA,C,N"
+        fit_mask = backbone_fit_mask({"CA", "C", "N"})
 
     # Write conf files
     conf_pdb = os.path.join(outdir, "conf.pdb")
@@ -1149,7 +1165,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"trajin {trajectory_file} 1 1\n")
         else:
             f.write(f"trajin {coordinate_file}\n")
-        f.write(f"trajout {conf_pdb} pdb onlyframes 1\n")
+        f.write(f"trajout {conf_pdb} pdb include_ep onlyframes 1\n")
         f.write("run\n")
     run_cpptraj(cppin_conf, "conf extraction", fatal=False)
     fix_pdb_element_symbols(conf_pdb)
@@ -1215,7 +1231,7 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
             f.write(f"rms first {fit_mask}\n")
             f.write(time_action(sampling_ps))
             f.write(f"trajout {full_xtc} xtc\n")
-            f.write(f"trajout {full_pdb} pdb onlyframes 1\n")
+            f.write(f"trajout {full_pdb} pdb include_ep onlyframes 1\n")
             f.write("run\n")
         run_cpptraj(cppin_full, "full")
         fix_pdb_element_symbols(full_pdb)
@@ -1307,68 +1323,233 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
 
 
 # --------------------------------------------------
-def restore_chain_ids(reference_pdb, target_pdb, output_pdb):
-    """Restore chain IDs from reference PDB to target PDB
+def pdb_atoms(path):
+    """The ATOM/HETATM records of the first MODEL of `path`, in order, as
+    (line index, atom name, residue name, residue number, insertion code)
+    with the names trimmed and upper-cased."""
+    atoms = []
+    with open(path) as fh:
+        for i, line in enumerate(fh):
+            if line.startswith("ENDMDL"):
+                break
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            atoms.append(
+                (
+                    i,
+                    line[12:16].strip().upper(),
+                    line[17:21].strip().upper(),
+                    line[22:26].strip(),
+                    line[26:27],
+                )
+            )
+    return atoms
 
-    Args:
-        reference_pdb: Original PDB file with chain information
-        target_pdb: GROMACS-generated PDB without chain info
-        output_pdb: Output PDB with restored chain IDs
+
+def _same_residue_name(a, b):
+    """Whether two writers' residue names are one residue's. GROMACS reads a
+    4-character name cpptraj wrote in columns 17-20 from columns 18-21, so
+    POPC comes back as OPC; a name that is a suffix of the other is the
+    same residue."""
+    return a == b or (a and b and (a.endswith(b) or b.endswith(a)))
+
+
+def _same_atom(a, b, number=True):
+    """Whether two atom records (from `pdb_atoms`) are the same atom: the
+    same atom name and residue names that agree as `_same_residue_name`
+    does, and with `number` the same residue number and insertion code.
+    Not the number when the two files were numbered by different writers:
+    GROMACS renumbers water, ions and every other single-residue molecule
+    after the last chain residue (wrapping at 10000), so the submitter's
+    ion 999 is GROMACS's 13."""
+    return (
+        a[1] == b[1]
+        and (not number or (a[3] == b[3] and a[4] == b[4]))
+        and _same_residue_name(a[2], b[2])
+    )
+
+
+def _with_columns(line, chain_id=None, element=None):
+    """`line` with its chain ID (column 22) and element (columns 77-78)
+    replaced where given. A line shorter than 78 columns is padded."""
+    line = line.rstrip("\n")
+    if chain_id is not None:
+        line = line[:21] + chain_id + line[22:]
+    if element is not None:
+        line = line.ljust(78)
+        line = line[:76] + element.rjust(2) + line[78:]
+    return line + "\n"
+
+
+def transfer_chain_ids(reference_pdb, target_pdb, output_pdb):
+    """Write `target_pdb` to `output_pdb` with the chain IDs of
+    `reference_pdb`, atom for atom.
+
+    The two files must describe the same atoms in the same order: the same
+    count, and each pair the same atom and residue name (`_same_atom`
+    without the residue number, which GROMACS reassigns to single-residue
+    molecules). An atom whose reference chain ID is blank keeps the
+    target's. Returns
+    True when the IDs were transferred, False (and writes nothing) when the
+    files are not atom for atom the same system.
+
+    Why atom for atom and nothing looser: the step this replaces mapped
+    residue NUMBER to chain ID, last writer wins, and rewrote every residue
+    with that number. GROMACS already writes correct chain IDs from the
+    TPR, one letter per molecule with each chain's own numbering, and the
+    pdb2gmx default restarts every chain at 1, so the map relabelled chain
+    A's residues 1-8 as chain B and the splitter then cut A in two (review
+    CONV-1/SEQ-1; a 2-chain system came out as 3 chains, barnase+barstar
+    as 5). Where the IDs cannot be matched atom for atom, GROMACS's own
+    are the ones to keep.
     """
 
     if not reference_pdb or not os.path.isfile(reference_pdb):
-        verbose(f"No reference PDB provided or file doesn't exist: {reference_pdb}")
+        verbose(f"No reference PDB to take chain IDs from: {reference_pdb}")
         return False
-
     if not os.path.isfile(target_pdb):
         verbose(f"Target PDB doesn't exist: {target_pdb}")
         return False
 
-    # Build chain mapping from reference PDB: resnum -> chain_id
-    chain_map = {}
-    with open(reference_pdb, "r") as f:
-        for line in f:
-            if line.startswith("ATOM") or line.startswith("HETATM"):
-                try:
-                    resnum = int(line[22:26].strip())
-                    chain_id = line[21:22].strip()
-                    if chain_id:  # Only if chain ID exists
-                        chain_map[resnum] = chain_id
-                except (ValueError, IndexError):
-                    continue
-
-    if not chain_map:
-        verbose("No chain information found in reference PDB")
+    ref = pdb_atoms(reference_pdb)
+    tgt = pdb_atoms(target_pdb)
+    if len(ref) != len(tgt):
+        verbose(
+            f"Chain IDs not transferred: {os.path.basename(reference_pdb)} has "
+            f"{len(ref)} atoms, {os.path.basename(target_pdb)} has {len(tgt)}; "
+            "keeping the chain IDs GROMACS wrote"
+        )
+        return False
+    mismatched = sum(1 for a, b in zip(ref, tgt) if not _same_atom(a, b, number=False))
+    if mismatched:
+        verbose(
+            f"Chain IDs not transferred: {mismatched} of {len(ref)} atoms differ "
+            f"between {os.path.basename(reference_pdb)} and "
+            f"{os.path.basename(target_pdb)}; keeping the chain IDs GROMACS wrote"
+        )
         return False
 
-    verbose(f"Found chain info for {len(chain_map)} residues in reference PDB")
+    with open(reference_pdb) as fh:
+        ref_lines = fh.read().splitlines()
+    chain_ids = [ref_lines[a[0]][21:22] for a in ref]
 
-    # Apply chain IDs to target PDB
-    fixed_lines = []
-    fixed_count = 0
-    with open(target_pdb, "r") as f:
-        for line in f:
-            if line.startswith("ATOM") or line.startswith("HETATM"):
-                try:
-                    resnum = int(line[22:26].strip())
-                    if resnum in chain_map:
-                        # Replace chain ID (column 21, 0-indexed position 21)
-                        new_line = line[:21] + chain_map[resnum] + line[22:]
-                        fixed_lines.append(new_line)
-                        fixed_count += 1
-                    else:
-                        fixed_lines.append(line)
-                except (ValueError, IndexError):
-                    fixed_lines.append(line)
-            else:
-                fixed_lines.append(line)
-
-    # Write output
-    with open(output_pdb, "w") as f:
-        f.writelines(fixed_lines)
-
-    verbose(f"Restored chain IDs for {fixed_count} atoms -> {output_pdb}")
+    changed = 0
+    out = []
+    with open(target_pdb) as fh:
+        lines = fh.read().splitlines(keepends=True)
+    by_line = {t[0]: k for k, t in enumerate(tgt)}
+    for i, line in enumerate(lines):
+        k = by_line.get(i)
+        if k is None or chain_ids[k] == " ":
+            out.append(line)
+            continue
+        if line[21:22] != chain_ids[k]:
+            changed += 1
+        out.append(_with_columns(line, chain_id=chain_ids[k]))
+    with open(output_pdb, "w") as fh:
+        fh.writelines(out)
+    verbose(
+        f"Chain IDs from {os.path.basename(reference_pdb)}: {changed} of "
+        f"{len(tgt)} atoms relabelled -> {output_pdb}"
+    )
     return True
+
+
+def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
+    """Rewrite `target_pdb`, a subset of `source_pdb`'s atoms in the same
+    order (minimal.pdb from full.pdb), with the source's chain IDs and
+    element symbols.
+
+    The target's atoms are matched to the source's in order, each to the
+    next source atom that is the same atom (`_same_atom`). A target atom
+    that cannot be matched leaves the file untouched; returns whether the
+    columns were copied.
+
+    Elements are copied because `gmx editconf`, which rotates minimal.pdb
+    to its principal axes, re-derives every element from the atom name:
+    CL1 becomes C, BR1 becomes B, SE1 S and FE1 F, and mol_id then inferred
+    a ligand's chlorine as a methyl (review F1; 52 of 206 corpus minimal.pdb
+    files with CL* ligand atoms carried C). full.pdb is written by trjconv
+    from the TPR's atomic numbers and is right; on the no-TPR path it is
+    cpptraj's, from the coordinate PDB's own element column.
+    """
+
+    if not (os.path.isfile(source_pdb) and os.path.isfile(target_pdb)):
+        return False
+    src = pdb_atoms(source_pdb)
+    tgt = pdb_atoms(target_pdb)
+    with open(source_pdb) as fh:
+        src_lines = fh.read().splitlines()
+
+    matched = []
+    j = 0
+    for atom in tgt:
+        while j < len(src) and not _same_atom(src[j], atom):
+            j += 1
+        if j == len(src):
+            warn(
+                f"{os.path.basename(target_pdb)}: atom {atom[1]} {atom[2]} "
+                f"{atom[3]} not found in order in {os.path.basename(source_pdb)}; "
+                "its chain IDs and elements are left as written"
+            )
+            return False
+        matched.append(src_lines[src[j][0]])
+        j += 1
+
+    changed = 0
+    out = []
+    with open(target_pdb) as fh:
+        lines = fh.read().splitlines(keepends=True)
+    by_line = {t[0]: k for k, t in enumerate(tgt)}
+    for i, line in enumerate(lines):
+        k = by_line.get(i)
+        if k is None:
+            out.append(line)
+            continue
+        src_line = matched[k]
+        new_chain = src_line[21:22] if chain_id else None
+        new_element = src_line[76:78].strip() if element else None
+        if new_element == "":
+            new_element = None
+        new_line = _with_columns(line, chain_id=new_chain, element=new_element)
+        if new_line != line:
+            changed += 1
+        out.append(new_line)
+    with open(target_pdb, "w") as fh:
+        fh.writelines(out)
+    verbose(
+        f"{os.path.basename(target_pdb)}: chain IDs and elements from "
+        f"{os.path.basename(source_pdb)}, {changed} of {len(tgt)} atoms changed"
+    )
+    return True
+
+
+def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
+    """Chain IDs and elements for the PDBs the GROMACS script wrote.
+
+    full.pdb takes the submitter's chain IDs when their coordinate PDB is
+    the same system atom for atom (`transfer_chain_ids`): that is where a
+    single moleculetype holding several chains gets its chains back
+    (GROMACS 2025.4 wrote no chain ID at all for a merged two-chain
+    protein with nothing but an ion beside it). The file GROMACS wrote is
+    kept as full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
+    chain IDs and elements (`copy_pdb_columns`).
+    """
+
+    full_pdb = os.path.join(outdir, "full.pdb")
+    if (
+        coordinate_file
+        and coordinate_file.endswith(".pdb")
+        and os.path.isfile(full_pdb)
+    ):
+        verbose("Taking chain IDs from the submitted PDB...")
+        gmx_copy = os.path.join(outdir, "full.gmx.pdb")
+        shutil.copy(full_pdb, gmx_copy)
+        if not transfer_chain_ids(coordinate_file, gmx_copy, full_pdb):
+            os.remove(gmx_copy)
+
+    for name in ["minimal.pdb"] + (["minimal_lipid.pdb"] if lipid_present else []):
+        copy_pdb_columns(full_pdb, os.path.join(outdir, name))
 
 
 # --------------------------------------------------
@@ -1470,6 +1651,14 @@ def write_gromacs_bash(
                 "-dump 0 -n $OUTDIR/index_prestripped.ndx <<EOF\n"
                 "$PRESTRIPPED_GROUP\nEOF\n\n"
             )
+            # full.gro was written above from the whole TPR; a pre-stripped
+            # trajectory's full.xtc and full.pdb hold only the saved group,
+            # so write full.gro from the same frame and group (CONV-6)
+            f.write(
+                "  $GMX trjconv -s $TOP -f $OUTDIR/full.xtc -o $OUTDIR/full.gro "
+                "-dump 0 -n $OUTDIR/index_prestripped.ndx <<EOF\n"
+                "$PRESTRIPPED_GROUP\nEOF\n\n"
+            )
             f.write("else\n")
             f.write(
                 "  $GMX trjconv -s $TOP -f $OUTDIR/full.xtc -o $OUTDIR/full.pdb "
@@ -1509,15 +1698,29 @@ def write_gromacs_bash(
                     warn(f"Could not generate PDB topology for cpptraj: {e}")
                     cpptraj_topo = None
 
+            # Image only when there is a cell to image in, as the Amber and
+            # NAMD paths do. This path cannot make a molecule broken across
+            # the box whole (its bonds come from distances), which is why
+            # main() now generates a TPR from a .top and any structure file
+            # before falling back to it.
+            box_present = True
+            if cpptraj_topo:
+                try:
+                    box_present = has_box(pt.iterload(trajfile, top=cpptraj_topo)[0])
+                except Exception as e:
+                    warn(f"Could not read the box of {trajfile}: {e}; imaging anyway")
+            if not box_present:
+                verbose("No box detected. Skipping autoimage...")
+
             cppin_wrap = os.path.join(outdir, "cpptraj_wrap.in")
             full_xtc_path = os.path.join(outdir, "full.xtc")
             full_pdb_path = os.path.join(outdir, "full.pdb")
             with open(cppin_wrap, "w") as cf:
                 cf.write(f"parm {cpptraj_topo}\n")
                 cf.write(f"trajin {trajfile}\n")
-                cf.write("autoimage\n")
+                cf.write(autoimage_action(box_present))
                 cf.write(f"trajout {full_xtc_path} xtc\n")
-                cf.write(f"trajout {full_pdb_path} pdb onlyframes 1\n")
+                cf.write(f"trajout {full_pdb_path} pdb include_ep onlyframes 1\n")
                 cf.write("run\n")
 
             f.write("echo '[*] Wrapping trajectory with cpptraj autoimage'\n")
@@ -1692,6 +1895,62 @@ KNOWN_IONS = [
     "Na+",
     "Cl-",  # Case variants
 ]
+# The ions the RMS fit and principal axes must not be measured on: the
+# stripped ones above plus the other monatomic ions by the residue names
+# Amber (`Ca2+`, and the older `CA`, `ZN`, `IOD`), CHARMM (POT, CAL, ZN2,
+# CES, LIT, RUB, BAR, CAD) and GROMACS (CA, ZN, CU, `CA2+`, `ZN2+`, `CU2+`)
+# give them. These stay in minimal.*: a bound Zn2+ or Ca2+ is part of the
+# structure, and whether to strip more ions is a policy decision
+# (review #8). But Amber's calcium is residue CA, atom CA, so left in the
+# fit mask `@CA,C,N` a freely diffusing ion was fitted and measured as an
+# alpha carbon (review CONV-3, TQ-03).
+FIT_EXCLUDED_IONS = KNOWN_IONS + [
+    "MG2+",
+    "POT",
+    "CA",
+    "Ca2+",
+    "CA2+",
+    "CAL",
+    "ZN",
+    "Zn2+",
+    "ZN2",
+    "ZN2+",
+    "LI",
+    "Li+",
+    "LIT",
+    "RB",
+    "Rb+",
+    "RUB",
+    "CS",
+    "Cs+",
+    "CES",
+    "F",
+    "F-",
+    "BR",
+    "Br-",
+    "IOD",
+    "I-",
+    "SR",
+    "Sr2+",
+    "BA",
+    "Ba2+",
+    "BAR",
+    "CD",
+    "Cd2+",
+    "CAD",
+    "CU",
+    "CU1",
+    "Cu+",
+    "Cu2+",
+    "CU1+",
+    "CU2+",
+    "MN",
+    "Mn2+",
+    "NI",
+    "Ni2+",
+    "Fe2+",
+    "Fe3+",
+]
 KNOWN_LIPIDS = [
     "DPPC",
     "POPC",
@@ -1702,6 +1961,85 @@ KNOWN_LIPIDS = [
     "DSPC",
     "CHOL",
 ]
+
+
+# --------------------------------------------------
+def pdb_atom_count(path):
+    """ATOM/HETATM records in the first MODEL"""
+    return len(pdb_atoms(path))
+
+
+def gro_atom_count(path):
+    """The count on a .gro's second line"""
+    with open(path) as fh:
+        fh.readline()
+        return int(fh.readline().strip())
+
+
+def xtc_atom_count(path):
+    """The atom count from an XTC's first frame header: the magic 1995 and
+    then natoms, both big-endian 32-bit integers"""
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if len(head) < 8:
+        raise ValueError(f"{path}: too short to be an XTC")
+    magic, natoms = struct.unpack(">ii", head)
+    if magic != 1995:
+        raise ValueError(f"{path}: magic {magic} is not an XTC's 1995")
+    return natoms
+
+
+def check_atom_counts(outdir, prefixes=("full", "minimal", "minimal_lipid")):
+    """The ways the converted structure and trajectory files disagree on
+    how many atoms there are, one line each; empty when they agree.
+
+    For each prefix whose .pdb, .gro and .xtc all exist, the three counts
+    must be equal: every consumer pairs the .pdb or .gro with the .xtc, and
+    MDAnalysis refuses a pair that differs ("don't have the same number of
+    atoms"). cpptraj dropped extra points (Amber TIP4P-Ew/OPC water sites,
+    CHARMM lone pairs) from PDB output unless told `include_ep`, so a
+    full.pdb could not be paired with its full.xtc, silently when the only
+    sites were in stripped water (review CONV-2). Nothing checked, so the
+    pair was published.
+    """
+
+    problems = []
+    for prefix in prefixes:
+        paths = {
+            ext: os.path.join(outdir, f"{prefix}.{ext}") for ext in ("pdb", "gro", "xtc")
+        }
+        if not all(os.path.isfile(p) for p in paths.values()):
+            continue
+        try:
+            counts = {
+                "pdb": pdb_atom_count(paths["pdb"]),
+                "gro": gro_atom_count(paths["gro"]),
+                "xtc": xtc_atom_count(paths["xtc"]),
+            }
+        except (OSError, ValueError) as e:
+            problems.append(f"{prefix}: {e}")
+            continue
+        if len(set(counts.values())) > 1:
+            problems.append(
+                f"{prefix}.pdb has {counts['pdb']} atoms, {prefix}.gro "
+                f"{counts['gro']}, {prefix}.xtc {counts['xtc']}"
+            )
+    return problems
+
+
+# --------------------------------------------------
+def backbone_fit_mask(atom_names):
+    """The cpptraj mask the RMS fit and principal axes are measured on
+
+    The backbone CA, C and N of the polymer residues: not an ion named like
+    one (Amber's calcium is residue CA, atom CA) and not a lipid (CHARMM's
+    choline nitrogen is atom N). `@*` when there is no backbone to fit on,
+    a coarse-grained model.
+    """
+
+    if not atom_names & {"CA", "C", "N"}:
+        return "@*"
+    return "@CA,C,N&!:" + ",".join(FIT_EXCLUDED_IONS + KNOWN_LIPIDS)
 
 
 # --------------------------------------------------

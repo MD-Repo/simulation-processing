@@ -306,3 +306,23 @@ def test_health_probe_writes_a_bundles_worth_of_objects(monkeypatch, tmp_path):
         lambda *a, **k: (calls.append(1), Proc(0 if len(calls) < 7 else 1))[1])
     assert B.irods_healthy(args) is False, (
         "one failed object among many must condemn the whole probe")
+
+
+# --------------------------------------------------
+def test_a_seeded_inference_records_the_script_and_no_structure(tmp_path):
+    """mdr-process 0.19.0 reuses inferred_ligands.json only for the inputs
+    recorded beside it; a seeded file names the mol_id.py and no structure"""
+    import hashlib
+    import json
+
+    import bulk_process_local as b
+
+    mol_id = tmp_path / "mol_id.py"
+    mol_id.write_text("print('mol_id')\n")
+    record = tmp_path / "inferred_ligands.inputs.json"
+    b.write_inferred_ligand_inputs(str(record), str(mol_id))
+    got = json.loads(record.read_text())
+    assert got == {
+        "mol_id_sha256": hashlib.sha256(mol_id.read_bytes()).hexdigest(),
+        "structure_sha256": None,
+    }
