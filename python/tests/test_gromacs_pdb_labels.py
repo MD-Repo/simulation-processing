@@ -318,3 +318,71 @@ def test_label_gromacs_pdbs_without_a_pdb_coordinate_file(tmp_path):
     c.label_gromacs_pdbs(str(tmp_path), str(tmp_path / "conf.gro"), lipid_present=False)
     assert not (tmp_path / "full.gmx.pdb").exists()
     assert chain_ids(tmp_path / "minimal.pdb") == [("A", 1), ("B", 2)]
+
+
+# --------------------------------------------------
+def placed(serial, name, element, x, y=0.0, z=0.0, resnum=9):
+    """One LIG atom at (x, y, z)"""
+    line = atom(serial, name, "LIG", "A", resnum, element)
+    return line[:30] + f"{x:>8.3f}{y:>8.3f}{z:>8.3f}" + line[54:]
+
+
+def test_halogens_written_as_c_and_b_are_set_to_cl_and_br(tmp_path):
+    """DDD's Pro_lig.pdb writes CL1 as C and BR1 as B; on the no-TPR path
+    full.pdb copies that column. A halogen is bonded to one heavy atom and
+    no hydrogen"""
+
+    full = tmp_path / "full.pdb"
+    write(
+        full,
+        [
+            placed(1, "C1", "C", 0.0),
+            placed(2, "CL1", "C", 1.75),
+            placed(3, "C2", "C", -1.4),
+            placed(4, "BR1", "B", -3.3),
+            placed(5, "CL", "C", 20.0, resnum=10),  # a lone ion
+        ],
+    )
+
+    assert c.fix_halogen_elements(str(full)) == 3
+    assert elements(full) == ["C", "Cl", "C", "Br", "Cl"]
+
+
+def test_atoms_merely_named_like_halogens_are_left(tmp_path):
+    """The same corpus has a CF3 carbon named CL1 (MDR00092758) and
+    sulfurs named SE1 (MDR00090909); a methyl named CL2 has hydrogens"""
+
+    full = tmp_path / "full.pdb"
+    write(
+        full,
+        [
+            placed(1, "CL1", "C", 0.0),
+            placed(2, "F1", "F", 1.35),
+            placed(3, "F2", "F", -0.45, 1.27),
+            placed(4, "F3", "F", -0.45, -0.64, 1.1),
+            placed(5, "C2", "C", -0.5, -0.7, -1.3),
+            placed(6, "SE1", "S", 5.0),
+            placed(7, "C3", "C", 6.8),
+            placed(8, "C4", "C", 3.2),
+            placed(9, "CL2", "C", 10.0),
+            placed(10, "C5", "C", 11.5),
+            placed(11, "H1", "H", 9.0),
+        ],
+    )
+    before = full.read_text()
+
+    assert c.fix_halogen_elements(str(full)) == 0
+    assert full.read_text() == before
+
+
+def test_label_gromacs_pdbs_gives_minimal_the_corrected_halogens(tmp_path):
+    write(
+        tmp_path / "full.pdb",
+        [placed(1, "C1", "C", 0.0), placed(2, "CL1", "C", 1.75)],
+    )
+    write(tmp_path / "minimal.pdb", [placed(1, "CL1", "C", 1.75)])
+
+    c.label_gromacs_pdbs(str(tmp_path), str(tmp_path / "conf.gro"), lipid_present=False)
+
+    assert elements(tmp_path / "full.pdb") == ["C", "Cl"]
+    assert elements(tmp_path / "minimal.pdb") == ["Cl"]

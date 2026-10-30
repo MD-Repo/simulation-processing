@@ -1471,7 +1471,9 @@ def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
     a ligand's chlorine as a methyl (review F1; 52 of 206 corpus minimal.pdb
     files with CL* ligand atoms carried C). full.pdb is written by trjconv
     from the TPR's atomic numbers and is right; on the no-TPR path it is
-    cpptraj's, from the coordinate PDB's own element column.
+    cpptraj's, from the coordinate PDB's own element column, which can be
+    wrong too (DDD's Pro_lig.pdb writes CL1 as C), so `label_gromacs_pdbs`
+    corrects full.pdb's halogens (`fix_halogen_elements`) before this runs.
     """
 
     if not (os.path.isfile(source_pdb) and os.path.isfile(target_pdb)):
@@ -1524,6 +1526,74 @@ def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
     return True
 
 
+HALOGEN_ELEMENTS = {"CL": ("C", "Cl"), "BR": ("B", "Br")}
+
+
+def fix_halogen_elements(pdb_path):
+    """Rewrite `pdb_path` with Cl/Br in the element column of each atom
+    named CL*/BR* that the column calls C/B and that is bonded as a halogen
+    is: to no hydrogen and at most one heavy atom of its own residue
+    (distances under 1.3 and 2.3 Å). Returns the number of atoms changed.
+
+    On the no-TPR GROMACS path full.pdb takes its elements from the
+    submitter's coordinate PDB, and the DDD (DD-03B) Pro_lig.pdb writes
+    chlorine as C and bromine as B in the raw tarballs ("CL1 LIG ... C"),
+    so 2,257 public DDD sims carried them into full.pdb and minimal.pdb
+    (2026-10-29 scan). The name alone is not enough: the same corpus has a
+    CF3 carbon named CL1 (MDR00092758, four heavy neighbours), and sulfurs
+    named SE1/SE2 (MDR00090909), which is why selenium is not touched.
+    The submitter's own file is left as uploaded; only our output changes.
+    """
+
+    if not os.path.isfile(pdb_path):
+        return 0
+    with open(pdb_path) as fh:
+        lines = fh.read().splitlines(keepends=True)
+
+    residues = {}
+    for i, line in enumerate(lines):
+        if line.startswith("ENDMDL"):
+            break
+        if not line.startswith(("ATOM", "HETATM")) or len(line) < 54:
+            continue
+        try:
+            xyz = tuple(float(line[k : k + 8]) for k in (30, 38, 46))
+        except ValueError:
+            continue
+        key = (line[17:21], line[21], line[22:27])
+        residues.setdefault(key, []).append(
+            (i, line[12:16].strip().upper(), line[76:78].strip().upper(), xyz)
+        )
+
+    changed = 0
+    for atoms in residues.values():
+        for i, name, element, xyz in atoms:
+            wrong_right = HALOGEN_ELEMENTS.get(name[:2])
+            if not wrong_right or element != wrong_right[0]:
+                continue
+            hydrogens = heavy = 0
+            for j, _, other, oxyz in atoms:
+                if j == i:
+                    continue
+                d = sum((a - b) ** 2 for a, b in zip(xyz, oxyz)) ** 0.5
+                if other == "H" and d < 1.3:
+                    hydrogens += 1
+                elif other != "H" and d < 2.3:
+                    heavy += 1
+            if hydrogens == 0 and heavy <= 1:
+                lines[i] = _with_columns(lines[i], element=wrong_right[1])
+                changed += 1
+
+    if changed:
+        with open(pdb_path, "w") as fh:
+            fh.writelines(lines)
+        verbose(
+            f"{os.path.basename(pdb_path)}: {changed} CL*/BR* atoms written as "
+            "C/B set to Cl/Br"
+        )
+    return changed
+
+
 def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
     """Chain IDs and elements for the PDBs the GROMACS script wrote.
 
@@ -1532,8 +1602,10 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
     single moleculetype holding several chains gets its chains back
     (GROMACS 2025.4 wrote no chain ID at all for a merged two-chain
     protein with nothing but an ion beside it). The file GROMACS wrote is
-    kept as full.gmx.pdb. minimal.pdb (and minimal_lipid.pdb) then take full.pdb's
-    chain IDs and elements (`copy_pdb_columns`).
+    kept as full.gmx.pdb. Halogens full.pdb took from a wrong element
+    column are corrected (`fix_halogen_elements`), and minimal.pdb (and
+    minimal_lipid.pdb) then take full.pdb's chain IDs and elements
+    (`copy_pdb_columns`).
     """
 
     full_pdb = os.path.join(outdir, "full.pdb")
@@ -1548,6 +1620,7 @@ def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
         if not transfer_chain_ids(coordinate_file, gmx_copy, full_pdb):
             os.remove(gmx_copy)
 
+    fix_halogen_elements(full_pdb)
     for name in ["minimal.pdb"] + (["minimal_lipid.pdb"] if lipid_present else []):
         copy_pdb_columns(full_pdb, os.path.join(outdir, name))
 
