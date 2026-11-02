@@ -147,3 +147,14 @@ def test_all_three_mappings_share_the_same_three_columns():
                      'fieldnames = ["pdb_id", "url", "simulations"]',
                      'fieldnames = ["inchikey", "url", "simulations"]'):
         assert expected in source, expected
+
+
+def test_uniprot_query_reads_the_chains():
+    """md_simulation_uniprot is gone (md-repo-app 0299, MDR-104): a
+    simulation has a UniProt entry through its chains, once however many
+    chains share it"""
+    source = (PY_DIR / "export_mapping_file.py").read_text()
+    assert "md_simulation_uniprot su" not in source
+    assert "join md_polymer_uniprot pu" in source
+    assert "on pu.polymer_id = c.polymer_id" in source
+    assert "select distinct s.id" in source
