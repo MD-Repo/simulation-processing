@@ -1,12 +1,8 @@
 """Chain IDs and elements of the PDBs the GROMACS path writes.
 
-`restore_chain_ids`, which this replaces, mapped residue NUMBER to chain ID
-from the submitter's PDB (last writer wins) and rewrote every residue with
-that number. GROMACS already writes correct chain IDs from the TPR, one
-letter per molecule with each chain's own numbering, and pdb2gmx restarts
-every chain at 1, so a 2-chain system (A 1-12, B 1-8) came out as
-B 1-8 / A 9-12 / B 1-8 and the splitter cut chain A in two (review
-CONV-1, SEQ-1). The transfer is now atom for atom or not at all.
+minimal.pdb takes full.pdb's chain IDs and elements atom for atom. Which
+chain IDs full.pdb carries is decided by mdr-process (`assign_chain_ids`,
+MDR-106) for every path, not here.
 """
 
 import importlib.util
@@ -86,103 +82,6 @@ TWO_CHAINS = [
     ("A", [("MET", 1), ("ALA", 2), ("LYS", 3)]),
     ("B", [("GLY", 1), ("SER", 2)]),
 ]
-
-
-# --------------------------------------------------
-def test_gromacs_chain_ids_survive_restarted_numbering(tmp_path):
-    """CONV-1's shape: both chains numbered from 1. GROMACS's letters are
-    right and the submitter's agree; nothing may be relabelled by number"""
-
-    ref = tmp_path / "submitted.pdb"
-    full = tmp_path / "full.pdb"
-    write(ref, residues(TWO_CHAINS))
-    write(full, residues(TWO_CHAINS))
-
-    assert c.transfer_chain_ids(str(ref), str(full), str(tmp_path / "out.pdb"))
-    assert chain_ids(tmp_path / "out.pdb") == [
-        ("A", 1),
-        ("A", 2),
-        ("A", 3),
-        ("B", 1),
-        ("B", 2),
-    ]
-
-
-def test_chains_merged_into_one_moleculetype_get_their_letters_back(tmp_path):
-    """pdb2gmx -merge all puts both chains in one moleculetype, which
-    GROMACS letters as one molecule. The submitter's PDB, the same atoms
-    in the same order, says where B starts"""
-
-    ref = tmp_path / "submitted.pdb"
-    full = tmp_path / "full.pdb"
-    write(ref, residues(TWO_CHAINS))
-    write(full, residues([("A", TWO_CHAINS[0][1]), ("A", TWO_CHAINS[1][1])]))
-
-    out = tmp_path / "out.pdb"
-    assert c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert chain_ids(out) == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2)]
-
-
-def test_gromacs_renumbering_of_ions_does_not_block_the_transfer(tmp_path):
-    """GROMACS renumbers single-residue molecules after the last chain
-    residue: the submitter's chloride 999 is residue 4 in full.pdb, and
-    the merged protein has no letters at all (seen with GROMACS 2025.4)"""
-
-    ref = tmp_path / "submitted.pdb"
-    full = tmp_path / "full.pdb"
-    write(ref, residues(TWO_CHAINS) + [atom(50, "CL1", "LIG", "X", 999, "Cl")])
-    write(
-        full,
-        residues([(" ", TWO_CHAINS[0][1]), (" ", TWO_CHAINS[1][1])])
-        + [atom(50, "CL1", "LIG", " ", 4, "Cl")],
-    )
-    out = tmp_path / "out.pdb"
-    assert c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert chain_ids(out) == [
-        ("A", 1),
-        ("A", 2),
-        ("A", 3),
-        ("B", 1),
-        ("B", 2),
-        ("X", 4),
-    ]
-
-
-def test_a_blank_reference_chain_keeps_the_gromacs_letter(tmp_path):
-    ref = tmp_path / "submitted.pdb"
-    full = tmp_path / "full.pdb"
-    write(ref, residues([(" ", TWO_CHAINS[0][1]), ("B", TWO_CHAINS[1][1])]))
-    write(full, residues(TWO_CHAINS))
-
-    out = tmp_path / "out.pdb"
-    assert c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert chain_ids(out) == [("A", 1), ("A", 2), ("A", 3), ("B", 1), ("B", 2)]
-
-
-def test_a_reference_of_other_atoms_is_not_applied(tmp_path):
-    """The submitter's PDB is often the one BEFORE pdb2gmx: no hydrogens,
-    no water, so fewer atoms. Then GROMACS's own IDs stand and nothing is
-    written"""
-
-    ref = tmp_path / "submitted.pdb"
-    full = tmp_path / "full.pdb"
-    write(ref, residues(TWO_CHAINS))
-    water = [("X", [("SOL", 10), ("SOL", 11)])]
-    write(full, residues(TWO_CHAINS + water))
-    out = tmp_path / "out.pdb"
-    assert not c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert not out.exists()
-
-    # The same count, but not the same atoms
-    other = [
-        ("A", [("MET", 1), ("ALA", 2), ("LYS", 3)]),
-        ("B", [("TRP", 1), ("SER", 2)]),
-    ]
-    write(ref, residues(other))
-    assert not c.transfer_chain_ids(str(ref), str(full.with_name("x.pdb")), str(out))
-    write(full, residues(TWO_CHAINS))
-    assert not c.transfer_chain_ids(str(ref), str(full), str(out))
-    assert not out.exists()
 
 
 def test_minimal_takes_full_pdb_columns_in_order(tmp_path):
@@ -275,46 +174,14 @@ def test_an_atom_missing_from_full_pdb_leaves_minimal_untouched(tmp_path):
     assert minimal.read_text() == before
 
 
-def test_label_gromacs_pdbs_keeps_the_gromacs_full_pdb(tmp_path):
-    ref = tmp_path / "submitted.pdb"
-    write(ref, residues(TWO_CHAINS))
-    write(
-        tmp_path / "full.pdb",
-        residues([("A", TWO_CHAINS[0][1]), ("A", TWO_CHAINS[1][1])]),
-    )
-    write(
-        tmp_path / "minimal.pdb",
-        [atom(1, "CA", "MET", "A", 1, "C"), atom(2, "CA", "SER", "A", 2, "C")],
-    )
-
-    c.label_gromacs_pdbs(str(tmp_path), str(ref), lipid_present=False)
-
-    assert chain_ids(tmp_path / "full.pdb") == [
-        ("A", 1),
-        ("A", 2),
-        ("A", 3),
-        ("B", 1),
-        ("B", 2),
-    ]
-    assert chain_ids(tmp_path / "full.gmx.pdb") == [
-        ("A", 1),
-        ("A", 2),
-        ("A", 3),
-        ("A", 1),
-        ("A", 2),
-    ]
-    assert chain_ids(tmp_path / "minimal.pdb") == [("A", 1), ("B", 2)]
-
-
-def test_label_gromacs_pdbs_without_a_pdb_coordinate_file(tmp_path):
-    """A .gro coordinate file has no chain IDs: GROMACS's stand, and
-    minimal.pdb still takes them from full.pdb"""
+def test_label_gromacs_pdbs_leaves_full_pdb_and_copies_to_minimal(tmp_path):
+    """full.pdb keeps the IDs GROMACS wrote (mdr-process decides them
+    after); minimal.pdb takes full.pdb's"""
 
     write(tmp_path / "full.pdb", residues(TWO_CHAINS))
     write(
         tmp_path / "minimal.pdb",
         [atom(1, "CA", "MET", " ", 1, "C"), atom(2, "CA", "SER", " ", 2, "C")],
     )
-    c.label_gromacs_pdbs(str(tmp_path), str(tmp_path / "conf.gro"), lipid_present=False)
-    assert not (tmp_path / "full.gmx.pdb").exists()
+    c.label_gromacs_pdbs(str(tmp_path), lipid_present=False)
     assert chain_ids(tmp_path / "minimal.pdb") == [("A", 1), ("B", 2)]
