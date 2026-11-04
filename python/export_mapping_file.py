@@ -144,18 +144,30 @@ def main() -> None:
     # The slug is built here to match Simulation.slug ("MDR%08d") in the Django
     # app; it is what /explore/<slug> takes and what MDDB will link against.
     # Ordered by s.id so a given day's file is byte-stable when nothing changed.
+    #
+    # UniProt: a simulation has an entry when one of its chains does (md_chain
+    # -> md_polymer_uniprot), as on the site. md_simulation_uniprot, the
+    # submitters' declared IDs, was dropped by md-repo-app 0299 (MDR-104,
+    # 2026-11-02); the declared IDs that match a chain were copied onto the
+    # polymers first. DISTINCT: several chains of one simulation can share
+    # an entry. Checked on prod 2026-11-02 before the drop: same 23,803 rows;
+    # 69,562 simulation-entry pairs kept, 32,133 added (references found by
+    # sequence), 2,311 dropped (declared IDs that match no chain).
     if args.mapping == "uniprot":
         cur.execute(f"""
             select   u.uniprot_id,
                      'https://mdrepo.org/uniprot/view/' || u.uniprot_id as url,
                      coalesce((
-                         select string_agg('MDR' || lpad(s.id::text, 8, '0'),
-                                           ',' order by s.id)
-                         from   md_simulation s
-                                join md_simulation_uniprot su
-                                  on su.simulation_id = s.id
-                         where  su.uniprot_id = u.id
-                           and  {VISIBLE_SIM}
+                         select string_agg('MDR' || lpad(v.id::text, 8, '0'),
+                                           ',' order by v.id)
+                         from   (select distinct s.id
+                                 from   md_simulation s
+                                        join md_chain c
+                                          on c.simulation_id = s.id
+                                        join md_polymer_uniprot pu
+                                          on pu.polymer_id = c.polymer_id
+                                 where  pu.uniprot_id = u.id
+                                   and  {VISIBLE_SIM}) v
                      ), '') as simulations
             from     md_uniprot u
             order by 1

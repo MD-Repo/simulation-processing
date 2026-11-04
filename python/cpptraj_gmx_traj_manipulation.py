@@ -249,7 +249,7 @@ def main():
         rv, out = subprocess.getstatusoutput(bash_script)
         if rv == 0:
             verbose("GROMACS processing completed.")
-            label_gromacs_pdbs(args.outdir, coordinate_file, lipid_present)
+            label_gromacs_pdbs(args.outdir, lipid_present)
         else:
             sys.exit(f"Failed to run '{bash_script}':\n{out}")
 
@@ -1381,80 +1381,6 @@ def _with_columns(line, chain_id=None, element=None):
     return line + "\n"
 
 
-def transfer_chain_ids(reference_pdb, target_pdb, output_pdb):
-    """Write `target_pdb` to `output_pdb` with the chain IDs of
-    `reference_pdb`, atom for atom.
-
-    The two files must describe the same atoms in the same order: the same
-    count, and each pair the same atom and residue name (`_same_atom`
-    without the residue number, which GROMACS reassigns to single-residue
-    molecules). An atom whose reference chain ID is blank keeps the
-    target's. Returns
-    True when the IDs were transferred, False (and writes nothing) when the
-    files are not atom for atom the same system.
-
-    Why atom for atom and nothing looser: the step this replaces mapped
-    residue NUMBER to chain ID, last writer wins, and rewrote every residue
-    with that number. GROMACS already writes correct chain IDs from the
-    TPR, one letter per molecule with each chain's own numbering, and the
-    pdb2gmx default restarts every chain at 1, so the map relabelled chain
-    A's residues 1-8 as chain B and the splitter then cut A in two (review
-    CONV-1/SEQ-1; a 2-chain system came out as 3 chains, barnase+barstar
-    as 5). Where the IDs cannot be matched atom for atom, GROMACS's own
-    are the ones to keep.
-    """
-
-    if not reference_pdb or not os.path.isfile(reference_pdb):
-        verbose(f"No reference PDB to take chain IDs from: {reference_pdb}")
-        return False
-    if not os.path.isfile(target_pdb):
-        verbose(f"Target PDB doesn't exist: {target_pdb}")
-        return False
-
-    ref = pdb_atoms(reference_pdb)
-    tgt = pdb_atoms(target_pdb)
-    if len(ref) != len(tgt):
-        verbose(
-            f"Chain IDs not transferred: {os.path.basename(reference_pdb)} has "
-            f"{len(ref)} atoms, {os.path.basename(target_pdb)} has {len(tgt)}; "
-            "keeping the chain IDs GROMACS wrote"
-        )
-        return False
-    mismatched = sum(1 for a, b in zip(ref, tgt) if not _same_atom(a, b, number=False))
-    if mismatched:
-        verbose(
-            f"Chain IDs not transferred: {mismatched} of {len(ref)} atoms differ "
-            f"between {os.path.basename(reference_pdb)} and "
-            f"{os.path.basename(target_pdb)}; keeping the chain IDs GROMACS wrote"
-        )
-        return False
-
-    with open(reference_pdb) as fh:
-        ref_lines = fh.read().splitlines()
-    chain_ids = [ref_lines[a[0]][21:22] for a in ref]
-
-    changed = 0
-    out = []
-    with open(target_pdb) as fh:
-        lines = fh.read().splitlines(keepends=True)
-    by_line = {t[0]: k for k, t in enumerate(tgt)}
-    for i, line in enumerate(lines):
-        k = by_line.get(i)
-        if k is None or chain_ids[k] == " ":
-            out.append(line)
-            continue
-        if line[21:22] != chain_ids[k]:
-            changed += 1
-        out.append(_with_columns(line, chain_id=chain_ids[k]))
-    with open(output_pdb, "w") as fh:
-        fh.writelines(out)
-    verbose(
-        f"Chain IDs from {os.path.basename(reference_pdb)}: {changed} of "
-        f"{len(tgt)} atoms relabelled -> {output_pdb}"
-    )
-    return True
-
-
 def copy_pdb_columns(source_pdb, target_pdb, chain_id=True, element=True):
     """Rewrite `target_pdb`, a subset of `source_pdb`'s atoms in the same
     order (minimal.pdb from full.pdb), with the source's chain IDs and
@@ -1594,32 +1520,24 @@ def fix_halogen_elements(pdb_path):
     return changed
 
 
-def label_gromacs_pdbs(outdir, coordinate_file, lipid_present):
-    """Chain IDs and elements for the PDBs the GROMACS script wrote.
+def label_gromacs_pdbs(outdir, lipid_present):
+    """Elements and chain IDs for the minimal PDBs the GROMACS script wrote:
+    minimal.pdb (and minimal_lipid.pdb) take full.pdb's (`copy_pdb_columns`),
+    so the pair reads back as the same chains.
 
-    full.pdb takes the submitter's chain IDs when their coordinate PDB is
-    the same system atom for atom (`transfer_chain_ids`): that is where a
-    single moleculetype holding several chains gets its chains back
-    (GROMACS 2025.4 wrote no chain ID at all for a merged two-chain
-    protein with nothing but an ion beside it). The file GROMACS wrote is
-    kept as full.gmx.pdb. Halogens full.pdb took from a wrong element
-    column are corrected (`fix_halogen_elements`), and minimal.pdb (and
-    minimal_lipid.pdb) then take full.pdb's chain IDs and elements
-    (`copy_pdb_columns`).
+    full.pdb keeps the chain IDs trjconv wrote from the TPR. Which chain IDs
+    a published file carries is decided in one place for every path
+    (GROMACS, Amber, NAMD/CHARMM): mdr-process `assign_chain_ids` (MDR-106,
+    mdrepo-rs#61), after this script. The submitter's IDs used to be copied
+    onto full.pdb here (`transfer_chain_ids`, GROMACS only); that rule now
+    keeps a file's IDs only when each chain has its own letter, and letters
+    every chain A, B, ... otherwise.
+
+    Halogens full.pdb took from a wrong element column are corrected first
+    (`fix_halogen_elements`), so minimal.pdb inherits the right ones.
     """
 
     full_pdb = os.path.join(outdir, "full.pdb")
-    if (
-        coordinate_file
-        and coordinate_file.endswith(".pdb")
-        and os.path.isfile(full_pdb)
-    ):
-        verbose("Taking chain IDs from the submitted PDB...")
-        gmx_copy = os.path.join(outdir, "full.gmx.pdb")
-        shutil.copy(full_pdb, gmx_copy)
-        if not transfer_chain_ids(coordinate_file, gmx_copy, full_pdb):
-            os.remove(gmx_copy)
-
     fix_halogen_elements(full_pdb)
     for name in ["minimal.pdb"] + (["minimal_lipid.pdb"] if lipid_present else []):
         copy_pdb_columns(full_pdb, os.path.join(outdir, name))
