@@ -23,7 +23,8 @@ are ever decompressed and the cost is a seek per frame.
   * AMBER NetCDF (classic, 64-bit offset or 64-bit data): the "time"
     record variable's values sit one per record at a fixed stride.
   * HDF5 (mdtraj, H5MD, NetCDF-4): the time dataset is read and written
-    through h5py; a dataset behind a compression filter is not rewritten.
+    through h5py, which re-encodes a chunk behind a compression filter and
+    leaves every other chunk of the file as it was.
   * DTR: a directory, whose frames store their time twice; refused.
 
 Ported from mdrepo-agent's internal/traj (xtc.go, trr.go, dcd.go, netcdf.go,
@@ -588,9 +589,9 @@ def time_scale(units: str) -> tuple[float, bool]:
 
 def hdf5_time_dataset(path: str):
     """Open the file read-write and return (file, time dataset) for the
-    mdtraj/AMBER layout (/coordinates and /time) or H5MD
-    (/particles/<name>/position/{value,time}). Refuses a dataset that cannot
-    be rewritten in place."""
+    mdtraj/AMBER layout (/coordinates and /time, which NetCDF-4 shares) or
+    H5MD (/particles/<name>/position/{value,time}). Refuses a dataset whose
+    values are not floating-point picoseconds."""
 
     import h5py
 
@@ -629,16 +630,6 @@ def hdf5_time_dataset(path: str):
             units = str(units)
         if not time_scale(units)[1]:
             raise Refused(f"the time dataset is in {units!r}, not picoseconds")
-        if (
-            td.compression is not None
-            or td.shuffle
-            or td.scaleoffset is not None
-            or td.fletcher32
-        ):
-            raise Refused(
-                "the time dataset is stored behind a compression filter, so its values cannot be "
-                "rewritten in place"
-            )
         return f, td
     except Exception:
         f.close()

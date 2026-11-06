@@ -15,17 +15,19 @@ corrected, and the release is never touched.
 Only the time field of each frame is rewritten: the 4-byte big-endian float
 at offset 12 of an XTC frame header, the real after a TRR frame's fixed
 header, the time record of an AMBER NetCDF, the time dataset of an HDF5
-file that stores it uncompressed. No frame changes length and no coordinate
-block is read, let alone re-encoded, so the file stays byte-identical
-everywhere except the time field. Offsets are collected before any write.
+file (mdtraj's, H5MD's, or AMBER NetCDF-4's, which is HDF5 too). No frame
+changes length and no coordinate block is read, let alone re-encoded, so
+the file stays byte-identical everywhere except the time field; an HDF5
+time dataset behind a compression filter has its own chunks re-encoded by
+h5py and nothing else touched. Offsets are collected before any write.
 
 Refused, with the reason, and nothing written: a DCD, which states one time
 step in its header and stamps no frame, so there is nothing per frame to
 rescale and the header is a claim already known to be unreliable (see
 set_dcd_spacing.py); a DTR, which stores each frame's time both in its
-index and inside the frame; an HDF5 time dataset behind a compression
-filter, or holding integers, or in a unit other than picoseconds. A refusal
-is a fact about the file, which the caller discloses, not a failure.
+index and inside the frame; an HDF5 time dataset holding integers, or in a
+unit other than picoseconds. A refusal is a fact about the file, which the
+caller discloses, not a failure.
 
 Moved here from mdrepo-agent's internal/traj RescaleTimes with the rest of
 the file-producing steps (mdrepo-agent#98).

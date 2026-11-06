@@ -195,7 +195,7 @@ def test_rescale_refuses_a_netcdf_time_in_nanoseconds(tmp_path):
         rescale_times.rescale(p, 1000)
 
 
-def test_rescale_rewrites_an_hdf5_time_dataset_unless_compressed(tmp_path):
+def test_rescale_rewrites_an_hdf5_time_dataset_compressed_or_not(tmp_path):
     h5py = pytest.importorskip("h5py")
     import numpy as np
 
@@ -209,14 +209,33 @@ def test_rescale_rewrites_an_hdf5_time_dataset_unless_compressed(tmp_path):
     with h5py.File(p, "r") as f:
         assert f["time"][:].tolist() == pytest.approx([1, 2, 3])
 
+    # A time dataset behind a compression filter, as a NetCDF-4 writer
+    # leaves it: h5py re-encodes its chunks and the coordinates' stay.
     q = str(tmp_path / "z.h5")
     with h5py.File(q, "w") as f:
-        f.create_dataset("coordinates", data=np.zeros((3, 2, 3), np.float32))
         f.create_dataset(
-            "time", data=np.array([1.0, 2.0, 3.0], np.float32), compression="gzip"
+            "coordinates",
+            data=np.arange(18, dtype=np.float32).reshape(3, 2, 3),
+            compression="gzip",
         )
-    with pytest.raises(tf.Refused, match="compression"):
-        rescale_times.rescale(q, 1000)
+        f.create_dataset(
+            "time",
+            data=np.array([1.0, 2.0, 3.0], np.float32),
+            compression="gzip",
+            shuffle=True,
+        )
+    assert rescale_times.rescale(q, 1000) == {"format": "hdf5", "frames": 3}
+    with h5py.File(q, "r") as f:
+        assert f["time"][:].tolist() == pytest.approx([1000, 2000, 3000])
+        assert f["coordinates"][:].flatten().tolist() == list(range(18))
+        assert f["time"].compression == "gzip", "the filter stays as it was"
+
+    z = str(tmp_path / "int.h5")
+    with h5py.File(z, "w") as f:
+        f.create_dataset("coordinates", data=np.zeros((2, 2, 3), np.float32))
+        f.create_dataset("time", data=np.array([0, 1], np.int64))
+    with pytest.raises(tf.Refused, match="integers"):
+        rescale_times.rescale(z, 1000)
 
     r = str(tmp_path / "h5md.h5")
     with h5py.File(r, "w") as f:
