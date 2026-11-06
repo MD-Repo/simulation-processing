@@ -28,6 +28,7 @@ dependencies = [
     "ty>=0.0.14",
     "pytest>=8.0",
     "rdkit>=2026.3.3",
+    "parmed>=4.3.1",
 ]
 
 [tool.pytest.ini_options]
