@@ -136,6 +136,10 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
     import MDAnalysis as mda
 
     s, t = structure, topology or ""
+    # A .tpr named as the structure alone is read as its own topology, so
+    # the atoms' places in it are known and it can be cut to them.
+    if not t and s.lower().endswith(".tpr"):
+        t = s
     top, whole, from_top = None, None, False
     if t and t != s and t.lower().endswith(SELF_CONTAINED):
         try:
