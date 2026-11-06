@@ -30,6 +30,7 @@ dependencies = [
     "rdkit>=2026.3.3",
     "parmed>=4.3.1",
     "mdtraj>=1.11.2",
+    "h5py>=3.16.0",
 ]
 
 [tool.pytest.ini_options]
