@@ -13,16 +13,13 @@ header, which cpptraj never exposes. The headers here are synthesised rather
 than committed as fixtures: the parser reads the first 92 bytes and nothing
 else, so a real multi-gigabyte trajectory would test exactly the same code.
 
-The module is loaded with pytraj/parmed stubbed. Those are real dependencies of
-the script, but they live in the simproc conda env that mdr-process runs it
-under, while this suite runs in .venv -- which has pytest and no pytraj. The
-functions under test touch neither.
+The module is loaded as it is: pytraj is gone from it and ParmEd is a
+dependency of this venv. The functions under test touch neither.
 """
 
 import importlib.util
 import struct
 import sys
-import types
 
 import pytest
 
@@ -32,28 +29,16 @@ AKMA_TO_PS = 4.888821e-2
 
 
 def _load_module():
-    """Import the script with its conda-only dependencies stubbed out."""
-
-    # The stubs are needed only while the module body runs, and must not
-    # outlive it. MDAnalysis asks `isinstance(thing, parmed.Structure)` while
-    # working out which parser a file needs, so a stub left in sys.modules
-    # makes every Universe in the process raise AttributeError -- which turned
-    # every later trajectory test into a silent pass.
-    planted = [
-        name
-        for name in ("pytraj", "parmed")
-        if sys.modules.setdefault(name, types.ModuleType(name)).__spec__ is None
-    ]
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "cpptraj_gmx_traj_manipulation", "cpptraj_gmx_traj_manipulation.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        for name in planted:
-            sys.modules.pop(name, None)
+    """Import the script by path. pytraj is gone and ParmEd is a real
+    dependency of this venv, so nothing is stubbed: a stub left in
+    sys.modules broke MDAnalysis for every later test (it asks
+    `isinstance(thing, parmed.Structure)`)."""
+    spec = importlib.util.spec_from_file_location(
+        "cpptraj_gmx_traj_manipulation", "cpptraj_gmx_traj_manipulation.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 cg = _load_module()

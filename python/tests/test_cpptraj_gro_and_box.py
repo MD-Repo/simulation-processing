@@ -36,12 +36,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# The module imports pytraj and parmed at the top and neither is in this venv.
-# Nothing under test here touches either -- these are pure functions over
-# duck-typed objects -- so stub them rather than pull in the simproc env.
-for _name in ("pytraj", "parmed"):
-    sys.modules.setdefault(_name, types.ModuleType(_name))
-
+# The module imports parmed (a dependency of this venv) and no longer pytraj.
+# Nothing under test here touches parmed -- these are pure functions over
+# duck-typed objects -- and it must not be stubbed: a stub left in
+# sys.modules breaks MDAnalysis for every later test.
 import cpptraj_gmx_traj_manipulation as c  # noqa: E402
 
 

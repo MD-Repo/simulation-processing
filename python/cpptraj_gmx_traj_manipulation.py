@@ -6,11 +6,15 @@ import shutil
 import struct
 import warnings
 import subprocess
-import pytraj as pt
 import parmed as pmd
 import sys
 from subprocess import getstatusoutput
-from typing import List
+from typing import List, NamedTuple, Optional, Set
+
+# Python 3.7 compatible on purpose, until mdr-process stops running this under
+# the simproc conda env (Python 3.7.12). pytraj was the only thing tying the
+# script to that env; it is gone (read_first_frame), so the same file runs
+# under simproc and under the uv env with ParmEd 4.3.1.
 
 warnings.filterwarnings("ignore")
 
@@ -592,6 +596,148 @@ def has_box(frame):
     return usable_box(getattr(frame, "box", None))
 
 
+class FirstFrame(NamedTuple):
+    """What this script needs to know about a trajectory's first frame.
+
+    `box` is [a, b, c, alpha, beta, gamma] in angstroms and degrees, or None
+    when there is none: cpptraj wrote no box line, or could not read the
+    frame at all (`frame_error` then says why). Pass the frame through
+    has_box before trusting the box: a run without a periodic cell can still
+    report zero lengths.
+    """
+
+    box: Optional[List[float]]
+    atom_names: Set[str]
+    residue_names: Set[str]
+    frame_error: Optional[str] = None
+
+
+def restart_box(lines):
+    """The box of an Amber ASCII restart's lines, or None if it has none.
+
+    Layout: a title, then "natoms [time]", then the coordinates six to a line
+    (12 characters each), then velocities if written, then one box line.
+    read_first_frame writes with `novelocity`, so anything after the
+    coordinates is the box. Read by column, not by whitespace: a value of
+    1,000 or more fills its 12 characters (F12.7) and touches the one before.
+    """
+    if len(lines) < 2 or not lines[1].split():
+        raise ValueError("not an Amber restart: no atom count on line 2")
+    natoms = int(lines[1].split()[0])
+    rest = [
+        line for line in lines[2 + (3 * natoms + 5) // 6 :] if line.strip()
+    ]
+    if not rest:
+        return None
+    line = rest[0].rstrip("\n")
+    values = [float(line[i : i + 12]) for i in range(0, len(line) - 11, 12)]
+    if len(values) < 3:
+        raise ValueError(f"short box line in Amber restart: {line!r}")
+    if len(values) < 6:
+        values += [90.0] * (6 - len(values))
+    return values[:6]
+
+
+def info_names(path):
+    """Column 2 (the name) of a cpptraj `atominfo` or `resinfo` table."""
+    names = set()
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) >= 2:
+                names.add(fields[1])
+    return names
+
+
+def run_cpptraj_quiet(cppin, outputs):
+    """Run cpptraj on `cppin`; return None if it made `outputs`, else why not.
+
+    Not run_cpptraj: that echoes cpptraj's output into the log and records
+    failures as fatal, and these reads were silent under pytraj.
+    """
+    for path in outputs:
+        if os.path.exists(path):
+            os.remove(path)
+    result = subprocess.run(
+        ["cpptraj", "-i", cppin], capture_output=True, text=True
+    )
+    missing = [os.path.basename(p) for p in outputs if not os.path.isfile(p)]
+    if result.returncode == 0 and not missing:
+        return None
+    out = ((result.stdout or "") + (result.stderr or "")).strip()
+    errors = [line for line in out.splitlines() if "Error" in line]
+    return (
+        f"exit {result.returncode}"
+        + (f", no {', '.join(missing)}" if missing else "")
+        + (": " + " | ".join(errors[:4]) if errors else "")
+    )
+
+
+def read_first_frame(topology_file, frames_file, outdir, conf_pdb=None):
+    """Box and atom/residue names of `frames_file`'s first frame, via cpptraj.
+
+    This replaces pytraj (iterload, then traj[0].box, traj.top.atoms and
+    traj.top.residues, and write_traj for conf.pdb), the only reason the
+    script needed the simproc conda env. pytraj is cpptraj's own reader and
+    PDB writer behind Python bindings, so asking cpptraj directly reads the
+    same topology and frame the same way.
+
+    Two cpptraj runs, to keep pytraj's behaviour when only the frame is bad.
+    pytraj loaded the topology on its own, so its atom and residue names held
+    even when the trajectory could not be read (a format cpptraj does not
+    know, or an atom count that disagrees with the topology); it then printed
+    "Global index 0 is out of range" and handed back an empty frame with a
+    zero box, i.e. "no box". So:
+
+      - topology unreadable: RuntimeError, as pytraj raised;
+      - frame unreadable: box None, `frame_error` set, conf.pdb not written.
+
+    If `conf_pdb` is given, the frame is also written there as a PDB, as
+    `pt.write_traj(conf_pdb, traj, frame_indices=[0], format="pdb")` did,
+    plus include_ep. Byte-identical for an Amber prmtop without extra points. With a PSF or PDB topology cpptraj
+    writes the frame's box as CRYST1 where pytraj took it from the topology
+    (none, or zeros and nan); only the prmtop path writes conf.pdb.
+    """
+    stem = os.path.join(outdir, "first_frame")
+    atoms = stem + "_atoms.dat"
+    residues = stem + "_residues.dat"
+    names_in = stem + "_names.in"
+    with open(names_in, "w") as f:
+        f.write(f"parm {topology_file}\n")
+        f.write(f"atominfo * out {atoms}\n")
+        f.write(f"resinfo * out {residues}\n")
+    why = run_cpptraj_quiet(names_in, [atoms, residues])
+    if why:
+        raise RuntimeError(
+            f"cpptraj could not read topology {topology_file} ({why})"
+        )
+
+    restart = stem + ".rst7"
+    frame_in = stem + ".in"
+    with open(frame_in, "w") as f:
+        f.write(f"parm {topology_file}\n")
+        f.write(f"trajin {frames_file} 1 1\n")
+        f.write(f"trajout {restart} restart novelocity\n")
+        if conf_pdb:
+            # include_ep, as every PDB this script writes (test_atom_counts);
+            # pytraj's write_traj left extra points out of conf.pdb.
+            f.write(f"trajout {conf_pdb} pdb include_ep\n")
+        f.write("run\n")
+    why = run_cpptraj_quiet(frame_in, [restart])
+    if why:
+        warn(
+            f"cpptraj could not read the first frame of {os.path.basename(frames_file)} "
+            f"({why}); treating it as having no box"
+        )
+        return FirstFrame(None, info_names(atoms), info_names(residues), why)
+
+    with open(restart) as fh:
+        box = restart_box(fh.read().splitlines())
+    return FirstFrame(box, info_names(atoms), info_names(residues))
+
+
 def bounding_box(structure):
     """A cell big enough to hold `structure`, with 5 angstroms of clearance.
 
@@ -887,45 +1033,28 @@ def generate_group_string(ions, lipids=None):
 def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, outdir):
     """Process Amber trajectory files to generate full and minimal variants"""
 
-    # Use iterload for memory efficiency with large trajectories
-    traj = None
     if trajectory_file:
-        traj = pt.iterload(trajectory_file, top=topology_file)
+        frames_file = trajectory_file
     elif coordinate_file:
-        traj = pt.iterload(coordinate_file, top=topology_file)
+        frames_file = coordinate_file
     else:
         warn("No trajectory or coordinates loaded; exiting.")
         return
 
-    first_frame = traj[0]
+    # Frame 0 also goes to conf.pdb, as pt.write_traj(frame_indices=[0]) did.
+    conf_pdb = os.path.join(outdir, "conf.pdb")
+    first_frame = read_first_frame(
+        topology_file, frames_file, outdir, conf_pdb=conf_pdb
+    )
     # Hoisted out of the full-trajectory branch below: the stripped
     # trajectories need the same answer, and re-deriving it there would let
     # the two paths disagree about whether there is a cell to image in.
     box_present = has_box(first_frame)
-    atom_names = {atom.name for atom in traj.top.atoms}
-    fit_mask = backbone_fit_mask(atom_names)
+    fit_mask = backbone_fit_mask(first_frame.atom_names)
     if fit_mask == "@*":
         verbose(
             "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
         )
-
-    # conf_cif = os.path.join(outdir, "conf.cif")
-    # pt.write_traj(
-    #    filename=conf_cif,
-    #    traj=traj,
-    #    frame_indices=[0],
-    #    format="cif",
-    #    overwrite=True,
-    # )
-
-    conf_pdb = os.path.join(outdir, "conf.pdb")
-    pt.write_traj(
-        filename=conf_pdb,
-        traj=traj,
-        frame_indices=[0],
-        format="pdb",
-        overwrite=True,
-    )
 
     # Extract a PDB from trajectory that matches topology atom count (for parmed)
     # We trust the toplogy file instead of the uploaded pdb file because in amber MD simulation
@@ -1037,7 +1166,7 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
             warn(f"Could not generate minimal.gro: {e}")
 
     # Minimal lipid trajectory (strip water and ions only, keep lipids)
-    has_lipid = any(res.name in KNOWN_LIPIDS for res in traj.top.residues)
+    has_lipid = bool(first_frame.residue_names & set(KNOWN_LIPIDS))
     strip_mask_minlip = ":" + ",".join(KNOWN_WATER + KNOWN_IONS)
 
     if has_lipid:
@@ -1113,44 +1242,32 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
         verbose(f"Recovered {sampling_ps} ps/frame from the source header")
     fix_pdb_element_symbols(traj_pdb)
 
-    # Load with pytraj to check box and lipids
-    # Load from trajectory file first (has box info), then check coordinate file
+    # Read the first frame to check box and lipids: from the trajectory
+    # first (it has the box), then the extracted frame, then the coordinates.
     box_info = None
     try:
-        import pytraj as pt
-
         if trajectory_file and os.path.isfile(trajectory_file):
-            traj = pt.iterload(trajectory_file, top=topology_file)
-            first_frame = traj[0]
-            box_present = has_box(first_frame)
-            if box_present:
-                box_info = list(first_frame.box)  # [a, b, c, alpha, beta, gamma]
-            has_lipid = any(res.name in KNOWN_LIPIDS for res in traj.top.residues)
+            frames_file = trajectory_file
         elif os.path.isfile(traj_pdb):
-            traj = pt.load(traj_pdb, top=topology_file)
-            first_frame = traj[0]
-            box_present = has_box(first_frame)
-            if box_present:
-                box_info = list(first_frame.box)
-            has_lipid = any(res.name in KNOWN_LIPIDS for res in traj.top.residues)
+            frames_file = traj_pdb
         elif coordinate_file:
-            traj = pt.load(coordinate_file, top=topology_file)
-            first_frame = traj[0]
-            box_present = has_box(first_frame)
-            if box_present:
-                box_info = list(first_frame.box)
-            has_lipid = any(res.name in KNOWN_LIPIDS for res in traj.top.residues)
+            frames_file = coordinate_file
         else:
-            box_present = False
-            has_lipid = False
-        atom_names = {atom.name for atom in traj.top.atoms}
-        fit_mask = backbone_fit_mask(atom_names)
+            # pytraj's version fell through to a NameError here and took the
+            # except below; same outcome, said plainly.
+            raise ValueError("no trajectory, extracted frame or coordinates")
+        first_frame = read_first_frame(topology_file, frames_file, outdir)
+        box_present = has_box(first_frame)
+        if box_present:
+            box_info = list(first_frame.box)  # [a, b, c, alpha, beta, gamma]
+        has_lipid = bool(first_frame.residue_names & set(KNOWN_LIPIDS))
+        fit_mask = backbone_fit_mask(first_frame.atom_names)
         if fit_mask == "@*":
             verbose(
                 "No backbone atoms (CA/C/N) found; using all atoms for RMS fit and principal rotation."
             )
     except Exception as e:
-        warn(f"Could not load trajectory with pytraj: {e}")
+        warn(f"Could not read the first frame with cpptraj: {e}")
         warn("Proceeding without box/lipid detection...")
         box_present = False
         has_lipid = False
@@ -1697,7 +1814,9 @@ def write_gromacs_bash(
             box_present = True
             if cpptraj_topo:
                 try:
-                    box_present = has_box(pt.iterload(trajfile, top=cpptraj_topo)[0])
+                    box_present = has_box(
+                        read_first_frame(cpptraj_topo, trajfile, outdir)
+                    )
                 except Exception as e:
                     warn(f"Could not read the box of {trajfile}: {e}; imaging anyway")
             if not box_present:
