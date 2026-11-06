@@ -288,6 +288,7 @@ def test_a_converted_run_maps_every_atom(tmp_path):
     assert (r.atoms, r.particles, r.pseudo, r.frames, r.dt) == (8, 11, 3, 2, 10)
     assert r.pseudo_on == {"LIG": 1, "T4P": 2}, "the solute's one and the waters' two"
     assert r.match_frame == 1 and r.match_spread <= 1e-4, "the .cms is frame 1 exactly"
+    assert r.matched
     assert r.bonds == 5 and r.forcefields == ["tiny ff", "tip4p"]
     assert r.renamed == 0 and r.named == 0 and r.regrouped == 0
     with open(bonds) as fh:
@@ -326,7 +327,7 @@ def test_a_trajectory_of_another_system_is_refused(tmp_path):
 def test_without_a_trajectory_only_the_pdb_is_written(tmp_path):
     pdb = str(tmp_path / "s.pdb")
     r = dc.convert(TINY, None, pdb, None)
-    assert r.atoms == 8 and r.frames == 0 and r.match_frame == -1
+    assert r.atoms == 8 and r.frames == 0 and r.match_frame == -1 and not r.matched
     assert os.path.exists(pdb)
     json.dumps(r._asdict())  # nothing in the report that JSON cannot carry
 

@@ -56,7 +56,10 @@ as --bonds. One JSON object on stdout:
   {"atoms": N, "particles": N, "pseudo": N, "pseudo_on": {resname: N},
    "renamed": N, "named": N, "regrouped": N, "bonds": N,
    "forcefields": [...], "frames": N, "first_time": ps, "dt": ps,
-   "match_frame": i, "match_spread": nm, "bond_p99": nm | null}
+   "match_frame": i, "match_spread": nm, "matched": bool, "bond_p99": nm | null}
+
+"matched" says the .cms coordinates are frame match_frame to within the
+tolerance; otherwise the mapping rested on the bond lengths.
 
 Exit 0 when converted; 1 with the reason as the last line of stderr when the
 .cms cannot be read, the trajectory is not the same system, or the atoms do
@@ -124,6 +127,7 @@ class Result(NamedTuple):
     dt: float
     match_frame: int
     match_spread: float
+    matched: bool
     bond_p99: Optional[float]
 
 
@@ -416,6 +420,7 @@ def convert(cms: str, trajectory: Optional[str], out_pdb: str, out_xtc: Optional
         dt=frames.dt,
         match_frame=frames.match_frame,
         match_spread=frames.match_spread if frames.frames else 0.0,
+        matched=frames.frames > 0 and frames.match_spread <= MAX_MATCH_SPREAD,
         bond_p99=frames.bond_p99,
     )
 
