@@ -828,6 +828,33 @@ wheels = [
 ]
 
 [[package]]
+name = "mdtraj"
+version = "1.11.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "pyparsing" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e3/b1/3b96824861b27ddfe437aa7b17ea15e8826baf8801907c4483a5b5f8987c/mdtraj-1.11.2.tar.gz", hash = "sha256:78e0e0063f40bfa507ea847337732d82ae4c03c973e50c4d290bae900ef4324a", size = 2893304, upload-time = "2026-10-05T15:55:04.003Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/db/2151b804a3cf8e5dfd3d565fda8dc8f079fbf47a33ff974a05eb22f4359b/mdtraj-1.11.2-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:00416ccb4705a2b754cccb790eaebfdcf5557c5e3ae6913ebd2bc32b1a2c2a9d", size = 5396121, upload-time = "2026-10-05T15:54:48.499Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/0e/0060d4658e74e138cb667452f4862ff50cdaffe2c587bee83eb1ecfe3c7c/mdtraj-1.11.2-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d1ad406d0ff8a8b6fe1ec1c347e11ff866b874dd13c991ca5793862faa573bca", size = 11257373, upload-time = "2026-10-05T15:54:50.337Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/1f/e35bb4318872ed5443ef638ba03d8251087ea3d3a753d7f946f10b9b4072/mdtraj-1.11.2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:41ad7ee1bfbe6f6f0b8a7b9475bb242387f393edebbf3901d2d0824f63a9cdf8", size = 11551013, upload-time = "2026-10-05T15:54:52.564Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/f1/ddabb00843d664d7c0e75b6553bdb8742fc8f3690363cb21d7f9307c2463/mdtraj-1.11.2-cp313-cp313-win_amd64.whl", hash = "sha256:4800ea74bae2d38c47edc68d499c7e0db6d9cdacf3f29c4823edf092cc7514a9", size = 4445950, upload-time = "2026-10-05T15:54:54.577Z" },
+    { url = "https://files.pythonhosted.org/packages/42/a7/d73a903a5dde1dc6cc528dc4b263030be57e4989cc4f945a2bd9bc065020/mdtraj-1.11.2-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:ac7acb2407009844c33071db3231c2c6d72b2d983322a70f79b69c68444134a6", size = 5430338, upload-time = "2026-10-05T15:54:56.233Z" },
+    { url = "https://files.pythonhosted.org/packages/28/20/8a94375fef6b74490a29d1b320eb2876e887a057903f14758b7188ae2bef/mdtraj-1.11.2-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e38cea404e58a0a41db04e48f79bd0086645d60a10fe66cec88124c3a682699b", size = 11250285, upload-time = "2026-10-05T15:54:57.788Z" },
+    { url = "https://files.pythonhosted.org/packages/40/fc/11fd697a6fea5ac3af6e41f0f472e5070ffd8e66f8975f679fe09a92daf9/mdtraj-1.11.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e8d8e372372036c82d1f0a3c83f087a4e84c231bd061de8c779db6c338a5889d", size = 11519780, upload-time = "2026-10-05T15:55:00.258Z" },
+    { url = "https://files.pythonhosted.org/packages/52/1c/27788ae7c8a00adbbbeb47c9627f94e2d011f90acbd72fd3f6989d7b0308/mdtraj-1.11.2-cp314-cp314-win_amd64.whl", hash = "sha256:60182169d5d8183e358cefc964b1e12bd121e8104544d803a9b6efdb3e7242ad", size = 4494699, upload-time = "2026-10-05T15:55:02.323Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/de/6722dd5df5e0a8cdb1d622363f679d3cf52729c51596c0deb6a3a9abf8b4/mdtraj-1.11.2-cp315-cp315-macosx_11_0_arm64.whl", hash = "sha256:a91fcdf638f19407cea3f519cb75520bf4a9814eecc7caaeb45d8d60f3af1a0f", size = 4132222, upload-time = "2026-10-13T16:19:18.197Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/a5/d01cfb21c0b3e76eb073333779741bea3a9b1b6de76db11e31d41a048215/mdtraj-1.11.2-cp315-cp315-macosx_11_0_x86_64.whl", hash = "sha256:58552ee37241adaca7836e0dbf7a97944346c393dc6a520a3eecb1cbff90e598", size = 4173038, upload-time = "2026-10-13T16:19:19.642Z" },
+    { url = "https://files.pythonhosted.org/packages/75/03/e23949908e4b9c2aa33658fce8a71cf73d07caab6a8791c6af0d8ea74a02/mdtraj-1.11.2-cp315-cp315-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:204b605e025d3045fcb1dd3a527932b69fa412c013aa91616fd6cbcfe0eacbfe", size = 11237427, upload-time = "2026-10-13T15:08:54.092Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/e5/6d5db953cf5f31e8f9e14bdd63897343fb9f407a6cd4a8fa6af4d69ed7b8/mdtraj-1.11.2-cp315-cp315-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:14924ede18627284b41105e742ccdab38b89ac263fb34247ee85306df5da446f", size = 11531102, upload-time = "2026-10-12T20:31:59.436Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/9d/9852c19bbc55eb0030a03fa1f4e9d789778f528ed646c1486c965cb51e3e/mdtraj-1.11.2-cp315-cp315-win_amd64.whl", hash = "sha256:0cfe6fb2de33278751062f017ce7ccc8de254f47b0e503a6ffcce2f6d31fb708", size = 4179433, upload-time = "2026-10-14T15:36:02.647Z" },
+]
+
+[[package]]
 name = "mmtf-python"
 version = "1.1.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1522,6 +1549,7 @@ dependencies = [
     { name = "humansize" },
     { name = "irods" },
     { name = "mdanalysis" },
+    { name = "mdtraj" },
     { name = "new-py" },
     { name = "openbabel-wheel" },
     { name = "parmed" },
@@ -1550,6 +1578,7 @@ requires-dist = [
     { name = "humansize", specifier = ">=1.0" },
     { name = "irods", specifier = ">=0.0.1" },
     { name = "mdanalysis", specifier = ">=2.10.0" },
+    { name = "mdtraj", specifier = ">=1.11.2" },
     { name = "new-py", specifier = ">=0.1.3" },
     { name = "openbabel-wheel", specifier = ">=3.1.1.23" },
     { name = "parmed", specifier = ">=4.3.1" },
