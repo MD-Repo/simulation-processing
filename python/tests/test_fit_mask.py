@@ -10,30 +10,21 @@ Ca2+ is part of the structure and stripping more ions is a policy decision
 import importlib.util
 import os
 import sys
-import types
 
 
 def _load_module():
-    """Import the script with its conda-only dependencies stubbed out, only
-    while its body runs: a stub left in sys.modules breaks MDAnalysis for
-    every later test in the process (see test_dcd_sampling.py)."""
+    """Import the script by path. pytraj is gone and ParmEd is a real
+    dependency of this venv, so nothing is stubbed: a stub left in
+    sys.modules broke MDAnalysis for every later test (it asks
+    `isinstance(thing, parmed.Structure)`)."""
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    planted = [
-        name
-        for name in ("pytraj", "parmed")
-        if sys.modules.setdefault(name, types.ModuleType(name)).__spec__ is None
-    ]
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "cpptraj_gmx_traj_manipulation",
-            os.path.join(here, "cpptraj_gmx_traj_manipulation.py"),
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        for name in planted:
-            sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(
+        "cpptraj_gmx_traj_manipulation",
+        os.path.join(here, "cpptraj_gmx_traj_manipulation.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 c = _load_module()
