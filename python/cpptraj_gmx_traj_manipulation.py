@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 
-import os
+import sys
+
+# mdr-process 0.34.0+ runs this under SCRIPT_DIR's uv environment (Python
+# 3.13+, ParmEd 4.3.1) with a standalone cpptraj. Until then it ran under the
+# `simproc` conda env's Python 3.7.12; say so plainly if an old host still does.
+if sys.version_info < (3, 13):
+    sys.exit(
+        f"cpptraj_gmx_traj_manipulation.py needs Python 3.13+ (the uv "
+        f"environment), not {sys.version.split()[0]} at {sys.executable}: "
+        "install mdr-process 0.34.0 or later"
+    )
+
+import os  # noqa: E402
 import argparse
 import shutil
 import struct
 import warnings
 import subprocess
 import parmed as pmd
-import sys
 from subprocess import getstatusoutput
-from typing import List, NamedTuple, Optional, Set
-
-# Python 3.7 compatible on purpose, until mdr-process stops running this under
-# the simproc conda env (Python 3.7.12). pytraj was the only thing tying the
-# script to that env; it is gone (read_first_frame), so the same file runs
-# under simproc and under the uv env with ParmEd 4.3.1.
+from typing import NamedTuple
 
 warnings.filterwarnings("ignore")
 
@@ -140,7 +146,7 @@ def find_matching_top_file(gro_file):
 
 
 # --------------------------------------------------
-def find_matching_struct_for_top(base_files: List[str], ext: str):
+def find_matching_struct_for_top(base_files: list[str], ext: str):
     """Find a structure file (.tpr or .gro) alongside a topology or trajectory file.
 
     Args:
@@ -446,10 +452,11 @@ def dcd_sampling_ps(path):
     ps/frame onto the XTC, and the fabricated spacing is measured back as
     though it were real. Reading the header here is what breaks that chain.
 
-    Parsed by hand rather than with MDAnalysis, which reads this correctly but
-    is not installed in the simproc env this script runs under. The layout is
-    fixed and ancient; offsets below are from readdcd.h, the reference
-    implementation MDAnalysis itself vendors:
+    Parsed by hand rather than with MDAnalysis, which reads this correctly:
+    written when the script ran under the simproc env, which had no
+    MDAnalysis, and kept because it reads 92 bytes and is pinned by tests
+    (test_dcd_sampling.py). The layout is fixed and ancient; offsets below are
+    from readdcd.h, the reference implementation MDAnalysis itself vendors:
 
         0..3    block size, always 84 -- also the endianness tell
         4..7    "CORD"
@@ -606,10 +613,10 @@ class FirstFrame(NamedTuple):
     report zero lengths.
     """
 
-    box: Optional[List[float]]
-    atom_names: Set[str]
-    residue_names: Set[str]
-    frame_error: Optional[str] = None
+    box: list[float] | None
+    atom_names: set[str]
+    residue_names: set[str]
+    frame_error: str | None = None
 
 
 def restart_box(lines):
