@@ -346,7 +346,7 @@ def test_split_leaves_out_replayed_frames_after_an_overlap(tmp_path):
 def test_split_with_nothing_to_split_writes_nothing(tmp_path):
     p = write(tmp_path, "one.xtc", tb.xtc([0.0, 10.0, 20.0]))
     report = split_at_resets.split(p, str(tmp_path / "one_{k}of{n}.xtc"))
-    assert report["split"] is False and report["frames"] == 3
+    assert report["split"] is False and report["frame_count"] == 3
     assert "no time reset" in report["reason"]
     assert list(tmp_path.glob("one_*")) == []
 

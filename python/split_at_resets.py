@@ -34,7 +34,7 @@ Output: the pieces, and one JSON object on stdout:
 
   {"format": "xtc", "split": true, "pieces": [paths], "frames": [N, ...],
    "dropped": N, "resets": N, "repeated": N, "overlaps": N}
-  {"format": "xtc", "split": false, "reason": "...", "frames": N,
+  {"format": "xtc", "split": false, "reason": "...", "frame_count": N,
    "first_ps": t, "last_ps": t}                     nothing to split at
 
 Exit 0 when split or when there was nothing to split; 1 with the reason as
@@ -132,7 +132,7 @@ def split(path: str, template: str) -> dict:
             "split": False,
             "reason": f"{run.name} has no time reset to split at: its {len(times)} frames run from "
             f"{times[0]:g} to {times[-1]:g} ps",
-            "frames": len(times),
+            "frame_count": len(times),
             "first_ps": times[0],
             "last_ps": times[-1],
         }
