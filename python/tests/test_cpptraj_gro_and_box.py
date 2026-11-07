@@ -76,10 +76,17 @@ class FakeStructure:
             picked.coordinates = self.coordinates[keep]
         return picked
 
-    def save(self, path, format=None):  # noqa: A002 - parmed's own signature
+    def save(self, path, format=None, combine=None):  # noqa: A002 - parmed's own signature
+        """Write a complete .gro, title to box, which save_gro reads back
+        with check_gro."""
+
         self.saved_to = path
         with open(path, "wt") as out:
-            print(f"{len(self.atoms)} atoms", file=out)
+            print("fake", file=out)
+            print(f"{len(self.atoms):5d}", file=out)
+            for i, atom in enumerate(self.atoms, 1):
+                print(f"{i:5d}{atom.residue.name:<5s}{'X':>5s}{i:5d}{0:8.3f}{0:8.3f}{0:8.3f}", file=out)
+            print("   1.00000   1.00000   1.00000", file=out)
 
 
 STRIP = {"HOH", "SOL", "NA", "CL"}
@@ -226,7 +233,7 @@ def test_a_failed_write_leaves_nothing_behind(tmp_path):
     out = tmp_path / "minimal.gro"
 
     class Exploding(FakeStructure):
-        def save(self, path, format=None):  # noqa: A002
+        def save(self, path, format=None, combine=None):  # noqa: A002
             with open(path, "wt") as handle:
                 print("every atom line, and then:", file=handle)
             raise ZeroDivisionError("division by zero")

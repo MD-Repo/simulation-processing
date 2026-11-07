@@ -21,6 +21,7 @@ registered checksum, and a checksum call that raises. Neither may be allowed to
 propagate, and neither may be allowed to read as verified.
 """
 
+import io
 import os
 import signal
 import sys
@@ -58,9 +59,12 @@ class FakeObj:
 
 # --------------------------------------------------
 class FakeDataObjects:
-    def __init__(self, obj, exists=True):
+    def __init__(self, obj, exists=True, content=b"", open_raises=None):
         self._obj = obj
         self._exists = exists
+        self._content = content
+        self._open_raises = open_raises
+        self.opens = 0
 
     def exists(self, _remote_path):
         return self._exists
@@ -68,22 +72,31 @@ class FakeDataObjects:
     def get(self, _remote_path):
         return self._obj
 
+    def open(self, _remote_path, _mode):
+        """The read that md5_readback hashes. Counted so a test can prove a
+        large file with a registered checksum is not read."""
+
+        self.opens += 1
+        if self._open_raises:
+            raise self._open_raises
+        return io.BytesIO(self._content)
+
 
 # --------------------------------------------------
 class FakeSession:
-    def __init__(self, obj, exists=True):
-        self.data_objects = FakeDataObjects(obj, exists)
+    def __init__(self, obj, exists=True, content=b"", open_raises=None):
+        self.data_objects = FakeDataObjects(obj, exists, content, open_raises)
 
 
 # --------------------------------------------------
 def test_absent_object_is_not_present():
-    """A path IRODS does not have is (False, None), and nothing is asked of it"""
+    """A path IRODS does not have is not present, and nothing is asked of it"""
 
     obj = FakeObj(size=10, checksum=GOOD_MD5)
-    present, md5 = p.verify_irods(FakeSession(obj, exists=False), "/z/gone", 10)
+    session = FakeSession(obj, exists=False)
 
-    assert (present, md5) == (False, None)
-    assert obj.chksum_calls == 0
+    assert p.verify_irods(session, "/z/gone", 10) == (False, None, "absent")
+    assert session.data_objects.opens == 0 and obj.chksum_calls == 0
 
 
 # --------------------------------------------------
@@ -95,25 +108,34 @@ def test_size_mismatch_is_not_present():
     """
 
     obj = FakeObj(size=17, checksum=GOOD_MD5)
-    present, md5 = p.verify_irods(FakeSession(obj), "/z/short", 4096)
+    session = FakeSession(obj)
 
-    assert (present, md5) == (False, None)
-    assert obj.chksum_calls == 0
+    assert p.verify_irods(session, "/z/short", 4096) == (False, None, "size mismatch")
+    assert session.data_objects.opens == 0
 
 
 # --------------------------------------------------
-def test_registered_checksum_is_used_without_computing():
-    """The catalog value is the answer, and chksum() is never called for it
+def test_a_small_file_is_proved_by_reading_it_back():
+    """Up to the read-back limit, the md5 is of the bytes IRODS serves, not
+    the catalog's claim about them"""
 
-    This is the whole point of registering the checksum at upload time: the
-    normal path must not touch the RPC that failed.
-    """
+    obj = FakeObj(size=0, checksum="md5:" + "0" * 32)
+    session = FakeSession(obj, content=b"")
+
+    assert p.verify_irods(session, "/z/small", 0, readback_limit=10) == (True, GOOD_MD5, "read back")
+    assert session.data_objects.opens == 1
+
+
+# --------------------------------------------------
+def test_registered_checksum_is_used_without_reading_or_computing():
+    """Above the read-back limit the catalog value is the answer: no second
+    pass over the file, and chksum() is never called for it"""
 
     obj = FakeObj(size=4096, checksum=GOOD_MD5)
-    present, md5 = p.verify_irods(FakeSession(obj), "/z/ok", 4096)
+    session = FakeSession(obj)
 
-    assert (present, md5) == (True, GOOD_MD5)
-    assert obj.chksum_calls == 0
+    assert p.verify_irods(session, "/z/ok", 4096, readback_limit=0) == (True, GOOD_MD5, "registered checksum")
+    assert session.data_objects.opens == 0 and obj.chksum_calls == 0
 
 
 # --------------------------------------------------
@@ -122,28 +144,44 @@ def test_checksum_is_normalised(registered):
     """A "md5:" prefix, padding, or upper case still compares to our manifest"""
 
     obj = FakeObj(size=4096, checksum=registered)
-    assert p.verify_irods(FakeSession(obj), "/z/ok", 4096) == (True, GOOD_MD5)
+    got = p.verify_irods(FakeSession(obj), "/z/ok", 4096, readback_limit=0)
+
+    assert got == (True, GOOD_MD5, "registered checksum")
 
 
 # --------------------------------------------------
-def test_missing_registration_falls_back_to_computing():
+def test_a_failed_read_back_falls_through_to_the_registered_checksum(capsys):
+    """A small file that will not read is recorded, and the catalog may still
+    know its checksum"""
+
+    obj = FakeObj(size=4096, checksum=GOOD_MD5)
+    session = FakeSession(obj, open_raises=OSError("connection reset"))
+
+    assert p.verify_irods(session, "/z/flaky", 4096) == (True, GOOD_MD5, "registered checksum")
+    assert "could not read back" in capsys.readouterr().out
+
+
+# --------------------------------------------------
+def test_missing_registration_falls_back_to_reading():
     """An object with no catalog checksum still gets an answer
 
     Objects uploaded before REG_CHKSUM_KW, or by something that is not this
-    script, have nothing registered. Forcing the computation is the only way
-    left to verify them, so the fallback has to exist.
+    script, have nothing registered. The bytes are read rather than calling
+    chksum(), the RPC that resolved a hierarchy and raised HIERARCHY_ERROR.
     """
 
-    obj = FakeObj(size=4096, checksum=None, chksum_returns=GOOD_MD5)
-    present, md5 = p.verify_irods(FakeSession(obj), "/z/old", 4096)
+    obj = FakeObj(size=4096, checksum=None, chksum_returns="f" * 32)
+    session = FakeSession(obj, content=b"")
 
-    assert (present, md5) == (True, GOOD_MD5)
-    assert obj.chksum_calls == 1
+    got = p.verify_irods(session, "/z/old", 4096, readback_limit=0)
+
+    assert got == (True, GOOD_MD5, "read back (no registered checksum)")
+    assert obj.chksum_calls == 0
 
 
 # --------------------------------------------------
-def test_hierarchy_error_is_contained(capsys):
-    """HIERARCHY_ERROR from chksum() returns unverified instead of propagating
+def test_an_unreadable_object_is_contained(capsys):
+    """A read that raises returns unverified instead of propagating
 
     The regression this file exists for. `present` stays True because the
     object really is there at the right size -- lying about that would send the
@@ -154,11 +192,10 @@ def test_hierarchy_error_is_contained(capsys):
 
     from irods.exception import HIERARCHY_ERROR
 
-    obj = FakeObj(size=4096, checksum=None, chksum_raises=HIERARCHY_ERROR(None))
-    present, md5 = p.verify_irods(FakeSession(obj), "/z/broken", 4096)
+    obj = FakeObj(size=4096, checksum=None)
+    session = FakeSession(obj, open_raises=HIERARCHY_ERROR(None))
 
-    assert present is True
-    assert md5 is None
+    assert p.verify_irods(session, "/z/broken", 4096, readback_limit=0) == (True, None, "unreadable")
     assert "could not checksum" in capsys.readouterr().out
 
 
@@ -170,14 +207,15 @@ def test_unverifiable_file_never_reads_as_verified():
     match. This pins the property at the point the decision is actually made.
     """
 
-    _present, remote_md5 = p.verify_irods(
-        FakeSession(FakeObj(size=4096, checksum=None, chksum_raises=RuntimeError("x"))),
+    _present, remote_md5, _how = p.verify_irods(
+        FakeSession(FakeObj(size=4096, checksum=None), open_raises=RuntimeError("x")),
         "/z/broken",
         4096,
+        readback_limit=0,
     )
 
+    assert remote_md5 is None
     assert remote_md5 != GOOD_MD5.lower()
-    assert not (remote_md5 == GOOD_MD5.lower())
 
 
 # --------------------------------------------------
