@@ -158,6 +158,49 @@ def test_wrap_safe_gives_each_block_past_the_wrap_its_own_chain(tmp_path):
     assert src.read_text().count("SOL A") == 20001, "the PDB itself is untouched"
 
 
+def subunits(n: int) -> str:
+    """A dipeptide n times, as trjconv writes an oligomer's frame: inside
+    MODEL and ENDMDL, every subunit chain A and numbered from 1.
+    zenodo:7986576's MthK tetramer is the case."""
+
+    lines, serial = ["MODEL        1"], 0
+    for s in range(n):
+        for res in (1, 2):
+            for name, x in [("N", 0), ("CA", 1.5), ("C", 3), ("O", 3.5), ("CB", 1.5),
+                            ("H", -0.5), ("HA", 1.5), ("HB1", 1), ("HB2", 2), ("HB3", 1.5)]:
+                serial += 1
+                lines.append(
+                    "ATOM  %5d  %-3s ALA A%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s"
+                    % (serial, name, res, x + (res - 1) * 3.8 + s * 20, float(serial % 3), 0.0, name[0])
+                )
+    return "\n".join(lines) + "\nTER\nENDMDL\nEND\n"
+
+
+def test_an_oligomer_frame_with_subunits_sharing_a_chain_is_read(tmp_path):
+    """ParmEd refuses the frame at ENDMDL, where it counts atoms by name and
+    residue; one model needs no wrapper. Nothing rewritten is left beside
+    the PDB."""
+
+    pdb, psf = tmp_path / "s.pdb", tmp_path / "s.psf"
+    pdb.write_text(subunits(4))
+
+    report = gt.generate(str(pdb), str(psf))
+
+    assert report.atoms == 80, "the 80 atoms of 4 subunits"
+    assert report.ok(), report.refusal()
+    assert not report.renumbered
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["s.pdb", "s.psf"]
+
+
+def test_several_models_are_not_read_as_one(tmp_path):
+    two = subunits(4).replace("ENDMDL\nEND\n", "ENDMDL\n") + subunits(4).replace("MODEL        1", "MODEL        2")
+    src, dest = tmp_path / "m.pdb", tmp_path / "one.pdb"
+    src.write_text(two)
+
+    assert not gt.single_model(str(src), str(dest))
+    assert not dest.exists()
+
+
 # --------------------------------------------------
 def run(*argv):
     return subprocess.run(
