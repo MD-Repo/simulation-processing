@@ -45,11 +45,11 @@ import argparse
 import json
 import os
 import sys
-import warnings
 from typing import NamedTuple
 
 import outputs
 import psf_elements
+from universe import is_chamber, open_universe
 
 
 class Args(NamedTuple):
@@ -84,30 +84,11 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
-def is_chamber(topology: str) -> bool:
-    """Whether the topology is a CHARMM-GUI Chamber .parm7."""
-
-    try:
-        with open(topology, "rb") as fh:
-            return b"%FLAG CTITLE" in fh.read(4096)
-    except OSError:
-        return False
-
-
-# --------------------------------------------------
 def write(topology: str, trajectory: str, out: str) -> Report:
     """Write the topology's atoms at the trajectory's first frame as a PDB."""
 
-    warnings.filterwarnings("ignore")
-    import MDAnalysis as mda
-
     chamber = is_chamber(topology)
-    if chamber:
-        import parmed
-
-        u = mda.Universe(parmed.load_file(topology), trajectory)
-    else:
-        u = mda.Universe(topology, trajectory)
+    u = open_universe(topology, trajectory)
     u.trajectory[0]
     # Written and checked beside out, then moved onto it: a check that fails
     # leaves a structure already at out as it was.
