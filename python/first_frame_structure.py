@@ -20,12 +20,21 @@ When the topology is a .psf, which carries no elements, the PDB's element
 column is filled from the topology's masses and bonds (psf_elements.py)
 rather than left for a reader to guess from the atoms' names.
 
+A CHARMM-GUI "Chamber" .parm7 is AMBER's format holding a CHARMM force field,
+and opens with %FLAG CTITLE where AMBER's own has %FLAG TITLE. MDAnalysis
+refuses it outright; ParmEd reads it, and MDAnalysis builds the Universe from
+the ParmEd structure. zenodo:6487373 is eleven such systems, each a .parm7 and
+its .nc runs with no coordinate file.
+
 Moved here from mdrepo-agent's internal/stage/firstframe.go with the rest of
 the file-producing steps (mdrepo-agent#98).
 
 Output: the PDB at --out, and one JSON object on stdout:
 
-  {"atoms": N, "elements": null | {"from": PSF, "repartitioned": N, "ions": N}}
+  {"atoms": N, "elements": null | {"from": PSF, "repartitioned": N, "ions": N},
+   "chamber": bool}
+
+"chamber" is true when the topology was a Chamber .parm7, read through ParmEd.
 
 Exit 0 when written; 1 with the reason as the last line of stderr when the
 files cannot be read or the written PDB does not hold the topology's atoms;
@@ -51,6 +60,7 @@ class Args(NamedTuple):
 class Report(NamedTuple):
     atoms: int
     elements: dict | None
+    chamber: bool
 
 
 # --------------------------------------------------
@@ -73,6 +83,16 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
+def is_chamber(topology: str) -> bool:
+    """Whether the topology is a CHARMM-GUI Chamber .parm7."""
+
+    try:
+        with open(topology, "rb") as fh:
+            return b"%FLAG CTITLE" in fh.read(4096)
+    except OSError:
+        return False
+
+
 # --------------------------------------------------
 def write(topology: str, trajectory: str, out: str) -> Report:
     """Write the topology's atoms at the trajectory's first frame as a PDB."""
@@ -80,7 +100,13 @@ def write(topology: str, trajectory: str, out: str) -> Report:
     warnings.filterwarnings("ignore")
     import MDAnalysis as mda
 
-    u = mda.Universe(topology, trajectory)
+    chamber = is_chamber(topology)
+    if chamber:
+        import parmed
+
+        u = mda.Universe(parmed.load_file(topology), trajectory)
+    else:
+        u = mda.Universe(topology, trajectory)
     u.trajectory[0]
     u.atoms.write(out)
 
@@ -93,7 +119,7 @@ def write(topology: str, trajectory: str, out: str) -> Report:
     elements = None
     if psf_elements.is_psf(topology):
         elements = psf_elements.fill_elements(out, topology).as_dict()
-    return Report(atoms, elements)
+    return Report(atoms, elements, chamber)
 
 
 # --------------------------------------------------

@@ -150,6 +150,33 @@ def test_first_frame_command_reports_json(tmp_path):
     assert out.exists()
 
 
+def test_a_chamber_parm7_is_read_through_parmed(tmp_path):
+    """The first LEU residue, 25 atoms, of zenodo:6487373's
+    bilayer_A176K.parm7, which MDAnalysis refuses."""
+
+    top = os.path.join(HERE, "tests", "inputs", "chamber.parm7")
+    dcd, out = tmp_path / "run.dcd", tmp_path / "sys.pdb"
+    dcd.write_bytes(numbered_dcd(25, 2))
+
+    report = ffs.write(top, str(dcd), str(out))
+
+    assert report.atoms == 25 and report.chamber
+    assert report.elements is None
+    import MDAnalysis as mda
+
+    u = mda.Universe(str(out))
+    assert u.atoms.n_atoms == 25 and u.atoms.resnames[0] == "LEU"
+    assert (u.atoms.positions == 1.0).all(), "the first frame's coordinates"
+
+
+def test_an_amber_topology_is_not_taken_for_a_chamber_one(tmp_path):
+    top = tmp_path / "plain.parm7"
+    top.write_text("%VERSION  VERSION_STAMP = V0001.000\n%FLAG TITLE\n%FORMAT(20a4)\n")
+
+    assert not ffs.is_chamber(str(top))
+    assert not ffs.is_chamber(str(tmp_path / "missing.parm7"))
+
+
 def test_first_frame_command_fails_on_a_mismatched_trajectory(tmp_path):
     psf, dcd, out = tmp_path / "run.psf", tmp_path / "run.dcd", tmp_path / "sys.pdb"
     psf.write_text(ten_atom_psf())
