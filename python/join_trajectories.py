@@ -9,10 +9,11 @@ file. A release that saved one run in consecutive pieces (md.part0001.xtc,
 md.part0002.xtc) is deposited as MDRepo reads it only after the pieces are
 joined. A segment that begins with the frame the one before it ended on,
 which a run continued from a checkpoint writes twice, has that frame left
-out; the frame is told by its coordinates in any format and by its time
-stamp where the format has one. A segment whose stamps begin before the
-previous one ends is refused: the segments are not in order, or not one
-run. A DCD stamps nothing, so its order is taken as given.
+out. The frame is told by its coordinates, which works in any format; a
+matching time stamp alone is not enough, since a release whose stamps are
+all placeholders stamps every frame alike. A segment whose stamps begin
+before the previous one ends is refused: the segments are not in order, or
+not one run. A DCD stamps nothing, so its order is taken as given.
 
 Whole frames are copied byte for byte; a DCD's header is written once with
 the joined frame count. No coordinate is decoded, and none changes.
@@ -87,9 +88,7 @@ def join(paths: list[str], out: str) -> dict:
             prev = runs[i - 1].times
             assert prev is not None
             last, t = prev[-1], run.times[0]
-            if tf.same_time(t, last):
-                first, repeated = 1, repeated + 1
-            elif t < last:
+            if t < last and not tf.same_time(t, last):
                 raise tf.BadTrajectory(
                     f"{run.name} begins at {t:g} ps, before {runs[i - 1].name} ends at {last:g} ps, so the two "
                     "are not consecutive segments of one run in this order"
@@ -106,11 +105,11 @@ def join(paths: list[str], out: str) -> dict:
 # --------------------------------------------------
 def main() -> None:
     args = get_args()
+    existed = tf.existing([args.out])
     try:
         report = join(args.trajectories, args.out)
     except Exception as e:
-        if os.path.exists(args.out):
-            os.remove(args.out)
+        tf.remove_fresh([args.out], existed)
         sys.stderr.write(
             f"joining the segments of {os.path.basename(args.out)}: {' '.join(str(e).split())}\n"
         )

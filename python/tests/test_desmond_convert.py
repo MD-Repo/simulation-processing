@@ -356,3 +356,31 @@ def test_command_reports_json_and_cleans_up_on_failure(tmp_path):
     assert not os.path.exists(tmp_path / "t.pdb") and not os.path.exists(
         tmp_path / "t.xtc"
     )
+
+
+def test_a_negative_residue_number_stays_negative_in_the_pdb():
+    """Maestro numbers N-terminal caps -1 and 0; folding -1 to 9999 would
+    make it another residue."""
+    assert dc.wrap_resid(-1) == -1 and dc.wrap_resid(0) == 0
+    assert (
+        dc.wrap_resid(9999) == 9999
+        and dc.wrap_resid(10000) == 0
+        and dc.wrap_resid(12345) == 2345
+    )
+    buf = io.StringIO()
+    dc.write_pdb(buf, [particle(name="C", resname="ACE", resid=-1)], maestro.ZERO_BOX)
+    assert buf.getvalue().splitlines()[0][22:26] == "  -1"
+
+
+def test_frame_steps_run_on_across_chunks(tmp_path, monkeypatch):
+    import numpy as np
+    import mdtraj as md
+
+    monkeypatch.setattr(dc, "CHUNK", 1)  # every frame its own write call
+    trj = str(tmp_path / "tiny_trj")
+    write_dtr(trj, "msys")
+    pdb, xtc = str(tmp_path / "s.pdb"), str(tmp_path / "s.xtc")
+    dc.convert(TINY, trj, pdb, xtc)
+    with md.formats.XTCTrajectoryFile(xtc) as f:
+        _, _, step, _ = f.read()
+    assert step.tolist() == [0, 1]

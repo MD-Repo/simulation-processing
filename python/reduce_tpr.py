@@ -191,10 +191,13 @@ def main() -> None:
     except ImportError:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
+    # Only what this run created is removed on failure, not a file that was
+    # already there.
+    existed = os.path.exists(args.out)
     try:
         report = reduce(args.tpr, args.selection, args.out, args.gmx)
     except Exception as e:
-        if os.path.exists(args.out):
+        if not existed and os.path.exists(args.out):
             os.remove(args.out)
         sys.stderr.write(
             f"reducing {os.path.basename(args.tpr)}: {' '.join(str(e).split())}\n"

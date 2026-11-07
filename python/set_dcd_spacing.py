@@ -62,8 +62,15 @@ def set_spacing(path: str, ps: float) -> dict:
     name = os.path.basename(path)
     with open(path, "r+b") as fh:
         h = tf.read_dcd_header(fh, name)
+        if h.nsavc <= 0:
+            # Readers take the spacing as step x interval; with no interval
+            # no time step can declare one, and a write would report a
+            # spacing the file does not carry.
+            raise tf.Refused(
+                f"the header's save interval is {h.nsavc}, so no time step can declare a frame spacing"
+            )
         was = h.declared_ps_per_frame()
-        delta = ps / (max(h.nsavc, 1) * tf.AKMA_PS)
+        delta = ps / (h.nsavc * tf.AKMA_PS)
         fh.seek(tf.DCD_DELTA_OFFSET)
         fh.write(struct.pack(h.order + ("f" if h.charmm else "d"), delta))
         fh.flush()
@@ -76,6 +83,10 @@ def main() -> None:
     args = get_args()
     try:
         report = set_spacing(args.trajectory, args.ps)
+    except tf.Refused as e:
+        print(json.dumps({"refused": str(e)}))
+        sys.stderr.write(f"{os.path.basename(args.trajectory)}: {e}\n")
+        sys.exit(1)
     except Exception as e:
         sys.stderr.write(
             f"{os.path.basename(args.trajectory)}: {' '.join(str(e).split())}\n"

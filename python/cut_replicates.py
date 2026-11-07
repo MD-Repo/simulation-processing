@@ -80,12 +80,11 @@ def cut(path: str, outs: list[str]) -> dict:
 # --------------------------------------------------
 def main() -> None:
     args = get_args()
+    existed = tf.existing(args.outs)
     try:
         report = cut(args.trajectory, args.outs)
     except Exception as e:
-        for p in args.outs:
-            if os.path.exists(p):
-                os.remove(p)
+        tf.remove_fresh(args.outs, existed)
         sys.stderr.write(
             f"cutting {os.path.basename(args.trajectory)}: {' '.join(str(e).split())}\n"
         )

@@ -273,6 +273,21 @@ def fill_elements(pdb: str, psf: str, atoms: Optional[list[int]] = None) -> Elem
 
 
 # --------------------------------------------------
+def pdb_atom_count(path: str) -> int:
+    """The ATOM and HETATM records of the first model: what the commands
+    that write a PDB check against the atoms they meant to write."""
+
+    n = 0
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(("ATOM  ", "HETATM")):
+                n += 1
+            elif line.startswith("ENDMDL"):
+                break
+    return n
+
+
+# --------------------------------------------------
 def pdb_lacks_elements(path: str) -> bool:
     """Whether any atom of the PDB has a blank element column."""
 

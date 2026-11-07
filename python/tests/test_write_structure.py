@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 pytest.importorskip("MDAnalysis")
 
 import first_frame_structure as ffs  # noqa: E402
+import psf_elements as pe  # noqa: E402
 import subset_structure as ss  # noqa: E402
 
 HERE = os.path.dirname(ffs.__file__)
@@ -120,7 +121,7 @@ def test_a_structure_is_written_from_the_topology_and_the_first_frame(tmp_path):
 
     assert report.atoms == 10
     assert report.elements == {"from": str(psf), "repartitioned": 0, "ions": 0}
-    assert ffs.pdb_atom_count(str(out)) == 10
+    assert pe.pdb_atom_count(str(out)) == 10
     import MDAnalysis as mda
 
     u = mda.Universe(str(out))
@@ -174,7 +175,7 @@ def test_a_subset_keeps_the_selected_atoms_in_order(tmp_path):
     assert not report.released and report.mismatches == 0
     assert not report.from_topology
     assert report.elements is None
-    assert ss.pdb_atom_count(str(out)) == 20
+    assert pe.pdb_atom_count(str(out)) == 20
     import MDAnalysis as mda
 
     assert list(mda.Universe(str(out)).atoms.names[:3]) == ["N", "CA", "C"]
@@ -252,9 +253,60 @@ def test_subset_command_reports_json_and_removes_its_output_on_failure(tmp_path)
     assert report["atoms"] == 6 and report["total"] == 26
     assert report["bonds"] is None or isinstance(report["bonds"], list)
 
+    # A failed run removes the output it would have written, and leaves
+    # alone one that was already there before it ran.
+    fresh = tmp_path / "fresh.pdb"
+    p = run(
+        SUBSET,
+        "--structure",
+        str(pdb),
+        "--selection",
+        "resname XXX",
+        "--out",
+        str(fresh),
+    )
+    assert p.returncode == 1
+    assert "holds no atoms" in p.stderr.strip().splitlines()[-1]
+    assert not fresh.exists()
     p = run(
         SUBSET, "--structure", str(pdb), "--selection", "resname XXX", "--out", str(out)
     )
     assert p.returncode == 1
-    assert "holds no atoms" in p.stderr.strip().splitlines()[-1]
-    assert not out.exists()
+    assert (
+        out.exists()
+    ), "a file that was there before the run is not the run's to remove"
+
+
+def test_a_tpr_structure_beside_a_top_is_still_its_own_topology(tmp_path, monkeypatch):
+    """A .top reads only with its includes, so the .tpr stands in for it:
+    the atoms' places are known and the report says which file served."""
+    import MDAnalysis as mda
+
+    calls = []
+    real = mda.Universe
+
+    class FakeUniverse:
+        def __init__(self, *paths, **kw):
+            calls.append(paths)
+            self.u = real(str(tmp_path / "sys.pdb"))
+            self.atoms = self.u.atoms
+
+        def select_atoms(self, sel):
+            return self.u.select_atoms(sel)
+
+    (tmp_path / "sys.pdb").write_text(dipeptide_in_water())
+    (tmp_path / "run.tpr").write_bytes(b"")
+    (tmp_path / "topol.top").write_text("; includes")
+    monkeypatch.setattr(mda, "Universe", FakeUniverse)
+
+    r = ss.subset(
+        str(tmp_path / "run.tpr"),
+        str(tmp_path / "topol.top"),
+        "all",
+        str(tmp_path / "o.pdb"),
+    )
+
+    assert calls == [(str(tmp_path / "run.tpr"),)], "the .tpr is read, the .top is not"
+    assert (
+        r.from_topology and r.released and r.topology_used == str(tmp_path / "run.tpr")
+    )

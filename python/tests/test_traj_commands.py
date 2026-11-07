@@ -390,3 +390,76 @@ def test_split_command_reports_json(tmp_path):
     report = json.loads(r.stdout.strip().splitlines()[-1])
     assert report["split"] and report["frames"] == [2, 2]
     assert all(os.path.exists(x) for x in report["pieces"])
+
+
+# --------------------------------------------------
+# What the first review of these commands found (simulation-processing#34).
+
+
+def test_join_refuses_segments_of_different_atoms_or_precision(tmp_path):
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0], natoms=3))
+    b = write(tmp_path, "b.xtc", tb.xtc([20.0, 30.0], natoms=5))
+    with pytest.raises(tf.BadTrajectory, match="3 atoms a frame and b.xtc 5"):
+        join_trajectories.join([a, b], str(tmp_path / "ab.xtc"))
+    c = write(tmp_path, "c.trr", tb.trr([0.0, 10.0]))
+    d = write(tmp_path, "d.trr", tb.trr([20.0, 30.0], double=True))
+    with pytest.raises(tf.BadTrajectory, match="different precision"):
+        join_trajectories.join([c, d], str(tmp_path / "cd.trr"))
+
+
+def test_join_does_not_drop_a_frame_on_a_matching_placeholder_stamp(tmp_path):
+    """Every frame stamped 0 ps, as a release of placeholders is: the
+    segments' end frames differ in coordinates, so nothing is a repeat."""
+
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 0.0, 0.0]))
+    b = write(tmp_path, "b.xtc", tb.xtc([0.0, 0.0], coord=lambda f: f + 4))
+    out = str(tmp_path / "ab.xtc")
+    report = join_trajectories.join([a, b], out)
+    assert report["frames"] == 5 and report["repeated"] == 0
+    assert frame_coords(out) == [1, 2, 3, 4, 5]
+
+
+def test_an_output_that_names_an_input_is_refused_and_the_input_kept(tmp_path):
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0]))
+    b = write(tmp_path, "b.xtc", tb.xtc([20.0, 30.0], coord=lambda f: f + 3))
+    with pytest.raises(tf.BadTrajectory, match="cannot be written over"):
+        join_trajectories.join([a, b], a)
+    assert frame_coords(a) == [1, 2], "the input is as it was"
+    with pytest.raises(tf.BadTrajectory, match="cannot be written over"):
+        cut_replicates.cut(a, [a, str(tmp_path / "c.xtc")])
+    assert frame_coords(a) == [1, 2]
+
+
+def test_a_failed_run_removes_only_what_it_created(tmp_path):
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0, 20.0]))  # 3 frames: no even cut
+    pre = tmp_path / "pre.xtc"
+    pre.write_bytes(b"not ours")
+    r = subprocess.run(
+        [sys.executable, os.path.join(HERE, "cut_replicates.py"), "--trajectory", a,
+         "--out", str(pre), "--out", str(tmp_path / "x2.xtc")],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    assert r.returncode == 1
+    assert pre.read_bytes() == b"not ours"
+    assert not (tmp_path / "x2.xtc").exists()
+
+
+def test_a_piece_is_written_whole_or_not_at_all(tmp_path):
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0]))
+    run = tf.read_run(a)
+    dest = str(tmp_path / "out" / "p.xtc")
+    with pytest.raises(tf.BadTrajectory, match="ended before"):
+        tf.write_piece(dest, run, 2, [(a, 0, run.size + 100)])
+    assert not os.path.exists(dest) and not os.path.exists(dest + ".part")
+
+
+def test_set_dcd_spacing_refuses_a_header_with_no_save_interval(tmp_path):
+    p = write(tmp_path, "a.dcd", tb.dcd(3, 2, delta=1.0, nsavc=0))
+    with pytest.raises(tf.Refused, match="save interval is 0"):
+        set_dcd_spacing.set_spacing(p, 100)
+    r = subprocess.run(
+        [sys.executable, os.path.join(HERE, "set_dcd_spacing.py"), "--trajectory", p, "--ps", "100"],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    assert r.returncode == 1
+    assert "refused" in json.loads(r.stdout.strip().splitlines()[-1])

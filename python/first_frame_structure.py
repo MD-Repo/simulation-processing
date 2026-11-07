@@ -73,19 +73,6 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
-def pdb_atom_count(path: str) -> int:
-    """The ATOM and HETATM records of the first model."""
-
-    n = 0
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith(("ATOM  ", "HETATM")):
-                n += 1
-            elif line.startswith("ENDMDL"):
-                break
-    return n
-
-
 # --------------------------------------------------
 def write(topology: str, trajectory: str, out: str) -> Report:
     """Write the topology's atoms at the trajectory's first frame as a PDB."""
@@ -97,7 +84,7 @@ def write(topology: str, trajectory: str, out: str) -> Report:
     u.trajectory[0]
     u.atoms.write(out)
 
-    atoms = pdb_atom_count(out)
+    atoms = psf_elements.pdb_atom_count(out)
     if atoms != len(u.atoms):
         raise ValueError(
             f"the structure written from the first frame holds {atoms} atoms "
@@ -118,10 +105,13 @@ def main() -> None:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
 
+    # Only what this run created is removed on failure, not a file that was
+    # already there.
+    existed = os.path.exists(args.out)
     try:
         report = write(args.topology, args.trajectory, args.out)
     except Exception as e:
-        if os.path.exists(args.out):
+        if not existed and os.path.exists(args.out):
             os.remove(args.out)
         # The reason is the last line of stderr, so it has to be one line.
         reason = " ".join(str(e).split())

@@ -64,6 +64,20 @@ def same_time(a: float, b: float) -> bool:
     return abs(a - b) <= max(1e-3, abs(b) * 1e-6)
 
 
+def remove_fresh(paths, existed) -> None:
+    """Remove the outputs this run created: those in paths that did not exist
+    before it began. A file that was already there is not this run's to
+    remove."""
+    for p in paths:
+        if p and p not in existed and os.path.exists(p):
+            os.remove(p)
+
+
+def existing(paths) -> set:
+    """The paths that exist now, taken before a command writes anything."""
+    return {p for p in paths if p and os.path.exists(p)}
+
+
 class BadTrajectory(ValueError):
     """A file that is not a trajectory this can walk, or is damaged."""
 
@@ -113,6 +127,7 @@ class Frame:
     time_offset: Optional[int] = None
     wide: bool = False  # float64 rather than float32
     order: str = ">"
+    natoms: int = 0
 
 
 @dataclass
@@ -159,6 +174,8 @@ class Run:
     size: int
     head: bytes = b""  # a DCD's header
     dcd: Optional[DCDHeader] = None
+    natoms: int = 0
+    wide: bool = False  # a TRR in double precision
     # How many bytes at the head of each frame say where it sits in the run
     # (an XTC's step and time, a TRR's header) rather than what it holds.
     skip: int = 0
@@ -234,7 +251,9 @@ def walk_xtc(fh: BinaryIO, size: int, name: str) -> list[Frame]:
         pos = fh.seek(skip, os.SEEK_CUR)
         if pos > size:
             raise BadTrajectory(f"{name}: truncated at frame {len(frames)}")
-        frames.append(Frame(offset, pos, t, offset + XTC_TIME_OFFSET, False, ">"))
+        frames.append(
+            Frame(offset, pos, t, offset + XTC_TIME_OFFSET, False, ">", natoms)
+        )
     if not frames:
         raise BadTrajectory(f"{name}: no readable frames")
     return frames
@@ -290,7 +309,9 @@ def walk_trr(fh: BinaryIO, size: int, name: str) -> list[Frame]:
             raise BadTrajectory(
                 f"{name}: atom count changes mid-file ({natoms0} -> {natoms} at frame {len(frames)})"
             )
-        frames.append(Frame(offset, pos, t, offset + TRR_FIXED_HEADER, real == 8, ">"))
+        frames.append(
+            Frame(offset, pos, t, offset + TRR_FIXED_HEADER, real == 8, ">", natoms)
+        )
     if not frames:
         raise BadTrajectory(f"{name}: no readable frames")
     if natoms0 is not None and natoms0 <= 0:
@@ -425,14 +446,25 @@ def read_run(path: str) -> Run:
         if fmt == "dcd":
             h, frames = walk_dcd(fh, size, name)
             fh.seek(0)
-            return Run("dcd", name, frames, size, head=fh.read(h.header_bytes), dcd=h)
+            return Run(
+                "dcd",
+                name,
+                frames,
+                size,
+                head=fh.read(h.header_bytes),
+                dcd=h,
+                natoms=h.natoms,
+            )
         if fmt == "xtc":
-            return Run("xtc", name, walk_xtc(fh, size, name), size, skip=XTC_HEADER)
+            frames = walk_xtc(fh, size, name)
+            return Run(
+                "xtc", name, frames, size, skip=XTC_HEADER, natoms=frames[0].natoms
+            )
         frames = walk_trr(fh, size, name)
         real = 8 if frames[0].wide else 4
-        return Run(
-            "trr", name, frames, size, skip=TRR_FIXED_HEADER + 2 * real
-        )  # the time and lambda
+        # skip covers the fixed header, the time and lambda.
+        return Run("trr", name, frames, size, skip=TRR_FIXED_HEADER + 2 * real,
+                   natoms=frames[0].natoms, wide=frames[0].wide)  # fmt: skip
 
 
 # --------------------------------------------------
@@ -648,8 +680,14 @@ def write_piece(
     (path, from, to), copied as they are. Nothing is left behind on failure."""
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    for path, _, _ in pieces:
+        if os.path.exists(dest) and os.path.samefile(dest, path):
+            raise BadTrajectory(
+                f"{os.path.basename(dest)} is one of the files being copied; it cannot be written over"
+            )
+    tmp = dest + ".part"
     try:
-        with open(dest, "wb") as out:
+        with open(tmp, "wb") as out:
             if run.format == "dcd" and run.dcd is not None:
                 head = bytearray(run.head)
                 struct.pack_into(run.dcd.order + "i", head, DCD_NSET_OFFSET, frames)
@@ -668,9 +706,10 @@ def write_piece(
                         left -= len(chunk)
             out.flush()
             os.fsync(out.fileno())
+        os.replace(tmp, dest)
     except Exception:
-        if os.path.exists(dest):
-            os.remove(dest)
+        if os.path.exists(tmp):
+            os.remove(tmp)
         raise
 
 
@@ -680,6 +719,14 @@ def joinable(a: Run, b: Run) -> None:
     if a.format != b.format:
         raise BadTrajectory(
             f"{a.name} is a {a.format} and {b.name} a {b.format}; segments joined into one file must be one format"
+        )
+    if a.natoms != b.natoms:
+        raise BadTrajectory(
+            f"{a.name} holds {a.natoms} atoms a frame and {b.name} {b.natoms}, so they are not segments of one run"
+        )
+    if a.wide != b.wide:
+        raise BadTrajectory(
+            f"{a.name} and {b.name} are TRRs of different precision, so one cannot follow the other in one file"
         )
     if a.format != "dcd":
         return

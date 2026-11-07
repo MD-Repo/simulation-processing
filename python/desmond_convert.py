@@ -274,6 +274,13 @@ def cell_parameters(v: maestro.Box):
     )
 
 
+def wrap_resid(resid: int) -> int:
+    """A residue number as the four-column field holds it: wrapped past 9999
+    as mdtraj wraps it, with a negative number (Maestro's caps) kept
+    negative rather than folded to a large positive one."""
+    return resid if -999 <= resid <= 9999 else int(math.fmod(resid, 10000))
+
+
 def write_pdb(fh, atoms: list[Particle], box: maestro.Box) -> None:
     """Write atoms as a PDB, the system's structure and topology for
     MDAnalysis: names, residues, chains and segments as msys reads them, and
@@ -292,7 +299,7 @@ def write_pdb(fh, atoms: list[Particle], box: maestro.Box) -> None:
         ins = p.insertion[:1] if p.insertion else " "
         fh.write(
             "ATOM  %5d %-4.4s %-4.4s%1s%4d%1s   %8.3f%8.3f%8.3f%6.2f%6.2f      %-4.4s%2s\n"
-            % ((i + 1) % 100000, name, p.resname, chain, p.resid % 10000, ins,
+            % ((i + 1) % 100000, name, p.resname, chain, wrap_resid(p.resid), ins,
                p.x, p.y, p.z, 1.0, 0.0, p.segid, element(p.atomic_number))
         )  # fmt: skip
     fh.write("END\n")
@@ -335,9 +342,12 @@ def copy_frames(dtr: str, out: str, particles: int, keep, ref, bonds) -> Frames:
                 angles[:, 1],
                 angles[:, 2],
             )
+            # mdtraj numbers the frames of each write call from 0 unless
+            # told otherwise; the step has to run on across chunks.
             x.write(
                 atoms.astype(np.float32),
                 time=t.astype(np.float32),
+                step=np.arange(frames, frames + len(atoms), dtype=np.int32),
                 box=np.stack(box, axis=1).astype(np.float32),
             )
             for i in range(len(atoms)):
@@ -435,14 +445,18 @@ def main() -> None:
             sys.stderr.write(f"mdtraj is not installed in {sys.executable}\n")
             sys.exit(2)
 
+    outs = [args.out_pdb, args.out_xtc, args.out_bonds]
+    # Only what this run created is removed on failure, not a file that was
+    # already there.
+    existed = {o for o in outs if o and os.path.exists(o)}
     try:
         result = convert(
             args.cms, args.trajectory, args.out_pdb, args.out_xtc, args.out_bonds
         )
     except Exception as e:
-        for p in (args.out_pdb, args.out_xtc, args.out_bonds):
-            if p and os.path.exists(p):
-                os.remove(p)
+        for o in outs:
+            if o and o not in existed and os.path.exists(o):
+                os.remove(o)
         reason = " ".join(str(e).split())
         sys.stderr.write(f"converting {os.path.basename(args.cms)}: {reason}\n")
         sys.exit(1)

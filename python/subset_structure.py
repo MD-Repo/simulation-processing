@@ -45,6 +45,8 @@ Output: the PDB at --out, and one JSON object on stdout:
    "released": bool,                 the topology is the release's own of these atoms
    "mismatches": N, "examples": [...],
    "from_topology": bool,            the atoms were read from the topology
+   "topology_used": path | null,     the file taken as the topology: --topology,
+                                     or the .tpr structure standing in for it
    "elements": null | {"from": PSF, "repartitioned": N, "ions": N}}
 
 Exit 0 when written; 1 with the reason as the last line of stderr when a file
@@ -81,6 +83,7 @@ class Report(NamedTuple):
     mismatches: int
     examples: list[str]
     from_topology: bool
+    topology_used: Optional[str]
     elements: Optional[dict]
 
 
@@ -114,19 +117,6 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
-def pdb_atom_count(path: str) -> int:
-    """The ATOM and HETATM records of the first model."""
-
-    n = 0
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith(("ATOM  ", "HETATM")):
-                n += 1
-            elif line.startswith("ENDMDL"):
-                break
-    return n
-
-
 # --------------------------------------------------
 def subset(structure: str, topology: Optional[str], selection: str, out: str) -> Report:
     """Write the atoms the selection picks as a PDB at out and report on them."""
@@ -136,9 +126,10 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
     import MDAnalysis as mda
 
     s, t = structure, topology or ""
-    # A .tpr named as the structure alone is read as its own topology, so
-    # the atoms' places in it are known and it can be cut to them.
-    if not t and s.lower().endswith(".tpr"):
+    # A .tpr structure is its own topology, so the atoms' places in it are
+    # known and it can be cut to them: with no topology named, or with one
+    # MDAnalysis reads only with its includes (a .top beside the .tpr).
+    if s.lower().endswith(".tpr") and not (t and t.lower().endswith(SELF_CONTAINED)):
         t = s
     top, whole, from_top = None, None, False
     if t and t != s and t.lower().endswith(SELF_CONTAINED):
@@ -212,7 +203,7 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
                 for i in d[:5]
             ]
 
-    atoms = pdb_atom_count(out)
+    atoms = psf_elements.pdb_atom_count(out)
     if atoms != len(ag):
         raise ValueError(
             f"the subset PDB holds {atoms} atoms and the selection {len(ag)}"
@@ -236,6 +227,7 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
         mismatches=mismatches,
         examples=examples,
         from_topology=from_top,
+        topology_used=t or None,
         elements=elements,
     )
 
@@ -249,10 +241,13 @@ def main() -> None:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
 
+    # Only what this run created is removed on failure, not a file that was
+    # already there.
+    existed = os.path.exists(args.out)
     try:
         report = subset(args.structure, args.topology, args.selection, args.out)
     except Exception as e:
-        if os.path.exists(args.out):
+        if not existed and os.path.exists(args.out):
             os.remove(args.out)
         # The reason is the last line of stderr, so it has to be one line.
         reason = " ".join(str(e).split())
