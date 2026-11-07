@@ -1,0 +1,26 @@
+name: Tests
+
+# Nothing ran the tests before this, and 22 of them had gone stale on main
+# unnoticed. Tests that need gmx or cpptraj skip without them.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Run tests
+        run: uv run --frozen pytest tests/
