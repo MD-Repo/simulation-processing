@@ -53,7 +53,10 @@ def get_args() -> Args:
     )
     a = parser.parse_args()
     if not (a.ps > 0):
-        parser.error(f"a frame spacing of {a.ps} ps cannot be written")
+        # Exit 1, not argparse's 2: a bad value is this run's refusal, and the
+        # contract keeps 2 for an environment that lacks something.
+        sys.stderr.write(f"a frame spacing of {a.ps} ps cannot be written" + "\n")
+        sys.exit(1)
     return Args(a.trajectory, a.ps)
 
 

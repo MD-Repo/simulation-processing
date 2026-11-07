@@ -163,7 +163,10 @@ def get_args() -> Args:
     )
     a = parser.parse_args()
     if a.trajectory and not a.out_xtc:
-        parser.error("--trajectory needs --out-xtc")
+        # Exit 1, not argparse's 2: a bad value is this run's refusal, and the
+        # contract keeps 2 for an environment that lacks something.
+        sys.stderr.write("--trajectory needs --out-xtc" + "\n")
+        sys.exit(1)
     return Args(a.cms, a.trajectory, a.out_pdb, a.out_xtc, a.out_bonds)
 
 

@@ -79,7 +79,10 @@ def get_args() -> Args:
     )
     a = parser.parse_args()
     if not (a.factor > 0) or a.factor == float("inf"):
-        parser.error(f"frame times cannot be scaled by {a.factor}")
+        # Exit 1, not argparse's 2: a bad value is this run's refusal, and the
+        # contract keeps 2 for an environment that lacks something.
+        sys.stderr.write(f"frame times cannot be scaled by {a.factor}" + "\n")
+        sys.exit(1)
     return Args(a.trajectory, a.factor)
 
 

@@ -57,7 +57,10 @@ def get_args() -> Args:
     )  # fmt: skip
     a = parser.parse_args()
     if len(a.out) < 2:
-        parser.error(f"cutting into {len(a.out)} pieces is not a cut")
+        # Exit 1, not argparse's 2: a bad value is this run's refusal, and the
+        # contract keeps 2 for an environment that lacks something.
+        sys.stderr.write(f"cutting into {len(a.out)} pieces is not a cut" + "\n")
+        sys.exit(1)
     return Args(a.trajectory, a.out)
 
 

@@ -86,7 +86,12 @@ def get_args() -> Args:
     )  # fmt: skip
     a = parser.parse_args()
     if "{k}" not in a.out_template:
-        parser.error("--out-template needs {k}, or every piece would be one file")
+        # Exit 1, not argparse's 2: a bad value is this run's refusal, and the
+        # contract keeps 2 for an environment that lacks something.
+        sys.stderr.write(
+            "--out-template needs {k}, or every piece would be one file" + "\n"
+        )
+        sys.exit(1)
     return Args(a.trajectory, a.out_template)
 
 
