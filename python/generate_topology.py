@@ -186,9 +186,9 @@ def single_model(path: str, dest: str) -> bool:
 # --------------------------------------------------
 def load_structure(path: str):
     """Load the PDB with ParmEd, rewriting one it refuses with "Coordinate
-    mismatch": first without a single model's MODEL and ENDMDL, then with
-    residues renumbered past the wrap. Returns the structure and whether it
-    was renumbered."""
+    mismatch": first with residues renumbered past the wrap, then without a
+    single model's MODEL and ENDMDL. Returns the structure and whether it was
+    renumbered."""
 
     import parmed as pmd
 
@@ -201,16 +201,18 @@ def load_structure(path: str):
     # The rewritten copies go in a directory of their own: the PDB's is the
     # deposit's, and every file in it is part of the deposit.
     with tempfile.TemporaryDirectory(prefix="psf-") as tmp:
-        attempts = []
-        one = os.path.join(tmp, "single.pdb")
-        if single_model(path, one):
-            attempts.append((one, False))
         wrapped = os.path.join(tmp, "renumbered.pdb")
         wrap_safe(path, wrapped)
-        attempts.append((wrapped, True))
-        for rewritten, renumbered in attempts:
+        try:
+            return pmd.load_file(wrapped), True
+        except pmd.exceptions.PDBError as e:
+            if "Coordinate mismatch" not in str(e):
+                raise
+            err = e
+        one = os.path.join(tmp, "single.pdb")
+        if single_model(path, one):
             try:
-                return pmd.load_file(rewritten), renumbered
+                return pmd.load_file(one), False
             except pmd.exceptions.PDBError as e:
                 if "Coordinate mismatch" not in str(e):
                     raise

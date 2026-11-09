@@ -158,6 +158,26 @@ def test_wrap_safe_gives_each_block_past_the_wrap_its_own_chain(tmp_path):
     assert src.read_text().count("SOL A") == 20001, "the PDB itself is untouched"
 
 
+def test_wrapped_single_model_is_renumbered_before_markers_are_removed(tmp_path):
+    """A marker-stripped parse can hide repeated residue keys at ENDMDL."""
+
+    lines = ["MODEL        1"]
+    for r in range(1, 10002):
+        lines.append(
+            "ATOM  %5d  OW  SOL A%4d    %8.3f%8.3f%8.3f  1.00  0.00           O"
+            % (r, r % 10000, r * 0.1, 0.0, 0.0)
+        )
+    pdb = tmp_path / "wrapped.pdb"
+    pdb.write_text("\n".join(lines) + "\nENDMDL\nEND\n")
+
+    st, renumbered = gt.load_structure(str(pdb))
+
+    assert renumbered
+    assert len(st.atoms) == 10001
+    assert len(st.residues) == 10001
+    assert len({(res.chain, res.number) for res in st.residues}) == 10001
+
+
 def subunits(n: int) -> str:
     """A dipeptide n times, as trjconv writes an oligomer's frame: inside
     MODEL and ENDMDL, every subunit chain A and numbered from 1.
