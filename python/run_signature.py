@@ -71,7 +71,7 @@ def get_args() -> Args:
 def pick(u):
     """The CA atoms, or the P atoms, when there are at least three."""
 
-    for sel in ("name CA", "name P"):
+    for sel in ("protein and name CA", "name P"):
         ag = u.select_atoms(sel)
         if len(ag) >= 3:
             return ag

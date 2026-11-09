@@ -90,7 +90,7 @@ def count(path: str, fmt: Optional[str] = None) -> Report:
     if fmt is None and is_gromacs_top(path):
         fmt = "ITP"
     if fmt == "ITP":
-        u = open_universe(path, topology_format="ITP")
+        u = open_universe(path, topology_format="ITP", infer_system=True)
     elif fmt:
         u = open_universe(path, topology_format=fmt, format=fmt)
     else:

@@ -62,6 +62,33 @@ def test_a_top_is_gromacs_unless_it_is_amber(tmp_path):
     assert not ca.is_gromacs_top(str(tmp_path / "s.pdb"))
 
 
+def test_itp_counts_infer_the_system_for_top_and_explicit_format(tmp_path, monkeypatch):
+    top, itp = tmp_path / "system.top", tmp_path / "system.itp"
+    top.write_text("[ defaults ]\n1 2 yes 0.5 0.8333\n")
+    itp.write_text("[ moleculetype ]\nMOL 3\n")
+    calls = []
+
+    class Atoms:
+        n_atoms = 4
+        resnames = []
+
+    class Universe:
+        atoms = Atoms()
+
+    def open_universe(path, **kwargs):
+        calls.append((path, kwargs))
+        return Universe()
+
+    monkeypatch.setattr(ca, "open_universe", open_universe)
+
+    assert ca.count(str(top)) == ca.Report(atoms=4, solvent=0)
+    assert ca.count(str(itp), fmt="ITP") == ca.Report(atoms=4, solvent=0)
+    assert calls == [
+        (str(top), {"topology_format": "ITP", "infer_system": True}),
+        (str(itp), {"topology_format": "ITP", "infer_system": True}),
+    ]
+
+
 def test_count_command_reports_json_and_refuses_an_unreadable_file(tmp_path):
     psf = tmp_path / "run.psf"
     psf.write_text(ten_atom_psf())
@@ -121,6 +148,21 @@ def test_a_run_is_fingerprinted_by_its_ca_atoms(tmp_path):
     assert report.n == 10
     assert len(report.first) == 40 and len(report.last) == 40
     assert report == rs.signature(str(pdb), str(dcd), str(dcd)), "deterministic"
+
+
+def test_a_run_fingerprint_excludes_calcium_ca_atoms(tmp_path):
+    pdb, dcd = tmp_path / "s.pdb", tmp_path / "run.dcd"
+    calcium = "".join(
+        "ATOM  %5d  CA  CA A%4d    %8.3f%8.3f%8.3f  1.00  0.00          CA\n"
+        % (i, i, 20.0 + i, 20.0, 20.0)
+        for i in range(4, 7)
+    )
+    pdb.write_text(numbered_pdb(3, 1.0).replace("END\n", calcium + "END\n"))
+    dcd.write_bytes(numbered_dcd(6, 3))
+
+    report = rs.signature(str(pdb), str(dcd), str(dcd))
+
+    assert report.n == 3
 
 
 def test_a_run_with_too_few_ca_atoms_has_no_fingerprint(tmp_path):
