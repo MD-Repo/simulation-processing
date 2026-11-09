@@ -31,8 +31,18 @@ Two things the PDB can do to ParmEd, both met on real records:
     residues each further block gets a chain letter of its own, which keeps
     every (chain, number) pair distinct; residues before the wrap, the
     protein among them, keep their chains. zenodo:11780149's 79366-atom
-    trjconv PDB is the case. The renumbered copy is written beside the PDB
-    and removed afterwards; the PDB itself is not changed.
+    trjconv PDB is the case.
+
+  * ParmEd checks a model's coordinates against its atoms only at ENDMDL,
+    keyed by atom name and residue, so atoms that share a key are counted
+    once and the file is refused ("Coordinate mismatch"): an oligomer whose
+    subunits all carry one chain letter and the same numbers (zenodo:7986576's
+    MthK tetramer, written by trjconv inside MODEL and ENDMDL), or a residue
+    with two atoms named alike. A file of one model is read without the
+    wrapper, and then the atoms are read in order, as many as it lists.
+
+  Either rewritten copy is written to a temporary directory, never beside
+  the PDB, whose directory is the deposit's; the PDB itself is not changed.
 
   * ParmEd takes a residue to be a run of consecutive atoms, and bonds an
     atom no template names by distance. Wrong names or a residue listed in
@@ -58,6 +68,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from typing import NamedTuple, Optional
 
 import outputs
@@ -160,9 +171,26 @@ def wrap_safe(path: str, dest: str) -> None:
 
 
 # --------------------------------------------------
+def single_model(path: str, dest: str) -> bool:
+    """Write a copy of the PDB without its MODEL and ENDMDL lines, when it
+    holds at most one model. False, and nothing written, when it holds
+    several: those are frames, and they have to agree."""
+
+    with open(path) as fh:
+        lines = fh.read().splitlines(True)
+    if sum(1 for line in lines if line.startswith("MODEL")) > 1:
+        return False
+    with open(dest, "w") as fh:
+        fh.writelines(l for l in lines if not l.startswith(("MODEL", "ENDMDL")))
+    return True
+
+
+# --------------------------------------------------
 def load_structure(path: str):
-    """Load the PDB with ParmEd, renumbering a wrapped one. Returns the
-    structure and whether it was renumbered."""
+    """Load the PDB with ParmEd, rewriting one it refuses with "Coordinate
+    mismatch": first without a single model's MODEL and ENDMDL, then with
+    residues renumbered past the wrap. Returns the structure and whether it
+    was renumbered."""
 
     import parmed as pmd
 
@@ -171,13 +199,25 @@ def load_structure(path: str):
     except pmd.exceptions.PDBError as e:
         if "Coordinate mismatch" not in str(e):
             raise
-    fixed = path + ".renumbered.pdb"
-    try:
-        wrap_safe(path, fixed)
-        return pmd.load_file(fixed), True
-    finally:
-        if os.path.exists(fixed):
-            os.remove(fixed)
+        err = e
+    # The rewritten copies go in a directory of their own: the PDB's is the
+    # deposit's, and every file in it is part of the deposit.
+    with tempfile.TemporaryDirectory(prefix="psf-") as tmp:
+        attempts = []
+        one = os.path.join(tmp, "single.pdb")
+        if single_model(path, one):
+            attempts.append((one, False))
+        wrapped = os.path.join(tmp, "renumbered.pdb")
+        wrap_safe(path, wrapped)
+        attempts.append((wrapped, True))
+        for rewritten, renumbered in attempts:
+            try:
+                return pmd.load_file(rewritten), renumbered
+            except pmd.exceptions.PDBError as e:
+                if "Coordinate mismatch" not in str(e):
+                    raise
+                err = e
+    raise err
 
 
 # --------------------------------------------------
