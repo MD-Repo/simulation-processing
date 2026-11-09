@@ -19,6 +19,18 @@ Cron uses `.venv/bin/python` directly, never `uv run` — cron must execute exac
 what is installed, with no surprise dependency sync mid-run. After pulling changes
 that touch dependencies, run `uv sync` as a deploy step; nothing in cron does it.
 
+## Branches
+
+Bring a branch up to date by rebasing it onto `origin/main`, not by merging
+main into it, and push the result with `git push --force-with-lease` (never a
+plain `--force`, which would overwrite commits pushed since you fetched). A
+pull request's history is then its own commits and nothing else, which is what
+a reviewer reads. Resolve conflicts commit by commit as the rebase stops on
+them, and run the tests again before pushing.
+
+When the branch a pull request is stacked on merges, rebase onto `origin/main`
+and change the pull request's base to `main`.
+
 ## The queue
 
 Two cron jobs and a Postgres table decouple *finding* a completed upload from
