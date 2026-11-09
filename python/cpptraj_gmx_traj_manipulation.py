@@ -884,21 +884,29 @@ def save_gro(structure, path):
 
 
 # --------------------------------------------------
-def autoimage_action(box_present):
-    """cpptraj `autoimage` line, or "" when there is no unit cell to image in
+def box_action(box_present):
+    """The cpptraj line that settles the box: `autoimage` or `box nobox`
 
-    The full trajectory has always had this; the stripped one never did, and
-    the stripped one is what becomes minimal.xtc and then the sampled.xtc
-    video. So a complex whose chains sit in different periodic images -- an
-    FXR ligand-binding domain and its coactivator peptide, say -- was written
-    to the video with the peptide flung to the far side of the box, jumping a
-    whole box vector between frames.
+    With a unit cell, `autoimage`. The full trajectory has always had this;
+    the stripped one never did, and the stripped one is what becomes
+    minimal.xtc and then the sampled.xtc video. So a complex whose chains sit
+    in different periodic images -- an FXR ligand-binding domain and its
+    coactivator peptide, say -- was written to the video with the peptide
+    flung to the far side of the box, jumping a whole box vector between
+    frames. Nothing was wrong with the simulation or with full.xtc. Only the
+    video.
 
-    Nothing was wrong with the simulation or with full.xtc. Only the video.
+    Without one, `box nobox`, so cpptraj writes a zero box. Writing nothing
+    is not the same: cpptraj still carries whatever cell it read with the
+    trajectory into every output frame. MDR00105222 (a CA-only PSF + DCD with
+    no periodic cell) came out of the standalone cpptraj 6.4.4 build with
+    [inf, inf, 0, 2.06, -inf, -inf, ...] as the box of all 20,000 frames of
+    full.xtc and minimal.xtc; simproc's build of the same version happened to
+    write zeros. Found 2026-11-09, after simproc was retired (#35).
     """
 
     if not box_present:
-        return ""
+        return "box nobox\n"
     return "autoimage\n"
 
 
@@ -953,7 +961,7 @@ def process_stripped_trajectory(
         # Before strip, so the imaging sees whole molecules and a real box.
         # The principal axes are measured from this frame; a chain sitting in
         # the wrong periodic image drags them off and tilts the whole video.
-        f.write(autoimage_action(box_present))
+        f.write(box_action(box_present))
         f.write(f"strip {strip_mask}\n")
         f.write(f"principal {fit_mask} dorotation\n")
         f.write("rotate z 90\n")
@@ -980,7 +988,7 @@ def process_stripped_trajectory(
         # the stored box vectors no longer describe the periodic lattice and
         # imaging silently does the wrong thing. Stripping first would also
         # remove the solvent that tells autoimage which molecules are mobile.
-        f.write(autoimage_action(box_present))
+        f.write(box_action(box_present))
         f.write(f"strip {strip_mask}\n")
         f.write(f"rms ref [rotref] {fit_mask}\n")
         f.write(time_action(sampling_ps))
@@ -1116,12 +1124,11 @@ def process_amber_trajectory(topology_file, coordinate_file, trajectory_file, ou
         with open(cppin_full, "w") as f:
             f.write(f"parm {topology_file}\n")
             f.write(f"trajin {trajectory_file}\n")
-            # Use autoimage only if box is present
             if box_present:
                 verbose("Box detected. Using autoimage...")
-                f.write("autoimage\n")
             else:
-                verbose("No box detected. Skipping autoimage...")
+                verbose("No box detected. Writing a zero box...")
+            f.write(box_action(box_present))
             # RMS fit to first frame using backbone atoms (or all atoms for CG)
             f.write(f"rms first {fit_mask}\n")
             f.write(time_action(sampling_ps))
@@ -1345,12 +1352,11 @@ def process_namd_trajectory(topology_file, coordinate_file, trajectory_file, out
         with open(cppin_full, "w") as f:
             f.write(f"parm {topology_file}\n")
             f.write(f"trajin {trajectory_file}\n")
-            # Use autoimage only if box is present
             if box_present:
                 verbose("Box detected. Using autoimage...")
-                f.write("autoimage\n")
             else:
-                verbose("No box detected. Skipping autoimage...")
+                verbose("No box detected. Writing a zero box...")
+            f.write(box_action(box_present))
             # RMS fit to first frame using backbone atoms (or all atoms for CG)
             f.write(f"rms first {fit_mask}\n")
             f.write(time_action(sampling_ps))
@@ -1827,7 +1833,7 @@ def write_gromacs_bash(
                 except Exception as e:
                     warn(f"Could not read the box of {trajfile}: {e}; imaging anyway")
             if not box_present:
-                verbose("No box detected. Skipping autoimage...")
+                verbose("No box detected. Writing a zero box...")
 
             cppin_wrap = os.path.join(outdir, "cpptraj_wrap.in")
             full_xtc_path = os.path.join(outdir, "full.xtc")
@@ -1835,7 +1841,7 @@ def write_gromacs_bash(
             with open(cppin_wrap, "w") as cf:
                 cf.write(f"parm {cpptraj_topo}\n")
                 cf.write(f"trajin {trajfile}\n")
-                cf.write(autoimage_action(box_present))
+                cf.write(box_action(box_present))
                 cf.write(f"trajout {full_xtc_path} xtc\n")
                 cf.write(f"trajout {full_pdb_path} pdb include_ep onlyframes 1\n")
                 cf.write("run\n")
