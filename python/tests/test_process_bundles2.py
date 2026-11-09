@@ -2,11 +2,10 @@
 
 The IRODS/DB/subprocess-touching pieces (find_next_candidate's session,
 ticket_queue_busy's cursor, run_mdr_process, delete_irods_source) are
-exercised with fakes rather than a live server -- get_args, load_state and
-save_state need nothing at all.
+exercised with fakes rather than a live server -- get_args, load_record and
+append_record need nothing at all.
 """
 
-import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -15,38 +14,49 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import process_bundles2 as pb  # noqa: E402
+from irods.models import DataObject  # noqa: E402
 
 
 # --------------------------------------------------
-class FakeDataObject:
-    def __init__(self, name, size, create_time):
-        self.name = name
-        self.size = size
-        self.create_time = create_time
+class FakeQuery:
+    """The catalog query find_next_candidate builds: filters and the ordering
+    are the catalog's job, so the fake keeps the rows in create_time order
+    and ignores the filters."""
 
+    def __init__(self, rows):
+        self._rows = rows
 
-class FakeCollections:
-    def __init__(self, data_objects):
-        self._data_objects = data_objects
+    def filter(self, *_args):
+        return self
 
-    def get(self, path):
-        return type("Coll", (), {"data_objects": self._data_objects})()
+    def order_by(self, *_args):
+        return self
+
+    def get_results(self):
+        for name, size, created in sorted(self._rows, key=lambda r: r[2]):
+            yield {DataObject.name: name, DataObject.size: size, DataObject.create_time: created}
 
 
 class FakeSession:
-    def __init__(self, data_objects):
-        self.collections = FakeCollections(data_objects)
+    def __init__(self, rows):
+        self._rows = rows
+
+    def query(self, *_columns):
+        return FakeQuery(self._rows)
 
 
 # --------------------------------------------------
-def test_get_args_defaults_are_prod_scoped(monkeypatch):
+def test_get_args_defaults_are_staging_scoped(monkeypatch):
+    """Staging by default: one forgotten flag must not write the backfill
+    into production."""
+
     monkeypatch.setattr(sys, "argv", ["process_bundles2.py"])
     args = pb.get_args()
 
-    assert args.server == "prod"
-    assert args.lock_file.endswith("drain_process_queue-prod.lock")
-    assert args.state_file.endswith("process_bundles2-prod.json")
-    assert args.log_dir.endswith(os.path.join("bundles2", "prod"))
+    assert args.server == "staging"
+    assert args.lock_file.endswith("drain_process_queue-staging.lock")
+    assert args.record_file.endswith(os.path.join("bundles2", "staging", "processed.tsv"))
+    assert args.log_dir.endswith(os.path.join("bundles2", "staging"))
     assert args.dry_run is False
 
 
@@ -58,66 +68,62 @@ def test_dry_run_implies_verbose(monkeypatch):
     assert args.verbose is True
 
 
-def test_staging_scopes_lock_and_state_file_separately(monkeypatch):
-    monkeypatch.setattr(
-        sys, "argv", ["process_bundles2.py", "--server", "staging"]
-    )
+def test_prod_scopes_lock_and_record_separately(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["process_bundles2.py", "--server", "prod"])
     args = pb.get_args()
 
-    assert args.lock_file.endswith("drain_process_queue-staging.lock")
-    assert args.state_file.endswith("process_bundles2-staging.json")
+    assert args.lock_file.endswith("drain_process_queue-prod.lock")
+    assert args.record_file.endswith(os.path.join("bundles2", "prod", "processed.tsv"))
 
 
 # --------------------------------------------------
-def test_load_state_missing_file_is_empty(tmp_path):
-    assert pb.load_state(str(tmp_path / "nope.json")) == {}
+def test_load_record_missing_file_is_empty(tmp_path):
+    assert pb.load_record(str(tmp_path / "nope.tsv")) == {}
 
 
-def test_load_state_corrupt_file_is_empty_not_a_crash(tmp_path):
-    path = tmp_path / "state.json"
-    path.write_text("not json{{{")
+def test_load_record_skips_the_header_and_short_lines(tmp_path):
+    path = tmp_path / "processed.tsv"
+    path.write_text("timestamp\tresult\tbundle\tdetail\nnot a record line\n")
 
-    assert pb.load_state(str(path)) == {}
-
-
-def test_save_state_then_load_state_roundtrips(tmp_path):
-    path = tmp_path / "nested" / "state.json"
-    state = {
-        "sim001": {"status": "done", "timestamp": "2026-08-14T00:00:00Z"}
-    }
-
-    pb.save_state(str(path), state)
-
-    assert path.is_file()
-    assert pb.load_state(str(path)) == state
+    assert pb.load_record(str(path)) == {}
 
 
-def test_save_state_leaves_no_tmp_file_behind(tmp_path):
-    path = tmp_path / "state.json"
-    pb.save_state(str(path), {"a": {"status": "done"}})
+def test_append_record_then_load_record_roundtrips(tmp_path):
+    path = tmp_path / "nested" / "processed.tsv"
 
-    assert not (tmp_path / "state.json.tmp").exists()
+    pb.append_record(str(path), "sim001", "done", "")
+    pb.append_record(str(path), "sim002", "failed", "mdr-process\nexited 1")
+
+    assert pb.load_record(str(path)) == {"sim001": "done", "sim002": "failed"}
+    lines = path.read_text().splitlines()
+    assert lines[0] == "timestamp\tresult\tbundle\tdetail", "one header, first"
+    assert len(lines) == 3, "the detail is flattened to one line"
+    assert lines[2].endswith("\tmdr-process exited 1")
 
 
-def test_save_state_is_atomic_replace_not_partial_write(tmp_path):
-    """A crash between the write and the rename must never corrupt the file
+def test_a_later_line_wins(tmp_path):
+    """Re-running a bundle that failed and recording it done reads as done,
+    without anyone editing history."""
 
-    save_state writes to "<path>.tmp" then os.replace()s it into place, so
-    the real file is either the old complete contents or the new complete
-    contents -- never a half-written mix of both.
-    """
+    path = tmp_path / "processed.tsv"
+    pb.append_record(str(path), "sim001", "failed", "boom")
+    pb.append_record(str(path), "sim001", "done", "")
 
-    path = tmp_path / "state.json"
-    pb.save_state(str(path), {"a": {"status": "done"}})
-    original = path.read_text()
+    assert pb.load_record(str(path)) == {"sim001": "done"}
 
-    # Simulate the write step failing before the replace: the .tmp file may
-    # exist mid-write, but the real file must be untouched.
-    tmp = Path(f"{path}.tmp")
-    tmp.write_text("garbage, not valid json")
 
-    assert path.read_text() == original
-    assert json.loads(path.read_text()) == {"a": {"status": "done"}}
+def test_a_long_detail_keeps_both_ends(tmp_path):
+    """The failing step is at the front and the diagnosis at the back; the
+    cap cuts the middle."""
+
+    path = tmp_path / "processed.tsv"
+    detail = "STEP " + "x" * 5000 + " DIAGNOSIS"
+    pb.append_record(str(path), "sim001", "failed", detail)
+
+    kept = path.read_text().splitlines()[1].split("\t")[3]
+    assert len(kept) <= pb.DETAIL_MAX
+    assert kept.startswith("STEP ") and kept.endswith(" DIAGNOSIS")
+    assert "chars elided" in kept
 
 
 # --------------------------------------------------
@@ -125,34 +131,31 @@ def test_find_next_candidate_skips_truncated_and_recorded_bundles():
     now = datetime(2026, 1, 1)
     session = FakeSession(
         [
-            FakeDataObject("a.md5", 10, now),
+            ("a.md5", 10, now),
             # 0-byte sidecar from a truncated write -- not ready.
-            FakeDataObject("b.md5", 0, now - timedelta(days=1)),
+            ("b.md5", 0, now - timedelta(days=1)),
             # Oldest ready candidate -- should win over "a".
-            FakeDataObject("c.md5", 5, now - timedelta(days=2)),
+            ("c.md5", 5, now - timedelta(days=2)),
             # Not a sidecar at all -- ignored.
-            FakeDataObject("c.data", 5, now),
-            # Already recorded in state -- skipped even though it's oldest.
-            FakeDataObject("d.md5", 5, now - timedelta(days=3)),
+            ("c.data", 5, now),
+            # Already recorded -- skipped even though it's oldest.
+            ("d.md5", 5, now - timedelta(days=3)),
         ]
     )
-    state = {"d": {"status": "done"}}
 
-    assert pb.find_next_candidate(session, state) == "c"
+    assert pb.find_next_candidate(session, {"d": "done"}) == "c"
 
 
 def test_find_next_candidate_returns_none_when_nothing_ready():
-    session = FakeSession([FakeDataObject("a.md5", 0, datetime(2026, 1, 1))])
+    session = FakeSession([("a.md5", 0, datetime(2026, 1, 1))])
 
     assert pb.find_next_candidate(session, {}) is None
 
 
 def test_find_next_candidate_returns_none_when_everything_is_recorded():
-    now = datetime(2026, 1, 1)
-    session = FakeSession([FakeDataObject("a.md5", 10, now)])
-    state = {"a": {"status": "failed"}}
+    session = FakeSession([("a.md5", 10, datetime(2026, 1, 1))])
 
-    assert pb.find_next_candidate(session, state) is None
+    assert pb.find_next_candidate(session, {"a": "failed"}) is None
 
 
 # --------------------------------------------------
