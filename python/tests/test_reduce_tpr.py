@@ -86,6 +86,20 @@ def test_reduce_refuses_a_count_that_differs_from_the_selection(tmp_path, monkey
         )
 
 
+def test_a_cut_that_fails_its_check_leaves_the_previous_output(tmp_path, monkeypatch):
+    """gmx writes the cut beside --out, and it moves onto --out only once
+    gmx dump counts the selection's atoms in it."""
+    gmx = fake_gmx(tmp_path, natoms=5)
+    monkeypatch.setattr(rt, "select_indices", lambda tpr, sel: ([0, 1, 2], 7))
+    (tmp_path / "full.tpr").write_bytes(b"TPR")
+    out = tmp_path / "saved.tpr"
+    out.write_bytes(b"previous")
+    with pytest.raises(RuntimeError, match="holds 5 atoms"):
+        rt.reduce(str(tmp_path / "full.tpr"), "resname PRO", str(out), gmx)
+    assert out.read_bytes() == b"previous"
+    assert not (tmp_path / "saved.part.tpr").exists()
+
+
 def test_command_exits_2_without_gmx(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     p = subprocess.run(

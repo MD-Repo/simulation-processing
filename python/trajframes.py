@@ -216,8 +216,11 @@ def walk_xtc(fh: BinaryIO, size: int, name: str) -> list[Frame]:
     while True:
         offset = fh.tell()
         head = fh.read(XTC_HEADER)
-        if len(head) < XTC_HEADER:
+        if not head:
             break  # the normal end of the file
+        if len(head) < XTC_HEADER:
+            # Part of a header: a writer that stopped mid-frame, not an end.
+            raise BadTrajectory(f"{name}: truncated at frame {len(frames)}")
         magic, natoms, step, t = struct.unpack(">iiif", head)
         if magic != XTC_MAGIC:
             raise BadTrajectory(
@@ -265,8 +268,10 @@ def walk_trr(fh: BinaryIO, size: int, name: str) -> list[Frame]:
     while True:
         offset = fh.tell()
         head = fh.read(TRR_FIXED_HEADER)
+        if not head:
+            break  # the normal end of the file
         if len(head) < TRR_FIXED_HEADER:
-            break
+            raise BadTrajectory(f"{name}: truncated at frame {len(frames)}")
         magic = struct.unpack(">i", head[:4])[0]
         if magic != TRR_MAGIC:
             raise BadTrajectory(
@@ -714,7 +719,9 @@ def write_piece(
 
 
 def joinable(a: Run, b: Run) -> None:
-    """Whether b can follow a in one file."""
+    """Whether b can follow a in one file. The joined file keeps a's header,
+    so for DCDs, whose frames carry no time of their own, b's frames must be
+    laid out and sampled as that header says."""
 
     if a.format != b.format:
         raise BadTrajectory(
@@ -742,4 +749,9 @@ def joinable(a: Run, b: Run) -> None:
         raise BadTrajectory(
             f"{a.name} and {b.name} are DCDs laid out differently (atoms, unit cell or byte order), "
             "so one cannot follow the other in one file"
+        )
+    if x.nsavc != y.nsavc or not math.isclose(x.delta, y.delta, rel_tol=1e-6):
+        raise BadTrajectory(
+            f"{a.name} saves a frame every {x.nsavc} steps of {x.delta:g} and {b.name} every "
+            f"{y.nsavc} of {y.delta:g}; the joined file keeps one header, which cannot time both"
         )

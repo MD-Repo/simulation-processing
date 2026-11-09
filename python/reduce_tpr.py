@@ -47,6 +47,8 @@ import tempfile
 import warnings
 from typing import NamedTuple, Optional
 
+import outputs
+
 # The index group written for the saved atoms, and the name fed to gmx.
 GROUP = "saved"
 
@@ -148,11 +150,15 @@ def reduce(tpr: str, selection: str, out: str, gmx: str = "gmx") -> Report:
     """Write the .tpr cut to the selection at out and report on it."""
 
     indices, total = select_indices(tpr, selection)
-    with tempfile.TemporaryDirectory(prefix="reduce-tpr-") as scratch:
+    # gmx writes the cut .tpr beside out, where gmx dump checks it; it moves
+    # onto out only once its atom count is the selection's, so a cut that
+    # fails the check leaves a .tpr already at out as it was.
+    stage = outputs.staged(out)
+    with tempfile.TemporaryDirectory(prefix="reduce-tpr-") as scratch, stage as cut:
         ndx = os.path.join(scratch, "saved.ndx")
         write_index(ndx, indices)
         p = subprocess.run(
-            [gmx, "convert-tpr", "-s", os.path.abspath(tpr), "-n", ndx, "-o", os.path.abspath(out)],
+            [gmx, "convert-tpr", "-s", os.path.abspath(tpr), "-n", ndx, "-o", os.path.abspath(cut)],
             input=GROUP + "\n", capture_output=True, text=True, cwd=scratch, timeout=600,
         )  # fmt: skip
         if p.returncode != 0:
@@ -160,7 +166,7 @@ def reduce(tpr: str, selection: str, out: str, gmx: str = "gmx") -> Report:
                 f"gmx convert-tpr of {os.path.basename(tpr)}: {last_line(p.stderr)}"
             )
         dump = subprocess.run(
-            [gmx, "dump", "-s", os.path.abspath(out)],
+            [gmx, "dump", "-s", os.path.abspath(cut)],
             capture_output=True,
             text=True,
             cwd=scratch,
@@ -170,13 +176,15 @@ def reduce(tpr: str, selection: str, out: str, gmx: str = "gmx") -> Report:
             raise RuntimeError(
                 f"gmx dump of the reduced {os.path.basename(tpr)}: {last_line(dump.stderr)}"
             )
-    n = tpr_atoms(dump.stdout)
-    if n is None:
-        raise RuntimeError(f"the reduced {os.path.basename(tpr)} states no atom count")
-    if n != len(indices):
-        raise RuntimeError(
-            f"{os.path.basename(tpr)} reduced to the selection holds {n} atoms and the selection {len(indices)}"
-        )
+        n = tpr_atoms(dump.stdout)
+        if n is None:
+            raise RuntimeError(
+                f"the reduced {os.path.basename(tpr)} states no atom count"
+            )
+        if n != len(indices):
+            raise RuntimeError(
+                f"{os.path.basename(tpr)} reduced to the selection holds {n} atoms and the selection {len(indices)}"
+            )
     return Report(n, total, len(indices), gmx_version(gmx))
 
 
@@ -191,14 +199,9 @@ def main() -> None:
     except ImportError:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
-    # Only what this run created is removed on failure, not a file that was
-    # already there.
-    existed = os.path.exists(args.out)
     try:
         report = reduce(args.tpr, args.selection, args.out, args.gmx)
-    except Exception as e:
-        if not existed and os.path.exists(args.out):
-            os.remove(args.out)
+    except Exception as e:  # reduce() staged its output: nothing is left behind
         sys.stderr.write(
             f"reducing {os.path.basename(args.tpr)}: {' '.join(str(e).split())}\n"
         )

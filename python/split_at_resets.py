@@ -182,12 +182,18 @@ def split(path: str, template: str) -> dict:
         plans.append((pieces, frames))
 
     n = len(plans)
-    paths, counts = [], []
-    for k, (pieces, frames) in enumerate(plans, 1):
-        dest = template.format(k=k, n=n)
-        tf.write_piece(dest, run, frames, pieces)
-        paths.append(dest)
-        counts.append(frames)
+    paths = [template.format(k=k, n=n) for k in range(1, n + 1)]
+    counts = [frames for _, frames in plans]
+    # A piece that fails takes the pieces this run wrote before it with it,
+    # so a partial set is never left looking like a split. A file that was
+    # at a piece's path before the run is not the run's to remove.
+    existed = tf.existing(paths)
+    try:
+        for dest, (pieces, frames) in zip(paths, plans):
+            tf.write_piece(dest, run, frames, pieces)
+    except Exception:
+        tf.remove_fresh(paths, existed)
+        raise
     return {
         "format": run.format,
         "split": True,

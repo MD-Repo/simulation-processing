@@ -299,6 +299,9 @@ def test_a_converted_run_maps_every_atom(tmp_path):
     assert (t.n_frames, t.n_atoms) == (2, 8)
     assert round(float(t.xyz[1][2][0]), 3) == 2.0, "O1 x"
     assert round(float(t.xyz[1][7][1]), 3) == 3.093, "H22 y"
+    # One box per frame, in nm: the (frames, 3, 3) array the XTC writer takes.
+    assert t.unitcell_lengths.shape == (2, 3)
+    assert (abs(t.unitcell_lengths - 5.0) < 1e-5).all()
 
 
 def test_a_misordered_trajectory_is_refused(tmp_path):
@@ -307,8 +310,16 @@ def test_a_misordered_trajectory_is_refused(tmp_path):
 
     trj = str(tmp_path / "tiny_trj")
     write_dtr(trj, "template")
+    pdb, xtc, bonds = tmp_path / "s.pdb", tmp_path / "s.xtc", tmp_path / "b.json"
+    pdb.write_text("previous")
     with pytest.raises(ValueError, match="do not map"):
-        dc.convert(TINY, trj, str(tmp_path / "s.pdb"), str(tmp_path / "s.xtc"))
+        dc.convert(TINY, trj, str(pdb), str(xtc), str(bonds))
+    # The PDB and bonds were written before the frames were checked, beside
+    # their paths: the refusal leaves what was at --out-pdb and publishes
+    # nothing else.
+    assert pdb.read_text() == "previous"
+    assert not xtc.exists() and not bonds.exists()
+    assert not [p for p in tmp_path.iterdir() if ".part." in p.name]
 
 
 def test_a_trajectory_of_another_system_is_refused(tmp_path):

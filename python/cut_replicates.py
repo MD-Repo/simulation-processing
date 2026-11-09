@@ -66,6 +66,17 @@ def get_args() -> Args:
 
 # --------------------------------------------------
 def cut(path: str, outs: list[str]) -> dict:
+    # One file named for two pieces would hold the later one and be reported
+    # as both.
+    named: dict[str, str] = {}
+    for o in outs:
+        key = os.path.realpath(o)
+        if key in named:
+            which = o if named[key] == o else f"{named[key]} and {o} are one file,"
+            raise ValueError(
+                f"{which} named for two pieces; each replicate needs a file of its own"
+            )
+        named[key] = o
     run = tf.read_run(path)
     n = len(outs)
     frames = len(run.frames)

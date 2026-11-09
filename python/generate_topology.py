@@ -41,7 +41,7 @@ Two things the PDB can do to ParmEd, both met on real records:
     hydrogens to nothing. A hydrogen bonded to no heavy atom, or a C, N, O, P
     or S atom bonded to nothing inside a residue of several atoms, says the
     bonds are wrong (a monatomic ion or a lone water oxygen is neither), and
-    the topology is refused: the .psf is removed and the run exits 1. The
+    the topology is refused: no .psf is written and the run exits 1. The
     report still goes to stdout so the caller can say what was wrong.
 
 Output: the .psf at --out, and one JSON object on stdout:
@@ -59,6 +59,8 @@ import json
 import os
 import sys
 from typing import NamedTuple, Optional
+
+import outputs
 
 # The alphabet of chain letters the renumbering may hand out.
 CHAIN_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"
@@ -222,7 +224,8 @@ def check_bonds(st) -> tuple[int, int, list[str]]:
 # --------------------------------------------------
 def generate(structure: str, out: str, bonds: Optional[list] = None) -> Report:
     """Write the .psf of the structure at out and report on it. A topology
-    whose bonds are wrong is not left behind."""
+    whose bonds are wrong is not written, and a file already at out is left
+    as it was."""
 
     st, renumbered = load_structure(structure)
     if bonds is not None:
@@ -238,9 +241,10 @@ def generate(structure: str, out: str, bonds: Optional[list] = None) -> Report:
         bonds_from="stated" if bonds is not None else "inferred",
     )
     if report.ok():
-        st.save(out, format="psf", overwrite=True)
-    elif os.path.exists(out):
-        os.remove(out)
+        # Written beside out and moved onto it whole, so a save that fails
+        # midway leaves a topology already at out as it was.
+        with outputs.staged(out) as psf:
+            st.save(psf, format="psf", overwrite=True)
     return report
 
 

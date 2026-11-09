@@ -164,6 +164,30 @@ def test_first_frame_command_fails_on_a_mismatched_trajectory(tmp_path):
     assert not out.exists(), "nothing is left behind"
 
 
+def test_a_check_that_fails_leaves_an_existing_output_as_it_was(tmp_path, monkeypatch):
+    """The PDB is written and checked beside --out and moved onto it only
+    when every check passes, so a check that fails after the write cannot
+    take a file that was there before the run."""
+    psf, dcd, out = tmp_path / "run.psf", tmp_path / "run.dcd", tmp_path / "sys.pdb"
+    psf.write_text(ten_atom_psf())
+    dcd.write_bytes(numbered_dcd(10, 3))
+    out.write_text("previous")
+    monkeypatch.setattr(pe, "pdb_atom_count", lambda path: -1)
+
+    with pytest.raises(ValueError, match="holds -1 atoms"):
+        ffs.write(str(psf), str(dcd), str(out))
+    assert out.read_text() == "previous"
+    assert not (tmp_path / "sys.part.pdb").exists()
+
+    whole, sub = tmp_path / "whole.pdb", tmp_path / "sub.pdb"
+    whole.write_text(dipeptide_in_water())
+    sub.write_text("previous")
+    with pytest.raises(ValueError, match="holds -1 atoms"):
+        ss.subset(str(whole), None, "resname TIP3", str(sub))
+    assert sub.read_text() == "previous"
+    assert not (tmp_path / "sub.part.pdb").exists()
+
+
 # --------------------------------------------------
 def test_a_subset_keeps_the_selected_atoms_in_order(tmp_path):
     pdb, out = tmp_path / "sys.pdb", tmp_path / "sub.pdb"

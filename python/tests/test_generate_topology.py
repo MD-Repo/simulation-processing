@@ -81,13 +81,17 @@ def test_inferred_bonds_that_leave_lone_hydrogens_are_refused(tmp_path):
     assert not report.ok()
     assert report.unbonded_h == 10, "all 10 hydrogens are bonded to nothing"
     assert "ALA 1 A H" in report.examples
-    assert not psf.exists(), "a refused topology is not left behind"
+    assert (
+        psf.read_text() == "stale"
+    ), "a refused topology is not written; what was at --out stays"
+    assert not (tmp_path / "s.part.psf").exists()
     assert "10 hydrogens" in report.refusal()
 
 
 def test_a_dipeptide_in_residue_order_bonds_every_hydrogen(tmp_path):
     pdb, psf = tmp_path / "s.pdb", tmp_path / "s.psf"
     pdb.write_text(two_alanines(True))
+    psf.write_text("stale")  # replaced by the topology that passes
 
     report = gt.generate(str(pdb), str(psf))
 

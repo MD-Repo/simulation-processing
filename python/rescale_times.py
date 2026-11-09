@@ -133,16 +133,18 @@ def rescale(path: str, factor: float) -> dict:
 def main() -> None:
     args = get_args()
     name = os.path.basename(args.trajectory)
+    fmt = None
     try:
-        if tf.identify(args.trajectory) == "hdf5":
-            import h5py  # noqa: F401
-    except ImportError:
-        sys.stderr.write(f"h5py is not installed in {sys.executable}\n")
-        sys.exit(2)
-    try:
+        fmt = tf.identify(args.trajectory)  # a path that is no file fails here
+        if fmt == "hdf5":
+            try:
+                import h5py  # noqa: F401
+            except ImportError:
+                sys.stderr.write(f"h5py is not installed in {sys.executable}\n")
+                sys.exit(2)
         report = rescale(args.trajectory, args.factor)
     except tf.Refused as e:
-        print(json.dumps({"format": tf.identify(args.trajectory), "refused": str(e)}))
+        print(json.dumps({"format": fmt, "refused": str(e)}))
         sys.stderr.write(f"{name}: {e}\n")
         sys.exit(1)
     except Exception as e:

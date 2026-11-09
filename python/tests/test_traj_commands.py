@@ -100,6 +100,20 @@ def test_a_truncated_xtc_is_damage(tmp_path):
         tf.read_run(p)
 
 
+def test_part_of_a_frame_header_is_damage(tmp_path):
+    """One to fifteen bytes of a header after the last whole frame: a writer
+    that stopped mid-frame, not a clean end. Only an empty read ends a
+    file; otherwise a cut or rescale would publish the truncation."""
+    data = tb.xtc([0.0, 10.0])
+    p = write(tmp_path, "a.xtc", data + data[:7])
+    with pytest.raises(tf.BadTrajectory, match="truncated at frame 2"):
+        tf.read_run(p)
+    data = tb.trr([0.0, 10.0])
+    p = write(tmp_path, "a.trr", data + data[:10])
+    with pytest.raises(tf.BadTrajectory, match="truncated at frame 2"):
+        tf.read_run(p)
+
+
 # --------------------------------------------------
 def test_rescale_rewrites_only_the_xtc_time_fields(tmp_path):
     data = tb.xtc([0.0, 0.01, 0.02, 0.03])
@@ -405,6 +419,42 @@ def test_join_refuses_segments_of_different_atoms_or_precision(tmp_path):
     d = write(tmp_path, "d.trr", tb.trr([20.0, 30.0], double=True))
     with pytest.raises(tf.BadTrajectory, match="different precision"):
         join_trajectories.join([c, d], str(tmp_path / "cd.trr"))
+
+
+def test_join_refuses_dcds_sampled_differently(tmp_path):
+    """The joined DCD keeps the first segment's header, which times every
+    frame by its save interval and time step: a segment saved at another
+    spacing would be mistimed."""
+    a = write(tmp_path, "a.dcd", tb.dcd(3, 2))
+    b = write(tmp_path, "b.dcd", tb.dcd(3, 2, nsavc=5, coord=lambda f: f + 3))
+    with pytest.raises(tf.BadTrajectory, match="every 1 steps .* every 5"):
+        join_trajectories.join([a, b], str(tmp_path / "ab.dcd"))
+    c = write(tmp_path, "c.dcd", tb.dcd(3, 2, delta=40.9096, coord=lambda f: f + 3))
+    with pytest.raises(tf.BadTrajectory, match="40.9096"):
+        join_trajectories.join([a, c], str(tmp_path / "ac.dcd"))
+    assert not (tmp_path / "ab.dcd").exists() and not (tmp_path / "ac.dcd").exists()
+
+
+def test_cut_refuses_one_file_named_for_two_pieces(tmp_path):
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0]))
+    x = str(tmp_path / "x.xtc")
+    with pytest.raises(ValueError, match="named for two pieces"):
+        cut_replicates.cut(a, [x, x])
+    with pytest.raises(ValueError, match="are one file, named for two pieces"):
+        cut_replicates.cut(a, [x, str(tmp_path / "sub" / ".." / "x.xtc")])
+    assert not os.path.exists(x)
+
+
+def test_a_failed_split_removes_the_pieces_it_wrote(tmp_path):
+    """The second piece cannot be written (a directory sits at its path):
+    the first, already written, goes with it, so no partial set is left
+    looking like a split."""
+    a = write(tmp_path, "a.xtc", tb.xtc([0.0, 10.0, 0.0, 10.0]))
+    (tmp_path / "run_2.xtc").mkdir()
+    with pytest.raises(OSError):
+        split_at_resets.split(a, str(tmp_path / "run_{k}.xtc"))
+    assert not (tmp_path / "run_1.xtc").exists()
+    assert not (tmp_path / "run_1.xtc.part").exists()
 
 
 def test_join_does_not_drop_a_frame_on_a_matching_placeholder_stamp(tmp_path):

@@ -39,6 +39,7 @@ import sys
 import warnings
 from typing import NamedTuple
 
+import outputs
 import psf_elements
 
 
@@ -82,17 +83,19 @@ def write(topology: str, trajectory: str, out: str) -> Report:
 
     u = mda.Universe(topology, trajectory)
     u.trajectory[0]
-    u.atoms.write(out)
-
-    atoms = psf_elements.pdb_atom_count(out)
-    if atoms != len(u.atoms):
-        raise ValueError(
-            f"the structure written from the first frame holds {atoms} atoms "
-            f"and the topology {len(u.atoms)}"
-        )
-    elements = None
-    if psf_elements.is_psf(topology):
-        elements = psf_elements.fill_elements(out, topology).as_dict()
+    # Written and checked beside out, then moved onto it: a check that fails
+    # leaves a structure already at out as it was.
+    with outputs.staged(out) as pdb:
+        u.atoms.write(pdb)
+        atoms = psf_elements.pdb_atom_count(pdb)
+        if atoms != len(u.atoms):
+            raise ValueError(
+                f"the structure written from the first frame holds {atoms} atoms "
+                f"and the topology {len(u.atoms)}"
+            )
+        elements = None
+        if psf_elements.is_psf(topology):
+            elements = psf_elements.fill_elements(pdb, topology).as_dict()
     return Report(atoms, elements)
 
 
@@ -105,14 +108,9 @@ def main() -> None:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
 
-    # Only what this run created is removed on failure, not a file that was
-    # already there.
-    existed = os.path.exists(args.out)
     try:
         report = write(args.topology, args.trajectory, args.out)
-    except Exception as e:
-        if not existed and os.path.exists(args.out):
-            os.remove(args.out)
+    except Exception as e:  # write() staged its output: nothing is left behind
         # The reason is the last line of stderr, so it has to be one line.
         reason = " ".join(str(e).split())
         sys.stderr.write(

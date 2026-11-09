@@ -51,7 +51,9 @@ taking in agent PR #101's naming of blank atoms.
 Output: the PDB at --out-pdb; with --trajectory, the XTC at --out-xtc; with
 --out-bonds, the .cms bonds between the PDB's atoms as a JSON list of
 0-based [i, j] pairs in the PDB's order, which generate_topology.py takes
-as --bonds. One JSON object on stdout:
+as --bonds. Each is written beside its path and moved onto it only once the
+run has converted, so a refusal leaves whatever was at the path as it was.
+One JSON object on stdout:
 
   {"atoms": N, "particles": N, "pseudo": N, "pseudo_on": {resname: N},
    "renamed": N, "named": N, "regrouped": N, "bonds": N,
@@ -67,6 +69,7 @@ not map; 2 when mdtraj is not installed.
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -74,6 +77,7 @@ import sys
 from typing import NamedTuple, Optional
 
 import maestro
+import outputs
 from maestro import Particle
 
 # Element symbols by atomic number.
@@ -395,28 +399,32 @@ def convert(cms: str, trajectory: Optional[str], out_pdb: str, out_xtc: Optional
         if p.pseudo:
             pseudo_on[p.resname] = pseudo_on.get(p.resname, 0) + 1
 
-    with open(out_pdb, "w") as fh:
-        write_pdb(fh, atoms, system.box)
-    if out_bonds:
-        with open(out_bonds, "w") as fh:
-            json.dump([list(b) for b in bonds], fh)
-
+    # Every output is staged beside its path and published together once the
+    # run has converted: a mapping that fails leaves a PDB or bonds file
+    # already at its path as it was.
     frames = Frames(0, 0.0, 0.0, -1, float("inf"), None)
-    if trajectory:
-        dtr = trajectory
-        if os.path.isdir(dtr):
-            dtr = os.path.join(dtr, "clickme.dtr")
-        ref = [(p.x, p.y, p.z) for p in atoms]
-        frames = copy_frames(dtr, out_xtc, len(system.particles), keep, ref, bonds)
-        # Either check establishes the mapping: the .cms matching a frame,
-        # or, for a .cms from outside the saved frames, sane bond lengths.
-        if frames.match_spread > MAX_MATCH_SPREAD and (
-            frames.bond_p99 is None or frames.bond_p99 > MAX_BOND_P99
-        ):
-            raise ValueError(
-                "atoms do not map: the .cms matches no frame (best spread "
-                f"{frames.match_spread:.3f} nm) and bonds run to {frames.bond_p99 or 0:.2f} nm"
-            )
+    with contextlib.ExitStack() as stack:
+        with open(stack.enter_context(outputs.staged(out_pdb)), "w") as fh:
+            write_pdb(fh, atoms, system.box)
+        if out_bonds:
+            with open(stack.enter_context(outputs.staged(out_bonds)), "w") as fh:
+                json.dump([list(b) for b in bonds], fh)
+        if trajectory:
+            dtr = trajectory
+            if os.path.isdir(dtr):
+                dtr = os.path.join(dtr, "clickme.dtr")
+            ref = [(p.x, p.y, p.z) for p in atoms]
+            xtc = stack.enter_context(outputs.staged(out_xtc))
+            frames = copy_frames(dtr, xtc, len(system.particles), keep, ref, bonds)
+            # Either check establishes the mapping: the .cms matching a frame,
+            # or, for a .cms from outside the saved frames, sane bond lengths.
+            if frames.match_spread > MAX_MATCH_SPREAD and (
+                frames.bond_p99 is None or frames.bond_p99 > MAX_BOND_P99
+            ):
+                raise ValueError(
+                    "atoms do not map: the .cms matches no frame (best spread "
+                    f"{frames.match_spread:.3f} nm) and bonds run to {frames.bond_p99 or 0:.2f} nm"
+                )
 
     return Result(
         atoms=len(atoms),
@@ -448,18 +456,11 @@ def main() -> None:
             sys.stderr.write(f"mdtraj is not installed in {sys.executable}\n")
             sys.exit(2)
 
-    outs = [args.out_pdb, args.out_xtc, args.out_bonds]
-    # Only what this run created is removed on failure, not a file that was
-    # already there.
-    existed = {o for o in outs if o and os.path.exists(o)}
     try:
         result = convert(
             args.cms, args.trajectory, args.out_pdb, args.out_xtc, args.out_bonds
         )
-    except Exception as e:
-        for o in outs:
-            if o and o not in existed and os.path.exists(o):
-                os.remove(o)
+    except Exception as e:  # convert() staged its outputs: none is left behind
         reason = " ".join(str(e).split())
         sys.stderr.write(f"converting {os.path.basename(args.cms)}: {reason}\n")
         sys.exit(1)

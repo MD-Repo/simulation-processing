@@ -61,6 +61,7 @@ import sys
 import warnings
 from typing import NamedTuple, Optional
 
+import outputs
 import psf_elements
 
 # Topology formats MDAnalysis reads on their own, for the bonds and the atoms.
@@ -162,7 +163,6 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
         raise ValueError(
             f"the selection {selection!r} holds no atoms of {os.path.basename(s)}"
         )
-    ag.write(out)
 
     bonds = None
     try:
@@ -203,21 +203,26 @@ def subset(structure: str, topology: Optional[str], selection: str, out: str) ->
                 for i in d[:5]
             ]
 
-    atoms = psf_elements.pdb_atom_count(out)
-    if atoms != len(ag):
-        raise ValueError(
-            f"the subset PDB holds {atoms} atoms and the selection {len(ag)}"
-        )
-
-    elements = None
-    if t and psf_elements.is_psf(t):
-        if from_top:
-            # The atoms are the .psf's atoms it names, in order.
-            elements = psf_elements.fill_elements(out, t, ag.indices.tolist()).as_dict()
-        elif released and mismatches == 0 and psf_elements.pdb_lacks_elements(out):
-            # The atoms are the released .psf's, name for name: where the
-            # structure they were read from had no elements, it gives them.
-            elements = psf_elements.fill_elements(out, t).as_dict()
+    # Written and checked beside out, then moved onto it: a check that fails
+    # leaves a structure already at out as it was.
+    with outputs.staged(out) as pdb:
+        ag.write(pdb)
+        atoms = psf_elements.pdb_atom_count(pdb)
+        if atoms != len(ag):
+            raise ValueError(
+                f"the subset PDB holds {atoms} atoms and the selection {len(ag)}"
+            )
+        elements = None
+        if t and psf_elements.is_psf(t):
+            if from_top:
+                # The atoms are the .psf's atoms it names, in order.
+                elements = psf_elements.fill_elements(
+                    pdb, t, ag.indices.tolist()
+                ).as_dict()
+            elif released and mismatches == 0 and psf_elements.pdb_lacks_elements(pdb):
+                # The atoms are the released .psf's, name for name: where the
+                # structure they were read from had no elements, it gives them.
+                elements = psf_elements.fill_elements(pdb, t).as_dict()
 
     return Report(
         atoms=atoms,
@@ -241,14 +246,9 @@ def main() -> None:
         sys.stderr.write(f"MDAnalysis is not installed in {sys.executable}\n")
         sys.exit(2)
 
-    # Only what this run created is removed on failure, not a file that was
-    # already there.
-    existed = os.path.exists(args.out)
     try:
         report = subset(args.structure, args.topology, args.selection, args.out)
-    except Exception as e:
-        if not existed and os.path.exists(args.out):
-            os.remove(args.out)
+    except Exception as e:  # subset() staged its output: nothing is left behind
         # The reason is the last line of stderr, so it has to be one line.
         reason = " ".join(str(e).split())
         sys.stderr.write(
