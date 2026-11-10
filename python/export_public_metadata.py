@@ -10,7 +10,8 @@ download the whole corpus instead of crawling /simulation_list page by page.
 The tarball layout is:
 
     mdrepo-metadata-YYYY-MM-DD.tar.gz
-    |-- index.json            generated-at, count, and the sorted ID list
+    |-- index.json            generated-at, count, the sorted ID list, and
+    |                         which of those an AI agent imported
     `-- simulations/
         |-- MDR00000002.json
         `-- ...
@@ -212,6 +213,36 @@ def prune_hidden(sim_dir: str, allowed: Set[int]) -> List[int]:
 
 
 # --------------------------------------------------
+def agent_imported(sim_dir: str, ids: List[int]) -> List[int]:
+    """The IDs whose record says an AI agent imported it"""
+
+    # Read from the records themselves, not the database, so the list and
+    # the files in the same tarball cannot disagree. Every record must carry
+    # the flag (mdr-export always writes it): a record without it means an
+    # mdr-export too old to say, and an empty list built from that would
+    # claim "no agent imports" when it does not know. So refuse instead.
+    out = []
+    for i in ids:
+        path = os.path.join(sim_dir, f"MDR{i:08}.json")
+        with open(path, "rt", encoding="UTF-8") as fh:
+            try:
+                record = json.load(fh)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"MDR{i:08}.json: not valid JSON ({e})") from e
+        if not isinstance(record, dict):
+            raise ValueError(f"MDR{i:08}.json: not a JSON object")
+        flag = record.get("is_agent_imported")
+        if not isinstance(flag, bool):
+            raise ValueError(
+                f"MDR{i:08}.json: is_agent_imported is {flag!r}, not true/false "
+                "(mdr-export too old?)"
+            )
+        if flag:
+            out.append(i)
+    return out
+
+
+# --------------------------------------------------
 def write_index(build_dir: str, sim_dir: str, server: str) -> int:
     """Write index.json describing the export, and return the record count"""
 
@@ -220,6 +251,7 @@ def write_index(build_dir: str, sim_dir: str, server: str) -> int:
         for name in os.listdir(sim_dir)
         if name.endswith(".json")
     )
+    agent = agent_imported(sim_dir, ids)
 
     index = {
         "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -232,6 +264,12 @@ def write_index(build_dir: str, sim_dir: str, server: str) -> int:
             "and not is_embargoed"
         ),
         "simulations": [f"MDR{i:08}" for i in ids],
+        # Imported by an AI agent; their metadata may be less reliable (the
+        # site tags them "Agent import"). A subset of "simulations", listed
+        # so a consumer can find or exclude them without opening every
+        # record. The same flag is in each record as is_agent_imported.
+        "agent_imported_count": len(agent),
+        "agent_imported": [f"MDR{i:08}" for i in agent],
     }
 
     with open(os.path.join(build_dir, "index.json"), "wt", encoding="UTF-8") as fh:
@@ -339,7 +377,10 @@ def main() -> None:
             more = f" (and {len(removed) - 10} more)" if len(removed) > 10 else ""
             print(f"Dropped {len(removed)} no longer visible: {ids}{more}")
 
-        count = write_index(build_dir, sim_dir, args.server)
+        try:
+            count = write_index(build_dir, sim_dir, args.server)
+        except ValueError as e:
+            sys.exit(f"Refusing to publish: {e}")
         if not count:
             # An empty export is never legitimate here and would replace a
             # good tarball with a useless one, so refuse to publish it.
