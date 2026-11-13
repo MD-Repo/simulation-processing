@@ -3,7 +3,8 @@
 compare_smiles.py — Compare two SMILES at multiple levels of strictness:
 
   1) Exact:        canonical SMILES identical
-  2) Connectivity: same heavy-atom skeleton (ignoring charge, H, stereo)
+  2) Connectivity: same heavy atoms joined the same way (ignoring charge,
+                   H, bond order, stereo)
   3) Stereo:       same connectivity + same stereochemistry
   4) Full InChI:   same InChI (connectivity + stereo + charge + protonation)
 
@@ -12,6 +13,12 @@ The connectivity layer (/c) captures the heavy-atom bond graph
 independent of protonation state, charge, and stereochemistry.
 This is what lets you recognize that NMN+ and neutral NMN are
 "the same molecule in different protonation states."
+
+/c alone does not say which element each atom is: it numbers the atoms in
+the order of the formula layer and carries none of the formula. So level 2
+is /c AND the same heavy atoms (same_heavy_atoms). Hydrogens are reported
+beside it, not required: same_hydrogens, and same_hydrogens_less_charge
+for a difference that protonation alone does not explain.
 
 Usage:
     python compare_smiles.py SMILES_1 SMILES_2
@@ -22,7 +29,8 @@ Requires: pip install openbabel-wheel
 import argparse
 import json
 import sys
-from typing import List, Tuple
+from collections import Counter
+from typing import List, Optional, Tuple
 
 from openbabel import openbabel as ob
 from rdkit import Chem, RDLogger
@@ -157,6 +165,35 @@ def inchi_layers(inchi: str) -> dict:
     return layers
 
 
+def composition(mol: ob.OBMol) -> Tuple[Counter, int]:
+    """(heavy atoms by element symbol, number of hydrogens) for a molecule.
+
+    Counted from the atoms, not read from an InChI formula layer, so that it
+    is there when InChI is not. Deuterium and tritium count as hydrogen.
+    """
+
+    heavy: Counter = Counter()
+    hydrogens = 0
+    for atom in ob.OBMolAtomIter(mol):
+        if atom.GetAtomicNum() == 1:
+            hydrogens += 1
+        else:
+            heavy[ob.GetSymbol(atom.GetAtomicNum())] += 1
+            hydrogens += atom.GetImplicitHCount()
+    return heavy, hydrogens
+
+
+def formula_text(heavy: Counter, hydrogens: Optional[int] = None) -> str:
+    """Hill order: C, H, then the rest by symbol. No H when `hydrogens` is None."""
+
+    counts = dict(heavy)
+    if hydrogens:
+        counts["H"] = hydrogens
+    first = [e for e in ("C", "H") if e in counts] if "C" in counts else []
+    order = first + sorted(e for e in counts if e not in first)
+    return "".join(f"{e}{counts[e] if counts[e] > 1 else ''}" for e in order)
+
+
 def split_fragments(smi: str) -> List[str]:
     """The dot-separated components of a SMILES, in input order."""
 
@@ -257,10 +294,39 @@ def compare(smi1: str, smi2: str) -> dict:
     # Level 1: exact canonical SMILES
     exact = can1 == can2
 
-    # Level 2: same connectivity (heavy-atom bond graph)
+    # Level 2: same connectivity (heavy-atom bond graph).
+    #
+    # THE /c LAYER DOES NOT NAME ELEMENTS (review F4). It numbers atoms in
+    # the order of the formula layer and says which numbers are joined, so
+    # two molecules with different formulas can share one /c string: benzene
+    # and pyridine, fluoro- and chlorobenzene, ethanol and ethylamine, a
+    # thiophene and its selenophene. Compared on /c alone those were "the
+    # same molecule", and mdr-process accepts a declared ligand on this
+    # field, so a submitter who declared the wrong member of a halogen
+    # series was verified. The heavy atoms must match too.
+    #
+    # Hydrogens are deliberately NOT part of it (Travis, 2026-11-12): the
+    # declared ligand is to be accepted wherever it can be, and protonation
+    # is expected to differ between a declaration and a simulated frame. A
+    # hydrogen difference is reported in same_hydrogens and
+    # same_hydrogens_less_charge for the caller to warn about.
     conn1 = layers1.get("c", "")
     conn2 = layers2.get("c", "")
-    same_connectivity = conn1 == conn2 and conn1 != ""
+    heavy1, hydrogens1 = composition(mol1)
+    heavy2, hydrogens2 = composition(mol2)
+    same_heavy_atoms = heavy1 == heavy2
+    same_connectivity = conn1 == conn2 and conn1 != "" and same_heavy_atoms
+
+    # Protonation aside. A proton gained or lost changes the hydrogens and
+    # the charge by the same amount, so hydrogens minus charge is the same
+    # for every protonation state of one molecule: acetic acid 4 - 0,
+    # acetate 3 - (-1). It differs where hydrogens came or went with their
+    # electrons: benzene and cyclohexane, NAD+ and NADH, an acid and its
+    # unsaturated analogue.
+    same_hydrogens = hydrogens1 == hydrogens2
+    same_hydrogens_less_charge = (
+        hydrogens1 - mol1.GetTotalCharge() == hydrogens2 - mol2.GetTotalCharge()
+    )
 
     # An EMPTY /c layer means InChI generation failed, not that the two
     # molecules differ. The strict predicate above cannot tell those apart
@@ -286,8 +352,15 @@ def compare(smi1: str, smi2: str) -> dict:
         # a 1.07.3 layer against a 1.04 one.
         main_conn1 = conn1 if not dropped1 else connectivity_of(main1, inchi_software)
         main_conn2 = conn2 if not dropped2 else connectivity_of(main2, inchi_software)
+        try:
+            main_heavy1 = composition(parse_smiles(main1))[0]
+            main_heavy2 = composition(parse_smiles(main2))[0]
+        except (ValueError, RuntimeError):
+            main_heavy1, main_heavy2 = Counter(), None
         same_connectivity_largest_fragment = (
-            main_conn1 == main_conn2 and main_conn1 != ""
+            main_conn1 == main_conn2
+            and main_conn1 != ""
+            and main_heavy1 == main_heavy2
         )
 
     # Every atom present, but distributed over more than one component:
@@ -335,6 +408,10 @@ def compare(smi1: str, smi2: str) -> dict:
                 else "split bond graph, all atoms present"
             )
             differences.append(f"{kind} ({dropped})")
+        elif conn1 == conn2 and not same_heavy_atoms:
+            differences.append(
+                f"elements ({formula_text(heavy1)} vs {formula_text(heavy2)})"
+            )
         else:
             differences.append("connectivity (different molecules)")
     else:
@@ -348,6 +425,8 @@ def compare(smi1: str, smi2: str) -> dict:
             differences.append("charge")
         if layers1.get("p", "") != layers2.get("p", ""):
             differences.append("protonation")
+        if layers1.get("i", "") != layers2.get("i", ""):
+            differences.append("isotopes")
         for k, label in [("t", "tetrahedral stereo"), ("b", "E/Z stereo")]:
             if layers1.get(k, "") != layers2.get(k, ""):
                 differences.append(label)
@@ -361,6 +440,17 @@ def compare(smi1: str, smi2: str) -> dict:
         "charge2": mol2.GetTotalCharge(),
         "exact_match": exact,
         "same_connectivity": same_connectivity,
+        # Element counts without hydrogen, and whether they agree. A shared
+        # /c layer with different heavy atoms is NOT same_connectivity.
+        "heavy_atoms1": formula_text(heavy1),
+        "heavy_atoms2": formula_text(heavy2),
+        "same_heavy_atoms": same_heavy_atoms,
+        # Hydrogens as written, and less the charge: the second is False
+        # only for a difference protonation does not explain.
+        "hydrogens1": hydrogens1,
+        "hydrogens2": hydrogens2,
+        "same_hydrogens": same_hydrogens,
+        "same_hydrogens_less_charge": same_hydrogens_less_charge,
         "same_connectivity_and_stereo": same_stereo,
         "same_inchi": same_inchi,
         "differences": differences,

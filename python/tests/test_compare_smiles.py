@@ -174,3 +174,92 @@ def test_largest_fragment_ranks_by_heavy_atoms_not_string_length():
 
     assert main == "CCO"
     assert dropped == ["[HH]"]
+
+
+# Pairs that share one InChI /c layer and are not the same molecule (review
+# F4): /c numbers atoms in formula order and names no element.
+SAME_C_DIFFERENT_ELEMENTS = [
+    ("c1ccccc1", "c1ccncc1"),  # benzene / pyridine
+    ("Oc1ccccc1", "Nc1ccccc1"),  # phenol / aniline
+    ("Fc1ccccc1", "Clc1ccccc1"),
+    ("CCO", "CCN"),
+    ("OC(=O)c1ccccc1Cl", "OC(=O)c1ccccc1Br"),
+    ("c1ccc2sccc2c1", "c1ccc2[se]ccc2c1"),
+    ("Cc1ccc(cc1)S(N)(=O)=O", "Cc1ccc(cc1)P(N)(=O)=O"),
+]
+
+
+@pytest.mark.parametrize("a,b", SAME_C_DIFFERENT_ELEMENTS)
+def test_a_shared_c_layer_with_different_elements_is_not_the_same_molecule(a, b):
+    """mdr-process verifies a declared ligand on same_connectivity. On /c
+    alone, the wrong member of a halogen series was verified."""
+
+    result = cs.compare(a, b)
+
+    assert result["connectivity1"] == result["connectivity2"] != ""
+    assert result["same_heavy_atoms"] is False
+    assert result["same_connectivity"] is False
+    assert result["same_connectivity_and_stereo"] is False
+    assert result["same_connectivity_largest_fragment"] is False
+    assert result["differences"] == [
+        f"elements ({result['heavy_atoms1']} vs {result['heavy_atoms2']})"
+    ]
+
+
+def test_a_detached_fragment_does_not_excuse_a_different_element():
+    """The largest-fragment rescue compares /c as well, and is held to the
+    same rule: benzene with a stray H2 is not pyridine."""
+
+    result = cs.compare("c1ccccc1.[HH]", "c1ccncc1")
+
+    assert result["same_connectivity_largest_fragment"] is False
+    assert result["fragment_artifact"] is False
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        ("CC(=O)O", "CC(=O)[O-]"),
+        ("CN", "C[NH3+]"),
+        ("[NH3+]CC(=O)[O-]", "NCC(=O)O"),
+        ("Cc1nn[n-]n1", "Cc1nn[nH]n1"),
+        ("OP(=O)(O)OCC[N+](C)(C)C", "[O-]P(=O)([O-])OCC[N+](C)(C)C"),
+    ],
+)
+def test_protonation_alone_still_verifies_and_is_not_a_hydrogen_difference(a, b):
+    """The declared ligand is accepted wherever it can be (Travis,
+    2026-11-12): hydrogens are no part of same_connectivity, and a proton
+    gained or lost leaves hydrogens-less-charge as it was."""
+
+    result = cs.compare(a, b)
+
+    assert result["same_connectivity"] is True
+    assert result["same_hydrogens_less_charge"] is True
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        ("C1CCCCC1", "c1ccccc1"),
+        ("CCCCCCCC(=O)O", "CCCCCC=CC(=O)O"),
+        ("NC(=O)c1ccc[n+](C)c1", "NC(=O)C1=CN(C)C=CC1"),  # NMN+-like / dihydro
+    ],
+)
+def test_a_redox_or_saturation_state_verifies_with_a_hydrogen_difference(a, b):
+    """Same heavy atoms, same bonds between them, different hydrogens for a
+    reason that is not protonation: verified, and the caller warns."""
+
+    result = cs.compare(a, b)
+
+    assert result["same_connectivity"] is True
+    assert result["same_hydrogens"] is False
+    assert result["same_hydrogens_less_charge"] is False
+
+
+def test_composition_counts_implicit_and_explicit_hydrogens():
+    heavy, hydrogens = cs.composition(cs.parse_smiles("[H]OC(Cl)Cl"))
+
+    assert dict(heavy) == {"C": 1, "O": 1, "Cl": 2}
+    assert hydrogens == 2
+    assert cs.formula_text(heavy) == "CCl2O"
+    assert cs.formula_text(heavy, hydrogens) == "CH2Cl2O"
