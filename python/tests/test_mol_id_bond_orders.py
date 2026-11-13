@@ -255,3 +255,59 @@ def test_a_real_nitrile_and_alkyne_are_still_settled():
         conv = ob.OBConversion()
         conv.SetOutFormat("can")
         assert "#" in conv.WriteString(got), smiles
+
+
+def _all_atom(smiles: str, tmp_path, united: bool = False) -> dict:
+    """mol_id's reading of `smiles` embedded with every hydrogen and written
+    as cpptraj writes a ligand: one residue, no CONECT, no formal charges.
+    With `united`, the hydrogens on carbon are left out."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    m = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    AllChem.EmbedMolecule(m, randomSeed=7)
+    AllChem.MMFFOptimizeMolecule(m, maxIters=2000)
+    pos = m.GetConformer().GetPositions()
+    atoms = [
+        (f"{a.GetSymbol()}{a.GetIdx() + 1}", a.GetSymbol().upper(), *pos[a.GetIdx()])
+        for a in m.GetAtoms()
+        if not (
+            united
+            and a.GetAtomicNum() == 1
+            and a.GetNeighbors()[0].GetAtomicNum() == 6
+        )
+    ]
+    path = tmp_path / "ligand.pdb"
+    path.write_text(_pdb(atoms))
+    return mol_id.structure_to_smiles(str(path), resname="LIG")[0]
+
+
+def test_a_united_atom_heteroaromatic_ring_gets_no_triple_bonds(tmp_path):
+    """Review F3. With its ring CH united and its NH explicit, 2-pyridone's
+    valences are met by [H]n1c#cc#cc1=O, which RDKit calls aromatic, and the
+    check of bond lengths passed over aromatic bonds. It reads the Kekule
+    form now, and no ring this small holds a triple bond at any length."""
+
+    for smiles in (
+        "O=c1cccc[nH]1",
+        "O=c1cc[nH]cc1",
+        "O=c1cc[nH]c(=O)[nH]1",
+        "c1c[nH]cn1",
+        "c1cc[nH]c1",
+    ):
+        got = _all_atom(smiles, tmp_path, united=True)
+        assert "#" not in got["smiles"], (smiles, got["smiles"])
+        assert got["num_heavy_atoms"] == _all_atom(smiles, tmp_path)["num_heavy_atoms"]
+
+
+def test_an_all_atom_aromatic_ring_stretched_by_the_frame_is_still_read():
+    """What the Kekule check must not cost: vorapaxar's NAMD frame holds one
+    aromatic C-C at 1.50 A, past the margin for a double bond. A ring RDKit
+    calls aromatic is exempt from that margin and from no other."""
+
+    got = mol_id.structure_to_smiles(
+        str(INPUTS / "vorapaxar_namd_frame.pdb"), resname="VPX"
+    )[0]
+
+    assert got["formula"] == "C29H33FN2O4"
+

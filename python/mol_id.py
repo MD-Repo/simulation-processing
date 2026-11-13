@@ -975,6 +975,9 @@ _MULTIPLE_BOND_MARGIN = 0.05
 # be under a single bond by this much.
 _TRIPLE_BOND_MARGIN = 0.25
 _CUMULATED_BOND_MARGIN = 0.20
+# No ligand has a triple bond in a ring this small: cyclooctyne, the smallest
+# cycloalkyne that can be kept in a bottle, has eight.
+_MAX_RING_WITH_NO_TRIPLE_BOND = 7
 
 # The search for bond orders is exponential in the atoms whose valence it can
 # choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
@@ -1130,12 +1133,31 @@ def _implausible(atom) -> bool:
 
 
 def _multiple_bonds_are_short(m) -> bool:
-    """Whether every double or triple bond of `m` outside an aromatic ring is
-    shorter in its conformer than a single bond between the same elements: by
-    _TRIPLE_BOND_MARGIN for a triple bond, _CUMULATED_BOND_MARGIN for a double
-    bond on a carbon with two, and _MULTIPLE_BOND_MARGIN for the rest."""
+    """Whether every double or triple bond of `m` is shorter in its conformer
+    than a single bond between the same elements: by _TRIPLE_BOND_MARGIN for
+    a triple bond, _CUMULATED_BOND_MARGIN for a double bond on a carbon with
+    two, and _MULTIPLE_BOND_MARGIN for the rest. A triple bond in a ring of
+    _MAX_RING_WITH_NO_TRIPLE_BOND atoms or fewer is refused at any length.
+
+    The bonds are read from a Kekule copy. RDKit's aromaticity model takes a
+    ring of alternating triple bonds for aromatic, and aromatic bonds used
+    to be passed over here: 2-pyridone with its ring CH united and its NH
+    explicit came back [H]n1c#cc#cc1=O, uracil O=C1NC#CC(=O)N1, pyrrole
+    N1C#CC#C1, each triple bond 1.34-1.40 A long and never measured (review
+    F3).
+
+    One thing is still passed over: the plain double bonds of a ring RDKit
+    calls aromatic, which a Kekule structure places on every other bond by
+    choice, not by length. A frame stretches them past the margin:
+    vorapaxar's NAMD frame holds one aromatic C-C at 1.50 A, and measuring
+    it lost the whole reading. Their triple and cumulated bonds are measured.
+    """
+    aromatic = {b.GetIdx() for b in m.GetBonds() if b.GetIsAromatic()}
+    m = Chem.Mol(m)
+    Chem.Kekulize(m, clearAromaticFlags=True)
     table = Chem.GetPeriodicTable()
     pos = m.GetConformer().GetPositions()
+    rings = m.GetRingInfo()
 
     def cumulated(atom) -> bool:
         return atom.GetAtomicNum() == 6 and (
@@ -1147,8 +1169,13 @@ def _multiple_bonds_are_short(m) -> bool:
         )
 
     for bond in m.GetBonds():
-        if bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.SINGLE:
+        if bond.GetBondType() == Chem.BondType.SINGLE:
             continue
+        if bond.GetBondType() == Chem.BondType.TRIPLE and any(
+            rings.IsBondInRingOfSize(bond.GetIdx(), size)
+            for size in range(3, _MAX_RING_WITH_NO_TRIPLE_BOND + 1)
+        ):
+            return False
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         single = sum(
             table.GetRcovalent(m.GetAtomWithIdx(k).GetAtomicNum())
@@ -1158,6 +1185,8 @@ def _multiple_bonds_are_short(m) -> bool:
             margin = _TRIPLE_BOND_MARGIN
         elif cumulated(bond.GetBeginAtom()) or cumulated(bond.GetEndAtom()):
             margin = _CUMULATED_BOND_MARGIN
+        elif bond.GetIdx() in aromatic:
+            continue
         else:
             margin = _MULTIPLE_BOND_MARGIN
         if np.linalg.norm(pos[i] - pos[j]) > single - margin:
