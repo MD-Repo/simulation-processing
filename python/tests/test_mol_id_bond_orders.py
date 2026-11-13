@@ -108,7 +108,10 @@ def test_a_residue_cut_from_a_chain_keeps_the_geometric_reading():
 def test_bond_orders_the_search_cannot_settle_are_left_to_openbabel():
     """Phytate with its twelve charges unwritten, as cpptraj writes a PDB: the
     search for bond orders has every phosphate oxygen to choose among, and
-    without a bound runs for hours. It gives up within the iteration budget."""
+    without a bound runs for hours. It gives up within the iteration budget,
+    at each charge it tries; -12 is past _MAX_SEARCHED_CHARGE. OpenBabel's
+    reading, a hydrogen on every phosphate oxygen, is the neutral form a
+    ligand is recorded in."""
 
     got = mol_id.structure_to_smiles(
         str(INPUTS / "phytate_embedded.pdb"), resname="IHP"
@@ -282,6 +285,78 @@ def _all_atom(smiles: str, tmp_path, united: bool = False) -> dict:
     return mol_id.structure_to_smiles(str(path), resname="LIG")[0]
 
 
+def _key(smiles: str) -> str:
+    return mol_id._inchikey_from_smiles(smiles)
+
+
+AMP = "Nc1ncnc2c1ncn2[C@@H]1O[C@H](COP(=O)({0})({0}))[C@@H](O)[C@H]1O"
+ATP = (
+    "Nc1ncnc2c1ncn2[C@@H]1O[C@H](COP(=O)({0})OP(=O)({0})OP(=O)({0})({0}))"
+    "[C@@H](O)[C@H]1O"
+)
+
+
+def test_a_ligand_of_charge_two_or_more_has_its_charge_tried(tmp_path):
+    """Review F2. No file states a ligand's charge, and tried at 0 and +-1
+    alone AMP(2-) came back with its adenine charge-separated,
+    [N+]1=CN=C2C1=[N+]=CN=C2N, ATP(4-) with a dihydro-adenine and spermine(4+)
+    with four neutral four-valent nitrogens. Each is now found at its own
+    charge, and recorded neutral."""
+
+    for charged, neutral, charge in (
+        (AMP.format("[O-]"), AMP.format("O"), -2),
+        (ATP.format("[O-]"), ATP.format("O"), -4),
+        ("[O-]C(=O)CC(O)(CC(=O)[O-])C(=O)[O-]", "OC(=O)CC(O)(CC(=O)O)C(=O)O", -3),
+        ("[NH3+]CCC[NH2+]CCCC[NH2+]CCC[NH3+]", "NCCCNCCCCNCCCN", 4),
+        ("C[NH+]1CC[NH+](CC1)Cc1ccccc1", "CN1CCN(CC1)Cc1ccccc1", 2),
+    ):
+        got = _all_atom(charged, tmp_path)
+        assert got["simulated_charge"] == charge, charged
+        assert _key(got["simulated_smiles"]) == _key(charged), charged
+        assert got["charge"] == 0, charged
+        assert got["inchikey"] == _key(neutral), charged
+        assert "+" not in got["smiles"] and "-" not in got["smiles"], charged
+
+
+def test_the_fewest_charged_atoms_win_then_the_lowest_charge():
+    """Travis's tie-break (2026-11-12). The charges run 0, -1, +1, -2, ...,
+    +-6; an assignment with fewer charged atoms beats one with more, and
+    between two with as many the one of lower total charge is kept."""
+
+    assert mol_id._charges_to_try(0) == [
+        0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6
+    ]  # fmt: skip
+    assert mol_id._charges_to_try(-8)[-1] == -8
+
+
+def test_a_neutral_ligand_and_a_zwitterion_are_left_as_they_are(tmp_path):
+    """The search stops at 0 for a neutral molecule, and a charge no proton
+    settles stays: a nitro group, a quaternary ammonium."""
+
+    for smiles in ("[O-][N+](=O)c1ccccc1", "CC(=O)OCC[N+](C)(C)C", "c1ccncc1"):
+        got = _all_atom(smiles, tmp_path)
+        assert got["inchikey"] == _key(smiles), smiles
+        assert "simulated_smiles" not in got, smiles
+
+    glycine = _all_atom("[NH3+]CC(=O)[O-]", tmp_path)
+    assert glycine["inchikey"] == _key("NCC(=O)O")
+    assert glycine["simulated_charge"] == 0
+
+
+def test_a_tetrazolate_is_not_read_as_a_cation(tmp_path):
+    """Losartan's tetrazolate came back C1=[N+]=NN=N1, charge +1 for -1: the
+    search at -1 puts the charge on carbon, refused, and at +1 found a ring
+    nitrogen with two double bonds. That is refused too, and the ligand is
+    recorded as the neutral tetrazole."""
+
+    losartan = "CCCCc1nc(Cl)c(CO)n1Cc1ccc(cc1)-c1ccccc1-c1nn[n-]n1"
+    got = _all_atom(losartan, tmp_path)
+
+    assert "[N+]" not in got["smiles"]
+    assert got["charge"] == 0
+    assert got["formula"] == "C22H23ClN6O"
+
+
 def test_a_united_atom_heteroaromatic_ring_gets_no_triple_bonds(tmp_path):
     """Review F3. With its ring CH united and its NH explicit, 2-pyridone's
     valences are met by [H]n1c#cc#cc1=O, which RDKit calls aromatic, and the
@@ -311,3 +386,20 @@ def test_an_all_atom_aromatic_ring_stretched_by_the_frame_is_still_read():
 
     assert got["formula"] == "C29H33FN2O4"
 
+
+def test_a_nitro_group_is_not_read_two_electrons_over():
+    """With the charge range widened, a nitro group the search cannot settle
+    at 0 was settled at -2 as N([O-])[O-] and recorded, neutral, as a
+    dihydroxylamine: MDR00000544's ligand, which OpenBabel had read right,
+    and MDR00020883's aminothiazole, which the sulfur-last pass had. Found
+    by running the old and new mol_id over the corpus, 2026-11-12."""
+
+    from rdkit import Chem
+
+    m = Chem.MolFromSmiles("c1ccccc1N([O-])[O-]")
+    nitrogen = next(a for a in m.GetAtoms() if a.GetAtomicNum() == 7)
+    assert mol_id._implausible(nitrogen)
+
+    for smiles in ("c1ccccc1[N+](=O)[O-]", "CC(=O)N[O-]", "C[N+](C)(C)[O-]"):
+        m = Chem.MolFromSmiles(smiles)
+        assert not any(mol_id._implausible(a) for a in m.GetAtoms()), smiles

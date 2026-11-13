@@ -674,19 +674,75 @@ def _atomic_num_for(atom) -> int:
     return 0
 
 
-def _mol_summary(mol) -> dict:
-    """Build the standard SMILES/formula/InChIKey summary for an OBMol."""
+def _canonical_smiles(mol) -> str:
     conv = ob.OBConversion()
     conv.SetOutFormat("can")
-    smiles = conv.WriteString(mol).strip().split("\t")[0]
-    inchikey = _inchikey_from_smiles(smiles) or ""
+    return conv.WriteString(mol).strip().split("\t")[0]
+
+
+def _neutral_form(smiles: str) -> Optional["ob.OBMol"]:
+    """The molecule of `smiles` with its charges neutralised by adding and
+    removing protons, every hydrogen explicit, or None when that changes
+    nothing or RDKit will not read the SMILES.
+
+    A carboxylate or a phosphate gains its proton and an ammonium loses one.
+    A charge no proton can settle is left as it is: a quaternary nitrogen,
+    with one anion kept to balance it (phosphocholine stays a zwitterion), a
+    nitro group, an N-oxide.
+    """
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+
+    m = Chem.MolFromSmiles(smiles)
+    if m is None or not any(a.GetFormalCharge() for a in m.GetAtoms()):
+        return None
+    try:
+        neutral = rdMolStandardize.Uncharger().uncharge(m)
+    except Exception:
+        return None
+    if Chem.MolToSmiles(neutral) == Chem.MolToSmiles(m):
+        return None
+    conv = ob.OBConversion()
+    conv.SetInFormat("smi")
+    out = ob.OBMol()
+    if not conv.ReadString(out, Chem.MolToSmiles(neutral)):
+        return None
+    out.AddHydrogens()
+    return out
+
+
+def _mol_summary(mol) -> dict:
+    """The SMILES/formula/InChIKey summary for an OBMol, as the molecule's
+    neutral form.
+
+    A ligand is recorded neutral whatever charge the simulation holds it at
+    (Travis, 2026-11-12): the record says which molecule it is, not its
+    protonation state at the simulation's pH. When the structure holds it
+    charged, `simulated_smiles`, `simulated_formula` and `simulated_charge`
+    say how, so that a declared ligand can be compared with what is in the
+    file and not only with the form recorded.
+    """
+    simulated = _canonical_smiles(mol)
+    neutral = _neutral_form(simulated)
+    if neutral is None:
+        return {
+            "smiles": simulated,
+            "formula": mol.GetFormula(),
+            "num_atoms": mol.NumAtoms(),
+            "num_heavy_atoms": mol.NumHvyAtoms(),
+            "charge": mol.GetTotalCharge(),
+            "inchikey": _inchikey_from_smiles(simulated) or "",
+        }
+    smiles = _canonical_smiles(neutral)
     return {
         "smiles": smiles,
-        "formula": mol.GetFormula(),
-        "num_atoms": mol.NumAtoms(),
-        "num_heavy_atoms": mol.NumHvyAtoms(),
-        "charge": mol.GetTotalCharge(),
-        "inchikey": inchikey,
+        "formula": neutral.GetFormula(),
+        "num_atoms": neutral.NumAtoms(),
+        "num_heavy_atoms": neutral.NumHvyAtoms(),
+        "charge": neutral.GetTotalCharge(),
+        "inchikey": _inchikey_from_smiles(smiles) or "",
+        "simulated_smiles": simulated,
+        "simulated_formula": mol.GetFormula(),
+        "simulated_charge": mol.GetTotalCharge(),
     }
 
 
@@ -1000,13 +1056,18 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     hydrogen in place the valences leave one assignment of bond orders; RDKit's
     DetermineBondOrders finds it without reading an angle.
 
-    The total charge is tried as the file's formal charges state it, then one
-    either side, and the first assignment that holds is kept. It is refused --
-    and OpenBabel's reading stands -- when it leaves a radical, charges a
-    carbon, charges an oxygen positively, charges any atom by more than one,
-    or calls a bond double or triple that the frame holds at single-bond
-    length outside an aromatic ring, or a bond triple or cumulated that the
-    frame holds at double- or aromatic-bond length. Those are what a residue
+    No file says what a ligand's total charge is (see _charges_to_try), so
+    every charge from 0 to +-_MAX_SEARCHED_CHARGE is tried, and of the
+    assignments that hold the one with the fewest charged atoms is kept, then
+    the one of lowest total charge. An assignment is refused when it leaves a
+    radical, charges a carbon, charges an oxygen positively, charges any atom
+    by more than one, puts two double bonds on a charged ring nitrogen, reads
+    a nitro group as N([O-])[O-], calls
+    a bond double or triple that the frame holds at single-bond length, calls
+    a bond triple or cumulated that the frame holds at double- or
+    aromatic-bond length, or puts a triple bond in a ring of seven atoms or
+    fewer. When every charge is refused OpenBabel's reading stands. Those are
+    what a residue
     with an open valence is otherwise forced into: a united-atom residue,
     whose carbons carry their hydrogens implicitly (all of them, or beside
     explicit polar hydrogens), or a residue cut from a polymer, whose
@@ -1018,8 +1079,9 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     The search depends on atom order. With a sulfur listed ahead of the atoms
     that should carry the double bonds, it returns charge-separated forms --
     a thiazole as C=[S+]...[O-] -- which the checks refuse; when every charge
-    has been refused, the search runs once more with the sulfurs listed last
-    (see _sulfur_last).
+    has been refused, or the assignment kept still has charged atoms, the
+    search runs once more with the sulfurs listed last (see _sulfur_last) and
+    the better of the two is kept.
     """
     from rdkit.Geometry import Point3D
 
@@ -1045,26 +1107,79 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     orders = [None]
     if (sulfur_last := _sulfur_last(rw)) is not None:
         orders.append(sulfur_last)
+    # The better of the two orders by the same rule as within one: fewest
+    # charged atoms, then lowest total charge. An order that settles with no
+    # charged atom cannot be bettered and the other is not searched.
+    best, best_rank = None, None
     for order in orders:
         m = _settled_bond_orders(rw, stated, order)
         if m is None:
             continue
-        Chem.Kekulize(m, clearAromaticFlags=True)
-        conv = ob.OBConversion()
-        conv.SetInFormat("mol")
-        out = ob.OBMol()
-        if conv.ReadString(out, Chem.MolToMolBlock(m)):
-            return out
+        rank = _charge_rank(m)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = m, rank
+        if best_rank[0] == 0:
+            break
+    if best is None:
+        return None
+    Chem.Kekulize(best, clearAromaticFlags=True)
+    conv = ob.OBConversion()
+    conv.SetInFormat("mol")
+    out = ob.OBMol()
+    if conv.ReadString(out, Chem.MolToMolBlock(best)):
+        return out
     return None
 
 
+def _charge_rank(m) -> tuple:
+    """(charged atoms, magnitude of the total charge): the lower the better."""
+    charges = [a.GetFormalCharge() for a in m.GetAtoms()]
+    return (sum(1 for q in charges if q), abs(sum(charges)))
+
+
+# The largest total charge, either sign, the bond-order search tries. ATP is
+# -4, spermine +4, IP3 -6; past this a ligand is a polyphosphate the search
+# does not settle anyway (phytate, -12).
+_MAX_SEARCHED_CHARGE = 6
+
+
+def _charges_to_try(stated: int) -> list:
+    """Total charges for the bond-order search, smallest magnitude first and
+    the negative of a pair before the positive.
+
+    `stated` is the sum of the file's formal charges, and it is 0 for every
+    ligand: cpptraj and gmx write no charges into a PDB, and psf_elements
+    writes them for monatomic ions only. Tried at 0 and +-1 alone, anything
+    of charge 2 or more never had its real charge tried, and the valences
+    were then met some other way: AMP(2-) came back with its adenine as
+    [N+]1=CN=C2C1=[N+]=CN=C2N, ATP(4-) with a dihydro-adenine, spermine(4+)
+    with four neutral four-valent nitrogens (review F2). A stated charge
+    outside the range is tried as well.
+    """
+    charges = set(range(-_MAX_SEARCHED_CHARGE, _MAX_SEARCHED_CHARGE + 1))
+    charges.add(stated)
+    return sorted(charges, key=lambda q: (abs(q), q > 0))
+
+
 def _settled_bond_orders(rw, stated: int, order):
-    """The first bond-order assignment for `rw` that holds, trying the stated
-    charge and then one either side, with its atoms in `order` while RDKit
-    searches (None for their own order) and in their own order after."""
+    """The bond-order assignment for `rw` that holds with the fewest charged
+    atoms and, among those, the lowest total charge (4 before 6), over the
+    charges of _charges_to_try; None when none holds. Its atoms are in
+    `order` while RDKit searches (None for their own order) and in their own
+    order after.
+
+    With every hydrogen explicit the true charge is the one that needs no
+    charge separation: at -2 ATP's valences are met with six charged atoms,
+    at -4 with four. An assignment at total charge q has at least |q|
+    charged atoms, so once one is held with n, no charge of magnitude n or
+    more can better it and the search stops: at 0 for a neutral molecule.
+    """
     from rdkit.Chem import rdDetermineBonds
 
-    for charge in (stated, stated - 1, stated + 1):
+    best, best_rank = None, None
+    for charge in _charges_to_try(stated):
+        if best_rank is not None and abs(charge) >= best_rank[0]:
+            break
         m = Chem.Mol(rw)
         if order is not None:
             m = Chem.RenumberAtoms(m, order)
@@ -1079,13 +1194,15 @@ def _settled_bond_orders(rw, stated: int, order):
             continue
         if not _multiple_bonds_are_short(m):
             continue
-        if order is not None:
-            back = [0] * len(order)
-            for new, old in enumerate(order):
-                back[old] = new
-            m = Chem.RenumberAtoms(m, back)
-        return m
-    return None
+        rank = _charge_rank(m)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = m, rank
+    if best is not None and order is not None:
+        back = [0] * len(order)
+        for new, old in enumerate(order):
+            back[old] = new
+        best = Chem.RenumberAtoms(best, back)
+    return best
 
 
 def _sulfur_last(m) -> Optional[list]:
@@ -1111,8 +1228,17 @@ def _sulfur_last(m) -> Optional[list]:
 
 def _implausible(atom) -> bool:
     """A radical or a charge no simulated ligand carries: on carbon, positive
-    on oxygen, positive on a double-bonded sulfur, or more than one on any
-    atom.
+    on oxygen, positive on a double-bonded sulfur, positive on a ring
+    nitrogen with two double bonds, or more than one on any atom.
+
+    A ring =[N+]= is what the search makes of a tetrazolate tried at the
+    wrong sign: losartan's came back C1=[N+]=NN=N1, a cation, for an anion
+    (review F2). Outside a ring it is an azide or a diazo group and stands.
+
+    A neutral nitrogen with two O- is a nitro group read two electrons over,
+    N([O-])[O-] for [N+](=O)[O-]: where the search cannot place the nitro's
+    own charges at 0 (it depends on atom order) it settles this at -2, and
+    it would be recorded as a dihydroxylamine (MDR00000544, MDR00020883).
 
     A double-bonded S+ is a charge-separated form, not a molecule: with a
     thioacid's sulfur listed before its oxygen the valence search returns
@@ -1128,6 +1254,22 @@ def _implausible(atom) -> bool:
             q > 0
             and atom.GetAtomicNum() == 16
             and any(b.GetBondType() != Chem.BondType.SINGLE for b in atom.GetBonds())
+        )
+        or (
+            q == 0
+            and atom.GetAtomicNum() == 7
+            and sum(
+                n.GetAtomicNum() == 8 and n.GetFormalCharge() < 0
+                for n in atom.GetNeighbors()
+            )
+            > 1
+        )
+        or (
+            q > 0
+            and atom.GetAtomicNum() == 7
+            and atom.IsInRing()
+            and sum(b.GetBondType() == Chem.BondType.DOUBLE for b in atom.GetBonds())
+            > 1
         )
     )
 
