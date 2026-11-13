@@ -490,7 +490,7 @@ def _polymer_residues(universe, resnames) -> set:
     inhibitor on a cysteine's sulfur or a lysine's NZ -- is not joined this
     way and stays a ligand. So does a ligand that is itself a chain of
     nonstandard residues, cyclosporin's for one, bonded to no standard
-    residue. Bonds come from the topology where it states them and from
+    residue: it is read as one peptide (_spanning_molecule). Bonds come from the topology where it states them and from
     distances in the frame, both: a file whose CONECT records cover only its
     ligand still has its peptide bonds found. With neither, nothing is
     excluded. The answer for a residue does not depend on which other names
@@ -1376,31 +1376,11 @@ def universe_to_smiles(
     plus summary. Dispatches to a coordinate-aware path when possible (which
     gives the best aromaticity perception) or a topology-only fallback.
     """
-    resnames = universe.atoms.resnames
-    mask = resnames == resname
-    if not mask.any():
-        mask = np.char.upper(resnames.astype(str)) == resname.upper()
-    all_match = universe.atoms[mask]
-    if len(all_match) == 0:
-        raise ValueError(
-            f"No atoms with residue name '{resname}' in the file."
-        )
-
-    # If multiple copies of the same residue name are present (e.g., many lipid
-    # molecules in a full simulation box), use only the first residue instance so
-    # that SMILES represents a single molecule rather than all copies concatenated.
-    # A copy joined into a polymer is passed over while a free one exists.
-    unique_resix = np.unique(all_match.resindices)
-    linked = _polymer_residues(universe, {str(resname)})
-    free = [r for r in unique_resix if int(r) not in linked]
-    if free:
-        unique_resix = np.array(free)
-    sel = all_match[all_match.resindices == unique_resix[0]]
-
+    sel, in_chain = _first_copy(universe, resname)
     has_coords = _has_coords(sel)
 
     # A chain residue is read for the molecule attached to it, where one is.
-    if has_coords and int(unique_resix[0]) in linked:
+    if has_coords and in_chain:
         attached = _attached_group(sel)
         if attached is not None and attached.mol is not None:
             result = _mol_summary(attached.mol)
@@ -1419,6 +1399,271 @@ def universe_to_smiles(
     )
 
 
+def _first_copy(universe, resname: str):
+    """(the atoms of the first residue named `resname`, whether it is joined
+    into a polymer chain).
+
+    If multiple copies of the same residue name are present (e.g., many lipid
+    molecules in a full simulation box), only the first is read, so that the
+    SMILES represents a single molecule rather than all copies concatenated:
+    the record says which ligands a simulation holds, not how many of each
+    (Travis, 2026-11-12). A copy joined into a polymer is passed over while
+    a free one exists.
+    """
+    resnames = universe.atoms.resnames
+    mask = resnames == resname
+    if not mask.any():
+        mask = np.char.upper(resnames.astype(str)) == resname.upper()
+    all_match = universe.atoms[mask]
+    if len(all_match) == 0:
+        raise ValueError(
+            f"No atoms with residue name '{resname}' in the file."
+        )
+    unique_resix = np.unique(all_match.resindices)
+    linked = _polymer_residues(universe, {str(resname)})
+    free = [r for r in unique_resix if int(r) not in linked]
+    if free:
+        unique_resix = np.array(free)
+    first = int(unique_resix[0])
+    return all_match[all_match.resindices == first], first in linked
+
+
+# The elements whose bonds make one molecule of several residues. A metal is
+# left out on purpose: an imidazole on a heme's iron, 2.0 A away, is a ligand
+# beside the heme, not a part of it.
+_COVALENT_ELEMENTS = frozenset({5, 6, 7, 8, 9, 14, 15, 16, 17, 34, 35, 53})
+# Two atoms of different residues are bonded when closer than the sum of
+# their covalent radii plus this (A). A glycosidic C-O is 1.43 against
+# 1.72, a disulfide 2.05 against 2.40; a hydrogen bond's O...O, 2.5 at its
+# shortest, is far outside 1.62.
+_BOND_TOLERANCE = 0.3
+# Residues that end a peptide and are not residues of it.
+_PEPTIDE_CAPS = frozenset({"ACE", "FOR", "NME", "NMA", "NH2", "NHE", "CT3"})
+_ONE_LETTER = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V",
+    "HIE": "H", "HID": "H", "HIP": "H", "HSD": "H", "HSE": "H", "HSP": "H",
+    "ASH": "D", "GLH": "E", "LYN": "K", "CYM": "C", "CYX": "C",
+}  # fmt: skip
+
+
+class _Spanning(NamedTuple):
+    """A molecule made of several residues. `residues` are in chain order
+    when `peptide`, in file order otherwise."""
+
+    residues: list
+    peptide: bool
+    cyclic: bool
+
+
+def _bonded_residues(universe, start: int, eligible: np.ndarray) -> list:
+    """Resindices of the residues covalently bonded, directly or through each
+    other, to residue `start`, itself included, in file order. Only residues
+    marked in `eligible` (by resindex) are walked into.
+
+    Bonds are the topology's where it states them and, with coordinates,
+    those found by distance under the minimum image (_BOND_TOLERANCE), both,
+    as for backbone links.
+    """
+    atoms = universe.atoms
+    resix = atoms.resindices
+    found = {int(start)}
+
+    stated: dict = {}
+    try:
+        bonded = atoms.bonds.indices if len(atoms.bonds) else None
+    except (mda.exceptions.NoDataError, AttributeError):
+        bonded = None
+    if bonded is not None:
+        a, b = resix[bonded[:, 0]], resix[bonded[:, 1]]
+        cross = (a != b) & eligible[a] & eligible[b]
+        for x, y in zip(a[cross].tolist(), b[cross].tolist()):
+            stated.setdefault(x, set()).add(y)
+            stated.setdefault(y, set()).add(x)
+
+    pool = None
+    if _has_coords(atoms):
+        from MDAnalysis.lib.distances import capped_distance
+
+        table = Chem.GetPeriodicTable()
+        candidates = atoms[eligible[resix]]
+        numbers = np.array([_atomic_num_for(a) for a in candidates])
+        keep = np.isin(numbers, list(_COVALENT_ELEMENTS))
+        pool = candidates[keep]
+        radii = np.array([table.GetRcovalent(int(n)) for n in numbers[keep]])
+        pool_resix = pool.resindices
+        box = universe.dimensions
+        if box is None or not np.all(box[:3] > 0):
+            box = None
+
+    queue = [int(start)]
+    while queue:
+        r = queue.pop()
+        near = set(stated.get(r, ()))
+        if pool is not None and len(pool):
+            mine = np.flatnonzero(pool_resix == r)
+            if len(mine):
+                pairs = capped_distance(
+                    pool.positions[mine],
+                    pool.positions,
+                    2 * radii.max() + _BOND_TOLERANCE,
+                    box=box,
+                    method="bruteforce",
+                    return_distances=True,
+                )
+                for (i, j), d in zip(*pairs):
+                    if (
+                        pool_resix[j] != r
+                        and d < radii[mine[i]] + radii[j] + _BOND_TOLERANCE
+                    ):
+                        near.add(int(pool_resix[j]))
+        for other in near - found:
+            found.add(other)
+            queue.append(other)
+    return sorted(found)
+
+
+def _peptide_order(universe, residues: list):
+    """(`residues` in order from N- to C-terminus, whether the chain closes on
+    itself), or None when they are not one peptide.
+
+    They are one when the peptide bonds among them, each residue's C to the
+    next one's N, run through every residue once: a single path, or a single
+    ring (cyclosporin). Other bonds between them, a disulfide or a side-chain
+    bridge, do not matter.
+    """
+    from MDAnalysis.lib.distances import capped_distance
+
+    members = set(residues)
+    atoms = universe.atoms[np.isin(universe.atoms.resindices, residues)]
+    names = atoms.names.astype(str)
+    c, n = atoms[names == "C"], atoms[names == "N"]
+    following: dict = {}
+
+    def link(a, b) -> bool:
+        if a == b or a not in members or b not in members:
+            return True
+        if following.get(a, b) != b:
+            return False
+        following[a] = b
+        return True
+
+    try:
+        for bond in atoms.bonds:
+            x, y = bond.atoms
+            for own, other in ((x, y), (y, x)):
+                if own.name == "C" and other.name == "N":
+                    if not link(int(own.resindex), int(other.resindex)):
+                        return None
+    except (mda.exceptions.NoDataError, AttributeError):
+        pass
+    if _has_coords(atoms) and len(c) and len(n):
+        box = universe.dimensions
+        if box is None or not np.all(box[:3] > 0):
+            box = None
+        pairs = capped_distance(
+            c.positions,
+            n.positions,
+            _LINK_CUTOFF,
+            box=box,
+            method="bruteforce",
+            return_distances=False,
+        )
+        for i, j in pairs:
+            if not link(int(c[i].resindex), int(n[j].resindex)):
+                return None
+
+    preceded = set(following.values())
+    if len(preceded) != len(following):
+        return None
+    starts = [r for r in residues if r not in preceded]
+    cyclic = not starts and len(following) == len(residues)
+    if cyclic:
+        starts = [min(residues)]
+    if len(starts) != 1:
+        return None
+    order = [starts[0]]
+    while order[-1] in following and following[order[-1]] != order[0]:
+        order.append(following[order[-1]])
+    if len(order) != len(residues):
+        return None
+    return order, cyclic
+
+
+def _spanning_molecule(universe, resname: str) -> Optional[_Spanning]:
+    """The molecule of several residues that the first `resname` residue is
+    part of, or None when that residue is a molecule by itself.
+
+    A ligand used to be one residue, whatever it was bonded to. A
+    tetrapeptide written DAL-SAR-DAL-MLE came back as three ligands, the
+    D-alanine an aminoaldehyde C[C@@H](C=O)N with its open valences filled
+    and its second copy dropped; POPC written the Lipid21 way as a palmitic
+    aldehyde, an oleic aldehyde and a glycerophosphocholine (review F5).
+
+    The other residues walked into are those that are not background by
+    name and not joined into a polymer chain, so a ligand on a cysteine's
+    sulfur is still one residue here.
+    """
+    sel, in_chain = _first_copy(universe, resname)
+    if in_chain:
+        return None
+    resnames = universe.residues.resnames.astype(str)
+    eligible = np.array([not _is_skipped_residue(n) for n in resnames])
+    if not eligible.any():
+        return None
+    names = {n for n in np.unique(resnames[eligible])}
+    for r in _polymer_residues(universe, names):
+        eligible[r] = False
+    start = int(sel.resindices[0])
+    eligible[start] = True
+    residues = _bonded_residues(universe, start, eligible)
+    if len(residues) < 2:
+        return None
+    ordered = _peptide_order(universe, residues)
+    if ordered is None:
+        return _Spanning(residues, False, False)
+    return _Spanning(ordered[0], True, ordered[1])
+
+
+def _peptide_summary(universe, spanning: _Spanning) -> dict:
+    """A peptide ligand as mol_id reports it: no SMILES, a sequence.
+
+    One letter per residue, X for any that is not a standard amino acid
+    (Travis, 2026-11-12: DAL, SAR and MLE have no one-letter code, and X is
+    the code for a residue that has none). `resnames` keeps what each X
+    stands for, the caps included; `sequence` leaves the caps out.
+    """
+    residues = [universe.residues[r] for r in spanning.residues]
+    resnames = [str(r.resname) for r in residues]
+    body = list(resnames)
+    if len(body) > 1 and body[0].upper() in _PEPTIDE_CAPS:
+        body = body[1:]
+    if len(body) > 1 and body[-1].upper() in _PEPTIDE_CAPS:
+        body = body[:-1]
+    return {
+        "sequence": "".join(_ONE_LETTER.get(n.upper(), "X") for n in body),
+        "sequence_type": "protein",
+        "resnames": resnames,
+        "resids": [int(r.resid) for r in residues],
+        "cyclic": spanning.cyclic,
+        "resname": resnames[0],
+    }
+
+
+def _residue_list(universe, residues: list) -> str:
+    """`DAL 1, SAR 2 and MLE 4` for a note; the first five and a count past
+    that."""
+    labels = [
+        f"{universe.residues[r].resname} {universe.residues[r].resid}"
+        for r in residues
+    ]
+    if len(labels) > 5:
+        return ", ".join(labels[:5]) + f" and {len(labels) - 5} more"
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
 def _has_coords(sel) -> bool:
     try:
         pos = sel.positions
@@ -1432,12 +1677,20 @@ def structure_to_smiles(
     fmt: Optional[str] = None,
     resname: Optional[str] = None,
     notes: Optional[list] = None,
+    peptides: Optional[list] = None,
 ) -> list:
     """
     Universal pipeline: load any MDAnalysis-supported file (PDB, GRO, GROMACS
     .top/.tpr, PSF, mmCIF, Amber prmtop, ...), identify the ligand residue(s),
     and return a list of canonical-SMILES summaries (one per distinct ligand
     residue), each tagged with its `resname`.
+
+    A ligand made of several residues bonded to each other is one molecule,
+    not one per residue name (see _spanning_molecule). If it is a peptide it
+    is a ligand by sequence, not by SMILES: its summary (_peptide_summary) is
+    added to `peptides` and is not in the list returned. Anything else of
+    several residues -- a glycan, a lipid written as head and tails -- is
+    refused for now and said in `notes` (Travis, 2026-11-12).
 
     If `fmt` is None, format is sniffed from file content (with extension as
     fallback for binary inputs). If `resname` is None, every non-background
@@ -1450,7 +1703,36 @@ def structure_to_smiles(
     universe = load_universe(path, fmt)
     target_resnames = resolve_target_resnames(universe, path, resname, notes)
     results = []
+    seen: set = set()
     for rn in target_resnames:
+        spanning = _spanning_molecule(universe, rn)
+        if spanning is not None:
+            key = frozenset(spanning.residues)
+            if key in seen:
+                continue
+            seen.add(key)
+            where = _residue_list(universe, spanning.residues)
+            if not spanning.peptide:
+                _note(
+                    notes,
+                    f"Residues {where} are bonded into one molecule that is "
+                    f"not a peptide (a glycan, or a lipid written as several "
+                    f"residues, for one). A ligand of several residues is "
+                    f"not recorded unless it is a peptide.",
+                )
+                continue
+            peptide = _peptide_summary(universe, spanning)
+            if peptides is not None:
+                peptides.append(peptide)
+            _note(
+                notes,
+                f"Residues {where} are one peptide of "
+                f"{len(peptide['sequence'])} residues, bonded to no other "
+                f"chain: a peptide ligand, read by its sequence "
+                f"({peptide['sequence']}; X is a residue with no one-letter "
+                f"code), not residue by residue.",
+            )
+            continue
         result = universe_to_smiles(universe, rn, notes)
         result["resname"] = rn
         results.append(result)
@@ -1902,14 +2184,23 @@ NOTE_MARKER = "[mdrepo] note="
 
 
 def _run(args, notes: list) -> None:
+    peptides: list = []
     if args.command == "smiles-from-structure":
         results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname, notes=notes
+            args.path,
+            fmt=args.fmt,
+            resname=args.resname,
+            notes=notes,
+            peptides=peptides,
         )
         if args.verbose:
+            # Small molecules only: mdr-process's ligand_resnames reads this
+            # list as one shape. A peptide ligand reaches it through `both`.
             print(json.dumps(results, indent=2))
         else:
-            print("\n".join(sorted([r["smiles"] for r in results])))
+            lines = sorted([r["smiles"] for r in results])
+            lines += [f"peptide {p['sequence']}" for p in peptides]
+            print("\n".join(lines))
 
     elif args.command == "name-from-smiles":
         result = smiles_to_name(args.smiles)
@@ -1920,12 +2211,18 @@ def _run(args, notes: list) -> None:
 
     elif args.command == "both":
         struct_results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname, notes=notes
+            args.path,
+            fmt=args.fmt,
+            resname=args.resname,
+            notes=notes,
+            peptides=peptides,
         )
+        # A small molecule is {structure, name}; a peptide ligand is
+        # {peptide} and has neither. mdr-process reads both shapes.
         combined = [
             {"structure": sr, "name": smiles_to_name(sr["smiles"])}
             for sr in struct_results
-        ]
+        ] + [{"peptide": p} for p in peptides]
         if args.outfile:
             with open(args.outfile, "wt") as fh:
                 json.dump(combined, fh, indent=2)
@@ -1933,6 +2230,10 @@ def _run(args, notes: list) -> None:
             print(json.dumps(combined, indent=2))
         else:
             for entry in combined:
+                if "peptide" in entry:
+                    p = entry["peptide"]
+                    print(f"{p['resname']}: peptide {p['sequence']}")
+                    continue
                 resname = entry["structure"]["resname"]
                 best = entry["name"]["best_name"]
                 print(f"{resname}: {best}")
