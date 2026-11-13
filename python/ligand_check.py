@@ -274,7 +274,17 @@ def check(
         # bond, which is how 1yq7 and 4dhm came to read
         # "connectivity (C7H11NO7P2 vs C7H11NO7P2)".
         verdicts.append(BLOCK)
-        if result["same_gross_formula"]:
+        if (
+            not result["same_heavy_atoms"]
+            and result["connectivity1"] == result["connectivity2"]
+        ):
+            # The same bond graph with a different element somewhere in it:
+            # a chloro- declared for a fluoro-, a pyridine for a benzene.
+            notes.append(
+                f"ligand[{num}] elements differ, "
+                f"{result['heavy_atoms1']} vs {result['heavy_atoms2']}"
+            )
+        elif result["same_gross_formula"]:
             notes.append(
                 f"ligand[{num}] connectivity differs, formula matches "
                 f"{result['formula1']} (isomer or rearrangement)"

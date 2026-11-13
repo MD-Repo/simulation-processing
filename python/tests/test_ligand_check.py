@@ -230,3 +230,13 @@ def test_write_element_corrected_never_touches_the_source(pdb_file):
     assert [line[:76] for line in corrected[:3]] == [
         line[:76] for line in ELEMENT_COLUMN_PDB.splitlines()[:3]
     ]
+
+
+def test_the_wrong_member_of_a_halogen_series_is_a_block_and_says_so():
+    """Review F4: the same bond graph with a chlorine where a fluorine was
+    declared shares its InChI /c layer, and used to be a FLAG."""
+
+    assert ligand_check.check(["Fc1ccccc1"], ["Clc1ccccc1"]) == (
+        BLOCK,
+        "ligand[0] elements differ, C6F vs C6Cl",
+    )

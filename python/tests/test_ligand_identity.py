@@ -63,9 +63,9 @@ def test_the_molecule_perceived_from_the_named_file_is_the_one_it_holds(
     file does not have. The bond orders now come from the explicit hydrogens
     (mol_id._bond_orders_from_hydrogens), which leave only the anion.
 
-    The recorded JSON is kept as imported -- get_inferred_ligands caches it and
-    never regenerates it -- so it and a fresh reading now differ, by exactly
-    those three hydrogens and the charge, over the same heavy atoms.
+    The anion is what the file holds (`simulated_*`); what is recorded is its
+    neutral form, the sulfonic acid, with the one hydrogen that neutralises
+    it and not the three the geometric reading made up.
     """
 
     got = mol_id.structure_to_smiles(
@@ -73,18 +73,22 @@ def test_the_molecule_perceived_from_the_named_file_is_the_one_it_holds(
     )
     got = got[0] if isinstance(got, list) else got
 
-    assert got["smiles"] == "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(=O)(=O)[O-]"
-    assert got["formula"] == "C14H7O5S-"
-    assert got["charge"] == -1
+    assert got["simulated_smiles"] == "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(=O)(=O)[O-]"
+    assert got["simulated_formula"] == "C14H7O5S-"
+    assert got["simulated_charge"] == -1
+    assert got["smiles"] == "O=C1c2cc(ccc2C(=O)c2c1cccc2)S(=O)(=O)O"
+    assert got["formula"] == "C14H8O5S"
+    assert got["charge"] == 0
     assert got["num_heavy_atoms"] == recorded["num_heavy_atoms"]
     assert recorded["formula"] == "C14H10O5S"
 
 
 def test_the_perceived_skeleton_is_the_declared_one(meta):
-    """With the hydrogens deciding the bond orders, the perceived key's
-    skeleton block is the declared molecule's, and only the protonation flag
-    differs: the file simulates the sulfonate, the metadata declares the acid.
-    The geometric reading shared neither block."""
+    """With the hydrogens deciding the bond orders, the file's molecule is
+    the declared one in another protonation state: it simulates the
+    sulfonate, the metadata declares the acid. The geometric reading shared
+    neither block of the key. Recorded in its neutral form, the perceived
+    ligand is the declared one outright."""
 
     got = mol_id.structure_to_smiles(
         str(BUNDLE / meta["structure_file_name"]), resname="LIG"
@@ -93,9 +97,11 @@ def test_the_perceived_skeleton_is_the_declared_one(meta):
     declared = [lig["smiles"] for lig in meta["ligands"] if lig.get("smiles")]
     want = mol_id._inchikey_from_smiles(declared[0])
 
-    assert got["inchikey"].split("-")[0] == want.split("-")[0]
-    assert (got["inchikey"][-1], want[-1]) == ("M", "N")
-    assert ligand_check.check(declared, [got["smiles"]]) == (
+    assert got["inchikey"] == want
+    simulated = mol_id._inchikey_from_smiles(got["simulated_smiles"])
+    assert simulated.split("-")[0] == want.split("-")[0]
+    assert (simulated[-1], want[-1]) == ("M", "N")
+    assert ligand_check.check(declared, [got["simulated_smiles"]]) == (
         ligand_check.FLAG,
         "ligand[0] protonation",
     )

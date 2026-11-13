@@ -490,7 +490,7 @@ def _polymer_residues(universe, resnames) -> set:
     inhibitor on a cysteine's sulfur or a lysine's NZ -- is not joined this
     way and stays a ligand. So does a ligand that is itself a chain of
     nonstandard residues, cyclosporin's for one, bonded to no standard
-    residue. Bonds come from the topology where it states them and from
+    residue: it is read as one peptide (_spanning_molecule). Bonds come from the topology where it states them and from
     distances in the frame, both: a file whose CONECT records cover only its
     ligand still has its peptide bonds found. With neither, nothing is
     excluded. The answer for a residue does not depend on which other names
@@ -674,19 +674,75 @@ def _atomic_num_for(atom) -> int:
     return 0
 
 
-def _mol_summary(mol) -> dict:
-    """Build the standard SMILES/formula/InChIKey summary for an OBMol."""
+def _canonical_smiles(mol) -> str:
     conv = ob.OBConversion()
     conv.SetOutFormat("can")
-    smiles = conv.WriteString(mol).strip().split("\t")[0]
-    inchikey = _inchikey_from_smiles(smiles) or ""
+    return conv.WriteString(mol).strip().split("\t")[0]
+
+
+def _neutral_form(smiles: str) -> Optional["ob.OBMol"]:
+    """The molecule of `smiles` with its charges neutralised by adding and
+    removing protons, every hydrogen explicit, or None when that changes
+    nothing or RDKit will not read the SMILES.
+
+    A carboxylate or a phosphate gains its proton and an ammonium loses one.
+    A charge no proton can settle is left as it is: a quaternary nitrogen,
+    with one anion kept to balance it (phosphocholine stays a zwitterion), a
+    nitro group, an N-oxide.
+    """
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+
+    m = Chem.MolFromSmiles(smiles)
+    if m is None or not any(a.GetFormalCharge() for a in m.GetAtoms()):
+        return None
+    try:
+        neutral = rdMolStandardize.Uncharger().uncharge(m)
+    except Exception:
+        return None
+    if Chem.MolToSmiles(neutral) == Chem.MolToSmiles(m):
+        return None
+    conv = ob.OBConversion()
+    conv.SetInFormat("smi")
+    out = ob.OBMol()
+    if not conv.ReadString(out, Chem.MolToSmiles(neutral)):
+        return None
+    out.AddHydrogens()
+    return out
+
+
+def _mol_summary(mol) -> dict:
+    """The SMILES/formula/InChIKey summary for an OBMol, as the molecule's
+    neutral form.
+
+    A ligand is recorded neutral whatever charge the simulation holds it at
+    (Travis, 2026-11-12): the record says which molecule it is, not its
+    protonation state at the simulation's pH. When the structure holds it
+    charged, `simulated_smiles`, `simulated_formula` and `simulated_charge`
+    say how, so that a declared ligand can be compared with what is in the
+    file and not only with the form recorded.
+    """
+    simulated = _canonical_smiles(mol)
+    neutral = _neutral_form(simulated)
+    if neutral is None:
+        return {
+            "smiles": simulated,
+            "formula": mol.GetFormula(),
+            "num_atoms": mol.NumAtoms(),
+            "num_heavy_atoms": mol.NumHvyAtoms(),
+            "charge": mol.GetTotalCharge(),
+            "inchikey": _inchikey_from_smiles(simulated) or "",
+        }
+    smiles = _canonical_smiles(neutral)
     return {
         "smiles": smiles,
-        "formula": mol.GetFormula(),
-        "num_atoms": mol.NumAtoms(),
-        "num_heavy_atoms": mol.NumHvyAtoms(),
-        "charge": mol.GetTotalCharge(),
-        "inchikey": inchikey,
+        "formula": neutral.GetFormula(),
+        "num_atoms": neutral.NumAtoms(),
+        "num_heavy_atoms": neutral.NumHvyAtoms(),
+        "charge": neutral.GetTotalCharge(),
+        "inchikey": _inchikey_from_smiles(smiles) or "",
+        "simulated_smiles": simulated,
+        "simulated_formula": mol.GetFormula(),
+        "simulated_charge": mol.GetTotalCharge(),
     }
 
 
@@ -975,6 +1031,9 @@ _MULTIPLE_BOND_MARGIN = 0.05
 # be under a single bond by this much.
 _TRIPLE_BOND_MARGIN = 0.25
 _CUMULATED_BOND_MARGIN = 0.20
+# No ligand has a triple bond in a ring this small: cyclooctyne, the smallest
+# cycloalkyne that can be kept in a bottle, has eight.
+_MAX_RING_WITH_NO_TRIPLE_BOND = 7
 
 # The search for bond orders is exponential in the atoms whose valence it can
 # choose. Real ligands settle in under 100 iterations; a polyphosphate -- every
@@ -997,13 +1056,18 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     hydrogen in place the valences leave one assignment of bond orders; RDKit's
     DetermineBondOrders finds it without reading an angle.
 
-    The total charge is tried as the file's formal charges state it, then one
-    either side, and the first assignment that holds is kept. It is refused --
-    and OpenBabel's reading stands -- when it leaves a radical, charges a
-    carbon, charges an oxygen positively, charges any atom by more than one,
-    or calls a bond double or triple that the frame holds at single-bond
-    length outside an aromatic ring, or a bond triple or cumulated that the
-    frame holds at double- or aromatic-bond length. Those are what a residue
+    No file says what a ligand's total charge is (see _charges_to_try), so
+    every charge from 0 to +-_MAX_SEARCHED_CHARGE is tried, and of the
+    assignments that hold the one with the fewest charged atoms is kept, then
+    the one of lowest total charge. An assignment is refused when it leaves a
+    radical, charges a carbon, charges an oxygen positively, charges any atom
+    by more than one, puts two double bonds on a charged ring nitrogen, reads
+    a nitro group as N([O-])[O-], calls
+    a bond double or triple that the frame holds at single-bond length, calls
+    a bond triple or cumulated that the frame holds at double- or
+    aromatic-bond length, or puts a triple bond in a ring of seven atoms or
+    fewer. When every charge is refused OpenBabel's reading stands. Those are
+    what a residue
     with an open valence is otherwise forced into: a united-atom residue,
     whose carbons carry their hydrogens implicitly (all of them, or beside
     explicit polar hydrogens), or a residue cut from a polymer, whose
@@ -1015,8 +1079,9 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     The search depends on atom order. With a sulfur listed ahead of the atoms
     that should carry the double bonds, it returns charge-separated forms --
     a thiazole as C=[S+]...[O-] -- which the checks refuse; when every charge
-    has been refused, the search runs once more with the sulfurs listed last
-    (see _sulfur_last).
+    has been refused, or the assignment kept still has charged atoms, the
+    search runs once more with the sulfurs listed last (see _sulfur_last) and
+    the better of the two is kept.
     """
     from rdkit.Geometry import Point3D
 
@@ -1042,26 +1107,79 @@ def _bond_orders_from_hydrogens(mol) -> Optional["ob.OBMol"]:
     orders = [None]
     if (sulfur_last := _sulfur_last(rw)) is not None:
         orders.append(sulfur_last)
+    # The better of the two orders by the same rule as within one: fewest
+    # charged atoms, then lowest total charge. An order that settles with no
+    # charged atom cannot be bettered and the other is not searched.
+    best, best_rank = None, None
     for order in orders:
         m = _settled_bond_orders(rw, stated, order)
         if m is None:
             continue
-        Chem.Kekulize(m, clearAromaticFlags=True)
-        conv = ob.OBConversion()
-        conv.SetInFormat("mol")
-        out = ob.OBMol()
-        if conv.ReadString(out, Chem.MolToMolBlock(m)):
-            return out
+        rank = _charge_rank(m)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = m, rank
+        if best_rank[0] == 0:
+            break
+    if best is None:
+        return None
+    Chem.Kekulize(best, clearAromaticFlags=True)
+    conv = ob.OBConversion()
+    conv.SetInFormat("mol")
+    out = ob.OBMol()
+    if conv.ReadString(out, Chem.MolToMolBlock(best)):
+        return out
     return None
 
 
+def _charge_rank(m) -> tuple:
+    """(charged atoms, magnitude of the total charge): the lower the better."""
+    charges = [a.GetFormalCharge() for a in m.GetAtoms()]
+    return (sum(1 for q in charges if q), abs(sum(charges)))
+
+
+# The largest total charge, either sign, the bond-order search tries. ATP is
+# -4, spermine +4, IP3 -6; past this a ligand is a polyphosphate the search
+# does not settle anyway (phytate, -12).
+_MAX_SEARCHED_CHARGE = 6
+
+
+def _charges_to_try(stated: int) -> list:
+    """Total charges for the bond-order search, smallest magnitude first and
+    the negative of a pair before the positive.
+
+    `stated` is the sum of the file's formal charges, and it is 0 for every
+    ligand: cpptraj and gmx write no charges into a PDB, and psf_elements
+    writes them for monatomic ions only. Tried at 0 and +-1 alone, anything
+    of charge 2 or more never had its real charge tried, and the valences
+    were then met some other way: AMP(2-) came back with its adenine as
+    [N+]1=CN=C2C1=[N+]=CN=C2N, ATP(4-) with a dihydro-adenine, spermine(4+)
+    with four neutral four-valent nitrogens (review F2). A stated charge
+    outside the range is tried as well.
+    """
+    charges = set(range(-_MAX_SEARCHED_CHARGE, _MAX_SEARCHED_CHARGE + 1))
+    charges.add(stated)
+    return sorted(charges, key=lambda q: (abs(q), q > 0))
+
+
 def _settled_bond_orders(rw, stated: int, order):
-    """The first bond-order assignment for `rw` that holds, trying the stated
-    charge and then one either side, with its atoms in `order` while RDKit
-    searches (None for their own order) and in their own order after."""
+    """The bond-order assignment for `rw` that holds with the fewest charged
+    atoms and, among those, the lowest total charge (4 before 6), over the
+    charges of _charges_to_try; None when none holds. Its atoms are in
+    `order` while RDKit searches (None for their own order) and in their own
+    order after.
+
+    With every hydrogen explicit the true charge is the one that needs no
+    charge separation: at -2 ATP's valences are met with six charged atoms,
+    at -4 with four. An assignment at total charge q has at least |q|
+    charged atoms, so once one is held with n, no charge of magnitude n or
+    more can better it and the search stops: at 0 for a neutral molecule.
+    """
     from rdkit.Chem import rdDetermineBonds
 
-    for charge in (stated, stated - 1, stated + 1):
+    best, best_rank = None, None
+    for charge in _charges_to_try(stated):
+        if best_rank is not None and abs(charge) >= best_rank[0]:
+            break
         m = Chem.Mol(rw)
         if order is not None:
             m = Chem.RenumberAtoms(m, order)
@@ -1076,13 +1194,15 @@ def _settled_bond_orders(rw, stated: int, order):
             continue
         if not _multiple_bonds_are_short(m):
             continue
-        if order is not None:
-            back = [0] * len(order)
-            for new, old in enumerate(order):
-                back[old] = new
-            m = Chem.RenumberAtoms(m, back)
-        return m
-    return None
+        rank = _charge_rank(m)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = m, rank
+    if best is not None and order is not None:
+        back = [0] * len(order)
+        for new, old in enumerate(order):
+            back[old] = new
+        best = Chem.RenumberAtoms(best, back)
+    return best
 
 
 def _sulfur_last(m) -> Optional[list]:
@@ -1108,8 +1228,17 @@ def _sulfur_last(m) -> Optional[list]:
 
 def _implausible(atom) -> bool:
     """A radical or a charge no simulated ligand carries: on carbon, positive
-    on oxygen, positive on a double-bonded sulfur, or more than one on any
-    atom.
+    on oxygen, positive on a double-bonded sulfur, positive on a ring
+    nitrogen with two double bonds, or more than one on any atom.
+
+    A ring =[N+]= is what the search makes of a tetrazolate tried at the
+    wrong sign: losartan's came back C1=[N+]=NN=N1, a cation, for an anion
+    (review F2). Outside a ring it is an azide or a diazo group and stands.
+
+    A neutral nitrogen with two O- is a nitro group read two electrons over,
+    N([O-])[O-] for [N+](=O)[O-]: where the search cannot place the nitro's
+    own charges at 0 (it depends on atom order) it settles this at -2, and
+    it would be recorded as a dihydroxylamine (MDR00000544, MDR00020883).
 
     A double-bonded S+ is a charge-separated form, not a molecule: with a
     thioacid's sulfur listed before its oxygen the valence search returns
@@ -1126,16 +1255,51 @@ def _implausible(atom) -> bool:
             and atom.GetAtomicNum() == 16
             and any(b.GetBondType() != Chem.BondType.SINGLE for b in atom.GetBonds())
         )
+        or (
+            q == 0
+            and atom.GetAtomicNum() == 7
+            and sum(
+                n.GetAtomicNum() == 8 and n.GetFormalCharge() < 0
+                for n in atom.GetNeighbors()
+            )
+            > 1
+        )
+        or (
+            q > 0
+            and atom.GetAtomicNum() == 7
+            and atom.IsInRing()
+            and sum(b.GetBondType() == Chem.BondType.DOUBLE for b in atom.GetBonds())
+            > 1
+        )
     )
 
 
 def _multiple_bonds_are_short(m) -> bool:
-    """Whether every double or triple bond of `m` outside an aromatic ring is
-    shorter in its conformer than a single bond between the same elements: by
-    _TRIPLE_BOND_MARGIN for a triple bond, _CUMULATED_BOND_MARGIN for a double
-    bond on a carbon with two, and _MULTIPLE_BOND_MARGIN for the rest."""
+    """Whether every double or triple bond of `m` is shorter in its conformer
+    than a single bond between the same elements: by _TRIPLE_BOND_MARGIN for
+    a triple bond, _CUMULATED_BOND_MARGIN for a double bond on a carbon with
+    two, and _MULTIPLE_BOND_MARGIN for the rest. A triple bond in a ring of
+    _MAX_RING_WITH_NO_TRIPLE_BOND atoms or fewer is refused at any length.
+
+    The bonds are read from a Kekule copy. RDKit's aromaticity model takes a
+    ring of alternating triple bonds for aromatic, and aromatic bonds used
+    to be passed over here: 2-pyridone with its ring CH united and its NH
+    explicit came back [H]n1c#cc#cc1=O, uracil O=C1NC#CC(=O)N1, pyrrole
+    N1C#CC#C1, each triple bond 1.34-1.40 A long and never measured (review
+    F3).
+
+    One thing is still passed over: the plain double bonds of a ring RDKit
+    calls aromatic, which a Kekule structure places on every other bond by
+    choice, not by length. A frame stretches them past the margin:
+    vorapaxar's NAMD frame holds one aromatic C-C at 1.50 A, and measuring
+    it lost the whole reading. Their triple and cumulated bonds are measured.
+    """
+    aromatic = {b.GetIdx() for b in m.GetBonds() if b.GetIsAromatic()}
+    m = Chem.Mol(m)
+    Chem.Kekulize(m, clearAromaticFlags=True)
     table = Chem.GetPeriodicTable()
     pos = m.GetConformer().GetPositions()
+    rings = m.GetRingInfo()
 
     def cumulated(atom) -> bool:
         return atom.GetAtomicNum() == 6 and (
@@ -1147,8 +1311,13 @@ def _multiple_bonds_are_short(m) -> bool:
         )
 
     for bond in m.GetBonds():
-        if bond.GetIsAromatic() or bond.GetBondType() == Chem.BondType.SINGLE:
+        if bond.GetBondType() == Chem.BondType.SINGLE:
             continue
+        if bond.GetBondType() == Chem.BondType.TRIPLE and any(
+            rings.IsBondInRingOfSize(bond.GetIdx(), size)
+            for size in range(3, _MAX_RING_WITH_NO_TRIPLE_BOND + 1)
+        ):
+            return False
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         single = sum(
             table.GetRcovalent(m.GetAtomWithIdx(k).GetAtomicNum())
@@ -1158,6 +1327,8 @@ def _multiple_bonds_are_short(m) -> bool:
             margin = _TRIPLE_BOND_MARGIN
         elif cumulated(bond.GetBeginAtom()) or cumulated(bond.GetEndAtom()):
             margin = _CUMULATED_BOND_MARGIN
+        elif bond.GetIdx() in aromatic:
+            continue
         else:
             margin = _MULTIPLE_BOND_MARGIN
         if np.linalg.norm(pos[i] - pos[j]) > single - margin:
@@ -1205,31 +1376,11 @@ def universe_to_smiles(
     plus summary. Dispatches to a coordinate-aware path when possible (which
     gives the best aromaticity perception) or a topology-only fallback.
     """
-    resnames = universe.atoms.resnames
-    mask = resnames == resname
-    if not mask.any():
-        mask = np.char.upper(resnames.astype(str)) == resname.upper()
-    all_match = universe.atoms[mask]
-    if len(all_match) == 0:
-        raise ValueError(
-            f"No atoms with residue name '{resname}' in the file."
-        )
-
-    # If multiple copies of the same residue name are present (e.g., many lipid
-    # molecules in a full simulation box), use only the first residue instance so
-    # that SMILES represents a single molecule rather than all copies concatenated.
-    # A copy joined into a polymer is passed over while a free one exists.
-    unique_resix = np.unique(all_match.resindices)
-    linked = _polymer_residues(universe, {str(resname)})
-    free = [r for r in unique_resix if int(r) not in linked]
-    if free:
-        unique_resix = np.array(free)
-    sel = all_match[all_match.resindices == unique_resix[0]]
-
+    sel, in_chain = _first_copy(universe, resname)
     has_coords = _has_coords(sel)
 
     # A chain residue is read for the molecule attached to it, where one is.
-    if has_coords and int(unique_resix[0]) in linked:
+    if has_coords and in_chain:
         attached = _attached_group(sel)
         if attached is not None and attached.mol is not None:
             result = _mol_summary(attached.mol)
@@ -1248,6 +1399,271 @@ def universe_to_smiles(
     )
 
 
+def _first_copy(universe, resname: str):
+    """(the atoms of the first residue named `resname`, whether it is joined
+    into a polymer chain).
+
+    If multiple copies of the same residue name are present (e.g., many lipid
+    molecules in a full simulation box), only the first is read, so that the
+    SMILES represents a single molecule rather than all copies concatenated:
+    the record says which ligands a simulation holds, not how many of each
+    (Travis, 2026-11-12). A copy joined into a polymer is passed over while
+    a free one exists.
+    """
+    resnames = universe.atoms.resnames
+    mask = resnames == resname
+    if not mask.any():
+        mask = np.char.upper(resnames.astype(str)) == resname.upper()
+    all_match = universe.atoms[mask]
+    if len(all_match) == 0:
+        raise ValueError(
+            f"No atoms with residue name '{resname}' in the file."
+        )
+    unique_resix = np.unique(all_match.resindices)
+    linked = _polymer_residues(universe, {str(resname)})
+    free = [r for r in unique_resix if int(r) not in linked]
+    if free:
+        unique_resix = np.array(free)
+    first = int(unique_resix[0])
+    return all_match[all_match.resindices == first], first in linked
+
+
+# The elements whose bonds make one molecule of several residues. A metal is
+# left out on purpose: an imidazole on a heme's iron, 2.0 A away, is a ligand
+# beside the heme, not a part of it.
+_COVALENT_ELEMENTS = frozenset({5, 6, 7, 8, 9, 14, 15, 16, 17, 34, 35, 53})
+# Two atoms of different residues are bonded when closer than the sum of
+# their covalent radii plus this (A). A glycosidic C-O is 1.43 against
+# 1.72, a disulfide 2.05 against 2.40; a hydrogen bond's O...O, 2.5 at its
+# shortest, is far outside 1.62.
+_BOND_TOLERANCE = 0.3
+# Residues that end a peptide and are not residues of it.
+_PEPTIDE_CAPS = frozenset({"ACE", "FOR", "NME", "NMA", "NH2", "NHE", "CT3"})
+_ONE_LETTER = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V",
+    "HIE": "H", "HID": "H", "HIP": "H", "HSD": "H", "HSE": "H", "HSP": "H",
+    "ASH": "D", "GLH": "E", "LYN": "K", "CYM": "C", "CYX": "C",
+}  # fmt: skip
+
+
+class _Spanning(NamedTuple):
+    """A molecule made of several residues. `residues` are in chain order
+    when `peptide`, in file order otherwise."""
+
+    residues: list
+    peptide: bool
+    cyclic: bool
+
+
+def _bonded_residues(universe, start: int, eligible: np.ndarray) -> list:
+    """Resindices of the residues covalently bonded, directly or through each
+    other, to residue `start`, itself included, in file order. Only residues
+    marked in `eligible` (by resindex) are walked into.
+
+    Bonds are the topology's where it states them and, with coordinates,
+    those found by distance under the minimum image (_BOND_TOLERANCE), both,
+    as for backbone links.
+    """
+    atoms = universe.atoms
+    resix = atoms.resindices
+    found = {int(start)}
+
+    stated: dict = {}
+    try:
+        bonded = atoms.bonds.indices if len(atoms.bonds) else None
+    except (mda.exceptions.NoDataError, AttributeError):
+        bonded = None
+    if bonded is not None:
+        a, b = resix[bonded[:, 0]], resix[bonded[:, 1]]
+        cross = (a != b) & eligible[a] & eligible[b]
+        for x, y in zip(a[cross].tolist(), b[cross].tolist()):
+            stated.setdefault(x, set()).add(y)
+            stated.setdefault(y, set()).add(x)
+
+    pool = None
+    if _has_coords(atoms):
+        from MDAnalysis.lib.distances import capped_distance
+
+        table = Chem.GetPeriodicTable()
+        candidates = atoms[eligible[resix]]
+        numbers = np.array([_atomic_num_for(a) for a in candidates])
+        keep = np.isin(numbers, list(_COVALENT_ELEMENTS))
+        pool = candidates[keep]
+        radii = np.array([table.GetRcovalent(int(n)) for n in numbers[keep]])
+        pool_resix = pool.resindices
+        box = universe.dimensions
+        if box is None or not np.all(box[:3] > 0):
+            box = None
+
+    queue = [int(start)]
+    while queue:
+        r = queue.pop()
+        near = set(stated.get(r, ()))
+        if pool is not None and len(pool):
+            mine = np.flatnonzero(pool_resix == r)
+            if len(mine):
+                pairs = capped_distance(
+                    pool.positions[mine],
+                    pool.positions,
+                    2 * radii.max() + _BOND_TOLERANCE,
+                    box=box,
+                    method="bruteforce",
+                    return_distances=True,
+                )
+                for (i, j), d in zip(*pairs):
+                    if (
+                        pool_resix[j] != r
+                        and d < radii[mine[i]] + radii[j] + _BOND_TOLERANCE
+                    ):
+                        near.add(int(pool_resix[j]))
+        for other in near - found:
+            found.add(other)
+            queue.append(other)
+    return sorted(found)
+
+
+def _peptide_order(universe, residues: list):
+    """(`residues` in order from N- to C-terminus, whether the chain closes on
+    itself), or None when they are not one peptide.
+
+    They are one when the peptide bonds among them, each residue's C to the
+    next one's N, run through every residue once: a single path, or a single
+    ring (cyclosporin). Other bonds between them, a disulfide or a side-chain
+    bridge, do not matter.
+    """
+    from MDAnalysis.lib.distances import capped_distance
+
+    members = set(residues)
+    atoms = universe.atoms[np.isin(universe.atoms.resindices, residues)]
+    names = atoms.names.astype(str)
+    c, n = atoms[names == "C"], atoms[names == "N"]
+    following: dict = {}
+
+    def link(a, b) -> bool:
+        if a == b or a not in members or b not in members:
+            return True
+        if following.get(a, b) != b:
+            return False
+        following[a] = b
+        return True
+
+    try:
+        for bond in atoms.bonds:
+            x, y = bond.atoms
+            for own, other in ((x, y), (y, x)):
+                if own.name == "C" and other.name == "N":
+                    if not link(int(own.resindex), int(other.resindex)):
+                        return None
+    except (mda.exceptions.NoDataError, AttributeError):
+        pass
+    if _has_coords(atoms) and len(c) and len(n):
+        box = universe.dimensions
+        if box is None or not np.all(box[:3] > 0):
+            box = None
+        pairs = capped_distance(
+            c.positions,
+            n.positions,
+            _LINK_CUTOFF,
+            box=box,
+            method="bruteforce",
+            return_distances=False,
+        )
+        for i, j in pairs:
+            if not link(int(c[i].resindex), int(n[j].resindex)):
+                return None
+
+    preceded = set(following.values())
+    if len(preceded) != len(following):
+        return None
+    starts = [r for r in residues if r not in preceded]
+    cyclic = not starts and len(following) == len(residues)
+    if cyclic:
+        starts = [min(residues)]
+    if len(starts) != 1:
+        return None
+    order = [starts[0]]
+    while order[-1] in following and following[order[-1]] != order[0]:
+        order.append(following[order[-1]])
+    if len(order) != len(residues):
+        return None
+    return order, cyclic
+
+
+def _spanning_molecule(universe, resname: str) -> Optional[_Spanning]:
+    """The molecule of several residues that the first `resname` residue is
+    part of, or None when that residue is a molecule by itself.
+
+    A ligand used to be one residue, whatever it was bonded to. A
+    tetrapeptide written DAL-SAR-DAL-MLE came back as three ligands, the
+    D-alanine an aminoaldehyde C[C@@H](C=O)N with its open valences filled
+    and its second copy dropped; POPC written the Lipid21 way as a palmitic
+    aldehyde, an oleic aldehyde and a glycerophosphocholine (review F5).
+
+    The other residues walked into are those that are not background by
+    name and not joined into a polymer chain, so a ligand on a cysteine's
+    sulfur is still one residue here.
+    """
+    sel, in_chain = _first_copy(universe, resname)
+    if in_chain:
+        return None
+    resnames = universe.residues.resnames.astype(str)
+    eligible = np.array([not _is_skipped_residue(n) for n in resnames])
+    if not eligible.any():
+        return None
+    names = {n for n in np.unique(resnames[eligible])}
+    for r in _polymer_residues(universe, names):
+        eligible[r] = False
+    start = int(sel.resindices[0])
+    eligible[start] = True
+    residues = _bonded_residues(universe, start, eligible)
+    if len(residues) < 2:
+        return None
+    ordered = _peptide_order(universe, residues)
+    if ordered is None:
+        return _Spanning(residues, False, False)
+    return _Spanning(ordered[0], True, ordered[1])
+
+
+def _peptide_summary(universe, spanning: _Spanning) -> dict:
+    """A peptide ligand as mol_id reports it: no SMILES, a sequence.
+
+    One letter per residue, X for any that is not a standard amino acid
+    (Travis, 2026-11-12: DAL, SAR and MLE have no one-letter code, and X is
+    the code for a residue that has none). `resnames` keeps what each X
+    stands for, the caps included; `sequence` leaves the caps out.
+    """
+    residues = [universe.residues[r] for r in spanning.residues]
+    resnames = [str(r.resname) for r in residues]
+    body = list(resnames)
+    if len(body) > 1 and body[0].upper() in _PEPTIDE_CAPS:
+        body = body[1:]
+    if len(body) > 1 and body[-1].upper() in _PEPTIDE_CAPS:
+        body = body[:-1]
+    return {
+        "sequence": "".join(_ONE_LETTER.get(n.upper(), "X") for n in body),
+        "sequence_type": "protein",
+        "resnames": resnames,
+        "resids": [int(r.resid) for r in residues],
+        "cyclic": spanning.cyclic,
+        "resname": resnames[0],
+    }
+
+
+def _residue_list(universe, residues: list) -> str:
+    """`DAL 1, SAR 2 and MLE 4` for a note; the first five and a count past
+    that."""
+    labels = [
+        f"{universe.residues[r].resname} {universe.residues[r].resid}"
+        for r in residues
+    ]
+    if len(labels) > 5:
+        return ", ".join(labels[:5]) + f" and {len(labels) - 5} more"
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
 def _has_coords(sel) -> bool:
     try:
         pos = sel.positions
@@ -1261,12 +1677,20 @@ def structure_to_smiles(
     fmt: Optional[str] = None,
     resname: Optional[str] = None,
     notes: Optional[list] = None,
+    peptides: Optional[list] = None,
 ) -> list:
     """
     Universal pipeline: load any MDAnalysis-supported file (PDB, GRO, GROMACS
     .top/.tpr, PSF, mmCIF, Amber prmtop, ...), identify the ligand residue(s),
     and return a list of canonical-SMILES summaries (one per distinct ligand
     residue), each tagged with its `resname`.
+
+    A ligand made of several residues bonded to each other is one molecule,
+    not one per residue name (see _spanning_molecule). If it is a peptide it
+    is a ligand by sequence, not by SMILES: its summary (_peptide_summary) is
+    added to `peptides` and is not in the list returned. Anything else of
+    several residues -- a glycan, a lipid written as head and tails -- is
+    refused for now and said in `notes` (Travis, 2026-11-12).
 
     If `fmt` is None, format is sniffed from file content (with extension as
     fallback for binary inputs). If `resname` is None, every non-background
@@ -1279,7 +1703,36 @@ def structure_to_smiles(
     universe = load_universe(path, fmt)
     target_resnames = resolve_target_resnames(universe, path, resname, notes)
     results = []
+    seen: set = set()
     for rn in target_resnames:
+        spanning = _spanning_molecule(universe, rn)
+        if spanning is not None:
+            key = frozenset(spanning.residues)
+            if key in seen:
+                continue
+            seen.add(key)
+            where = _residue_list(universe, spanning.residues)
+            if not spanning.peptide:
+                _note(
+                    notes,
+                    f"Residues {where} are bonded into one molecule that is "
+                    f"not a peptide (a glycan, or a lipid written as several "
+                    f"residues, for one). A ligand of several residues is "
+                    f"not recorded unless it is a peptide.",
+                )
+                continue
+            peptide = _peptide_summary(universe, spanning)
+            if peptides is not None:
+                peptides.append(peptide)
+            _note(
+                notes,
+                f"Residues {where} are one peptide of "
+                f"{len(peptide['sequence'])} residues, bonded to no other "
+                f"chain: a peptide ligand, read by its sequence "
+                f"({peptide['sequence']}; X is a residue with no one-letter "
+                f"code), not residue by residue.",
+            )
+            continue
         result = universe_to_smiles(universe, rn, notes)
         result["resname"] = rn
         results.append(result)
@@ -1731,14 +2184,23 @@ NOTE_MARKER = "[mdrepo] note="
 
 
 def _run(args, notes: list) -> None:
+    peptides: list = []
     if args.command == "smiles-from-structure":
         results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname, notes=notes
+            args.path,
+            fmt=args.fmt,
+            resname=args.resname,
+            notes=notes,
+            peptides=peptides,
         )
         if args.verbose:
+            # Small molecules only: mdr-process's ligand_resnames reads this
+            # list as one shape. A peptide ligand reaches it through `both`.
             print(json.dumps(results, indent=2))
         else:
-            print("\n".join(sorted([r["smiles"] for r in results])))
+            lines = sorted([r["smiles"] for r in results])
+            lines += [f"peptide {p['sequence']}" for p in peptides]
+            print("\n".join(lines))
 
     elif args.command == "name-from-smiles":
         result = smiles_to_name(args.smiles)
@@ -1749,12 +2211,18 @@ def _run(args, notes: list) -> None:
 
     elif args.command == "both":
         struct_results = structure_to_smiles(
-            args.path, fmt=args.fmt, resname=args.resname, notes=notes
+            args.path,
+            fmt=args.fmt,
+            resname=args.resname,
+            notes=notes,
+            peptides=peptides,
         )
+        # A small molecule is {structure, name}; a peptide ligand is
+        # {peptide} and has neither. mdr-process reads both shapes.
         combined = [
             {"structure": sr, "name": smiles_to_name(sr["smiles"])}
             for sr in struct_results
-        ]
+        ] + [{"peptide": p} for p in peptides]
         if args.outfile:
             with open(args.outfile, "wt") as fh:
                 json.dump(combined, fh, indent=2)
@@ -1762,6 +2230,10 @@ def _run(args, notes: list) -> None:
             print(json.dumps(combined, indent=2))
         else:
             for entry in combined:
+                if "peptide" in entry:
+                    p = entry["peptide"]
+                    print(f"{p['resname']}: peptide {p['sequence']}")
+                    continue
                 resname = entry["structure"]["resname"]
                 best = entry["name"]["best_name"]
                 print(f"{resname}: {best}")
