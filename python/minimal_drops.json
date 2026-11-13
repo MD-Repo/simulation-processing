@@ -1,0 +1,18 @@
+{
+  "_about": [
+    "Residue names minimal.* drops on purpose. One list for every reader:",
+    "cpptraj_gmx_traj_manipulation.py strips water + ions (+ lipids) by these names;",
+    "mdr-process's output check 'solute' (mdrepo-rs#108) fails a minimal that lacks",
+    "any other residue full has. Names are compared without case by mdr-process.",
+    "water/ions/lipids: KNOWN_WATER, KNOWN_IONS, KNOWN_LIPIDS in the conversion script.",
+    "gromacs_water: what GROMACS's residuetypes.dat calls Water; the GROMACS path",
+    "keeps its 'non-Water' group, so these go too, though the script never names them.",
+    "Bound metals (Zn2+, Ca2+, ...) are NOT here: they stay in minimal (review #8).",
+    "From 2025-10-14 to 2026-04-29 the GROMACS path also dropped MOL (a ligand):",
+    "simulation-processing#30. Do not add a ligand name here."
+  ],
+  "water": ["WAT", "HOH", "TIP3", "TIP3P", "TIP4", "TIP4P", "TIP5", "OPC", "SPC", "SOL"],
+  "ions": ["NA", "CL", "K", "SOD", "CLA", "NA+", "CL-", "K+", "Mg2+", "MG", "Na+", "Cl-"],
+  "lipids": ["DPPC", "POPC", "POPE", "DOPC", "DLPC", "DMPC", "DSPC", "CHOL"],
+  "gromacs_water": ["SOL", "WAT", "HOH", "OHH", "TIP", "T3P", "T4P", "T5P", "T3H"]
+}

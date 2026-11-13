@@ -14,6 +14,7 @@ if sys.version_info < (3, 13):
 
 import os  # noqa: E402
 import argparse
+import json
 import shutil
 import struct
 import warnings
@@ -1991,33 +1992,30 @@ def write_gromacs_bash(
 
 
 # --------------------------------------------------
-# Residues
-KNOWN_WATER = [
-    "WAT",
-    "HOH",
-    "TIP3",
-    "TIP3P",
-    "TIP4",
-    "TIP4P",
-    "TIP5",
-    "OPC",
-    "SPC",
-    "SOL",
-]
-KNOWN_IONS = [
-    "NA",
-    "CL",
-    "K",
-    "SOD",
-    "CLA",
-    "NA+",
-    "CL-",
-    "K+",
-    "Mg2+",
-    "MG",  # Amber-style ion names
-    "Na+",
-    "Cl-",  # Case variants
-]
+# Residues minimal.* drops: one list, minimal_drops.json beside this script,
+# also read by mdr-process's output check "solute" (mdrepo-rs#108), so the
+# stripping and the check that nothing else was stripped cannot drift apart.
+MINIMAL_DROPS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "minimal_drops.json"
+)
+
+
+def load_minimal_drops(path=MINIMAL_DROPS_FILE):
+    """{"water", "ions", "lipids", "gromacs_water"}: lists of residue names"""
+    with open(path) as fh:
+        drops = json.load(fh)
+    for key in ("water", "ions", "lipids", "gromacs_water"):
+        names = drops.get(key)
+        if not isinstance(names, list) or not all(
+            isinstance(n, str) and n.strip() for n in names
+        ):
+            raise ValueError(f"{path}: {key!r} must be a list of residue names")
+    return drops
+
+
+_DROPS = load_minimal_drops()
+KNOWN_WATER = list(_DROPS["water"])
+KNOWN_IONS = list(_DROPS["ions"])
 # The ions the RMS fit and principal axes must not be measured on: the
 # stripped ones above plus the other monatomic ions by the residue names
 # Amber (`Ca2+`, and the older `CA`, `ZN`, `IOD`), CHARMM (POT, CAL, ZN2,
@@ -2074,16 +2072,7 @@ FIT_EXCLUDED_IONS = KNOWN_IONS + [
     "Fe2+",
     "Fe3+",
 ]
-KNOWN_LIPIDS = [
-    "DPPC",
-    "POPC",
-    "POPE",
-    "DOPC",
-    "DLPC",
-    "DMPC",
-    "DSPC",
-    "CHOL",
-]
+KNOWN_LIPIDS = list(_DROPS["lipids"])
 
 
 # --------------------------------------------------
