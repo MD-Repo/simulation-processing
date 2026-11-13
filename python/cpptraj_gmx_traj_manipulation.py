@@ -1674,6 +1674,97 @@ def label_gromacs_pdbs(outdir, lipid_present):
 
 
 # --------------------------------------------------
+def write_minimal_commands(f, outdir, lipid_present):
+    """The bash that writes minimal.pdb, minimal.xtc and minimal.gro from
+    $STRUCT_REF (full.pdb) and $OUTDIR/full.xtc: every atom but water, the
+    stripped ions (and lipids), rotated to principal axes, the trajectory
+    fitted on it. write_gromacs_bash and rebuild_minimal.py (MISATO's minimal
+    files, which lost their MOL ligand 2025-10-14..2026-04-29: #30) both use
+    it, so a rebuild matches what processing writes. Expects GMX, OUTDIR and
+    STRUCT_REF set."""
+
+    # Create index groups for minimal (protein-only)
+    # First, check if "non-Water" group exists and get its number
+    f.write("echo '[*] Detecting available groups'\n")
+    f.write(
+        "BASE_GROUP_NUM=$(echo q | $GMX make_ndx -f $STRUCT_REF -o /dev/null 2>&1 "
+        "| grep -E '^[[:space:]]*[0-9]+' | grep 'non-Water' "
+        "| head -1 | awk '{print $1}')\n"
+    )
+    f.write('if [[ -z "$BASE_GROUP_NUM" ]]; then\n')
+    f.write("  BASE_GROUP_NUM=0  # Use System if non-Water not found\n")
+    f.write("fi\n\n")
+
+    if lipid_present:
+        f.write("echo '[*] Creating index groups for minimal (protein-only)'\n")
+        f.write("$GMX make_ndx -f $STRUCT_REF -o $OUTDIR/index_minimal.ndx <<EOF\n")
+        f.write(
+            f'$BASE_GROUP_NUM & !r {" ".join(KNOWN_IONS + KNOWN_LIPIDS)}\nq\nEOF\n\n'
+        )
+    else:
+        f.write("echo '[*] Creating index groups (protein-only, no lipids)'\n")
+        f.write("$GMX make_ndx -f $STRUCT_REF -o $OUTDIR/index_minimal.ndx <<EOF\n")
+        f.write(f'$BASE_GROUP_NUM & !r {" ".join(KNOWN_IONS)}\nq\nEOF\n\n')
+
+    # Extract protein-only trajectory (temp)
+    # Get the last group number from the index file (the one we just created)
+    f.write("echo '[*] Extracting protein-only trajectory (minimal_temp.xtc)'\n")
+    f.write("MINIMAL_GROUP_NUM=$(grep -c '\\[ .* \\]' $OUTDIR/index_minimal.ndx)\n")
+    f.write(
+        "MINIMAL_GROUP_NUM=$((MINIMAL_GROUP_NUM - 1))  # Groups are 0-indexed\n"
+    )
+    f.write(
+        "$GMX trjconv -s $STRUCT_REF -f $OUTDIR/full.xtc -n $OUTDIR/index_minimal.ndx "
+        "-o $OUTDIR/minimal_temp.xtc <<EOF\n"
+    )
+    f.write("$MINIMAL_GROUP_NUM\nEOF\n\n")
+
+    # Extract protein-only structure (temp)
+    f.write("echo '[*] Writing temp minimal.pdb from full.pdb'\n")
+    f.write(
+        "$GMX trjconv -s $STRUCT_REF -f $OUTDIR/full.pdb -n $OUTDIR/index_minimal.ndx "
+        "-o $OUTDIR/minimal_temp.pdb -dump 0 <<EOF\n"
+    )
+    f.write("$MINIMAL_GROUP_NUM\nEOF\n\n")
+
+    # Rotate minimal structure to principal components and then rotate 90 degrees
+    f.write("echo '[*] Rotating minimal structure to principal components'\n")
+    f.write(
+        "echo 1 | $GMX editconf -f $OUTDIR/minimal_temp.pdb "
+        "-o $OUTDIR/min_princ.pdb -princ >/dev/null 2>&1\n"
+    )
+    f.write(
+        "$GMX editconf -f $OUTDIR/min_princ.pdb "
+        "-o $OUTDIR/minimal.pdb -rotate 0 0 90 >/dev/null 2>&1\n\n"
+    )
+
+    # Superimpose minimal trajectory using rotated structure
+    f.write("echo '[*] Writing superimposed minimal.xtc'\n")
+    f.write(
+        "$GMX trjconv -s $OUTDIR/minimal.pdb -f $OUTDIR/minimal_temp.xtc "
+        "-o $OUTDIR/minimal.xtc -fit rot+trans <<EOF\n0\n0\nEOF\n\n"
+    )
+
+    if os.path.isfile(os.path.join(outdir, "full.tpr")):
+        f.write("echo '[*] Writing minimal.tpr'\n")
+        f.write(
+            "$GMX convert-tpr -s $OUTDIR/full.tpr -o $OUTDIR/minimal.tpr "
+            "-n $OUTDIR/index_minimal.ndx <<EOF\n$MINIMAL_GROUP_NUM\nEOF\n\n"
+        )
+        f.write(
+            "$GMX trjconv -s $OUTDIR/minimal.tpr -f $OUTDIR/minimal.xtc "
+            "-o $OUTDIR/minimal.gro -dump 0 <<EOF\n0\nEOF\n\n"
+        )
+    else:
+        # Dump frame 0 from the *fitted* minimal trajectory using the fitted ref
+        f.write("echo '[*] Writing minimal.gro'\n")
+        f.write(
+            "$GMX trjconv -s $OUTDIR/minimal.pdb -f $OUTDIR/minimal.xtc "
+            "-o $OUTDIR/minimal.gro -dump 0 <<EOF\n0\nEOF\n\n"
+        )
+
+
+# --------------------------------------------------
 def write_gromacs_bash(
     topfile, trajfile, tpr_file, coord_file, outdir, lipid_present, gmx_path
 ):
@@ -1851,85 +1942,7 @@ def write_gromacs_bash(
             # cpptraj outputs full.pdb atom-for-atom with full.xtc, so use it as reference.
             f.write("STRUCT_REF=$OUTDIR/full.pdb\n\n")
 
-        # Create index groups for minimal (protein-only)
-        # First, check if "non-Water" group exists and get its number
-        f.write("echo '[*] Detecting available groups'\n")
-        f.write(
-            "BASE_GROUP_NUM=$(echo q | $GMX make_ndx -f $STRUCT_REF -o /dev/null 2>&1 "
-            "| grep -E '^[[:space:]]*[0-9]+' | grep 'non-Water' "
-            "| head -1 | awk '{print $1}')\n"
-        )
-        f.write('if [[ -z "$BASE_GROUP_NUM" ]]; then\n')
-        f.write("  BASE_GROUP_NUM=0  # Use System if non-Water not found\n")
-        f.write("fi\n\n")
-
-        if lipid_present:
-            f.write("echo '[*] Creating index groups for minimal (protein-only)'\n")
-            f.write("$GMX make_ndx -f $STRUCT_REF -o $OUTDIR/index_minimal.ndx <<EOF\n")
-            f.write(
-                f'$BASE_GROUP_NUM & !r {" ".join(KNOWN_IONS + KNOWN_LIPIDS)}\nq\nEOF\n\n'
-            )
-        else:
-            f.write("echo '[*] Creating index groups (protein-only, no lipids)'\n")
-            f.write("$GMX make_ndx -f $STRUCT_REF -o $OUTDIR/index_minimal.ndx <<EOF\n")
-            f.write(f'$BASE_GROUP_NUM & !r {" ".join(KNOWN_IONS)}\nq\nEOF\n\n')
-
-        # Extract protein-only trajectory (temp)
-        # Get the last group number from the index file (the one we just created)
-        f.write("echo '[*] Extracting protein-only trajectory (minimal_temp.xtc)'\n")
-        f.write("MINIMAL_GROUP_NUM=$(grep -c '\\[ .* \\]' $OUTDIR/index_minimal.ndx)\n")
-        f.write(
-            "MINIMAL_GROUP_NUM=$((MINIMAL_GROUP_NUM - 1))  # Groups are 0-indexed\n"
-        )
-        f.write(
-            "$GMX trjconv -s $STRUCT_REF -f $OUTDIR/full.xtc -n $OUTDIR/index_minimal.ndx "
-            "-o $OUTDIR/minimal_temp.xtc <<EOF\n"
-        )
-        f.write("$MINIMAL_GROUP_NUM\nEOF\n\n")
-
-        # Extract protein-only structure (temp)
-        f.write("echo '[*] Writing temp minimal.pdb from full.pdb'\n")
-        f.write(
-            "$GMX trjconv -s $STRUCT_REF -f $OUTDIR/full.pdb -n $OUTDIR/index_minimal.ndx "
-            "-o $OUTDIR/minimal_temp.pdb -dump 0 <<EOF\n"
-        )
-        f.write("$MINIMAL_GROUP_NUM\nEOF\n\n")
-
-        # Rotate minimal structure to principal components and then rotate 90 degrees
-        f.write("echo '[*] Rotating minimal structure to principal components'\n")
-        f.write(
-            "echo 1 | $GMX editconf -f $OUTDIR/minimal_temp.pdb "
-            "-o $OUTDIR/min_princ.pdb -princ >/dev/null 2>&1\n"
-        )
-        f.write(
-            "$GMX editconf -f $OUTDIR/min_princ.pdb "
-            "-o $OUTDIR/minimal.pdb -rotate 0 0 90 >/dev/null 2>&1\n\n"
-        )
-
-        # Superimpose minimal trajectory using rotated structure
-        f.write("echo '[*] Writing superimposed minimal.xtc'\n")
-        f.write(
-            "$GMX trjconv -s $OUTDIR/minimal.pdb -f $OUTDIR/minimal_temp.xtc "
-            "-o $OUTDIR/minimal.xtc -fit rot+trans <<EOF\n0\n0\nEOF\n\n"
-        )
-
-        if os.path.isfile(os.path.join(outdir, "full.tpr")):
-            f.write("echo '[*] Writing minimal.tpr'\n")
-            f.write(
-                "$GMX convert-tpr -s $OUTDIR/full.tpr -o $OUTDIR/minimal.tpr "
-                "-n $OUTDIR/index_minimal.ndx <<EOF\n$MINIMAL_GROUP_NUM\nEOF\n\n"
-            )
-            f.write(
-                "$GMX trjconv -s $OUTDIR/minimal.tpr -f $OUTDIR/minimal.xtc "
-                "-o $OUTDIR/minimal.gro -dump 0 <<EOF\n0\nEOF\n\n"
-            )
-        else:
-            # Dump frame 0 from the *fitted* minimal trajectory using the fitted ref
-            f.write("echo '[*] Writing minimal.gro'\n")
-            f.write(
-                "$GMX trjconv -s $OUTDIR/minimal.pdb -f $OUTDIR/minimal.xtc "
-                "-o $OUTDIR/minimal.gro -dump 0 <<EOF\n0\nEOF\n\n"
-            )
+        write_minimal_commands(f, outdir, lipid_present)
 
         # Clean up temporary files
         # f.write(
