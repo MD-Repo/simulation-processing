@@ -166,14 +166,29 @@ def test_a_valence_error_our_stack_cannot_see_still_passes():
     assert Chem.MolFromSmiles(bad) is None
 
 
-ELEMENT_COLUMN_PDB = """\
-ATOM      1  CL6 LIG A   1      11.104   6.134   7.298  1.00  0.00           C
-ATOM      2  BR1 LIG A   1      12.104   6.134   7.298  1.00  0.00           B
-ATOM      3  SE2 LIG A   1      13.104   6.134   7.298  1.00  0.00           S
-ATOM      4  CA  ALA A   2      14.104   6.134   7.298  1.00  0.00           C
-HETATM    5  O   HOH A   3      15.104   6.134   7.298  1.00  0.00           O
-END
-"""
+def atom(serial, name, resname, resseq, x, y, z, element, record="ATOM  "):
+    """One fixed-column PDB atom line (element in columns 77-78)."""
+
+    return (
+        f"{record}{serial:5d} {name:<4} {resname:>3} A{resseq:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2}"
+    )
+
+
+# Real bond lengths: C-Cl 1.75 A, C-Br 1.94 A, Se-C 1.95 A, C-H 1.09 A.
+# Each name-implied element sits in its own residue with its one carbon.
+ELEMENT_COLUMN_PDB = "\n".join([
+    atom(1, "CL6", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+    atom(2, "BR1", "LIG", 2, 10.0, 0.0, 0.0, "B"),
+    atom(3, "SE2", "LIG", 3, 20.0, 0.0, 0.0, "S"),
+    atom(4, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+    atom(5, "C2", "LIG", 2, 11.94, 0.0, 0.0, "C"),
+    atom(6, "C3", "LIG", 3, 21.95, 0.0, 0.0, "C"),
+    atom(7, "C4", "LIG", 3, 18.05, 0.0, 0.0, "C"),
+    atom(8, "CA", "ALA", 4, 30.0, 0.0, 0.0, "C"),
+    atom(9, "O", "HOH", 5, 40.0, 0.0, 0.0, "O", "HETATM"),
+    "END",
+]) + "\n"
 
 
 @pytest.fixture
@@ -230,3 +245,218 @@ def test_write_element_corrected_never_touches_the_source(pdb_file):
     assert [line[:76] for line in corrected[:3]] == [
         line[:76] for line in ELEMENT_COLUMN_PDB.splitlines()[:3]
     ]
+
+
+# --------------------------------------------------
+# 2026-11-16: a carbon merely NAMED CL... or CU... stays carbon.
+# Some DDD bundles name a ligand's carbons alphabetically (CA, CB, ... CL,
+# ... CU). Trusting the name alone made 18 of 50 corrections in the 499
+# structure-wins bundles wrong (2pcp, 4gh6, 3oc0, ...).
+
+
+def corrections(*lines):
+    """element_corrections over these lines, as {atom name: (col, implied)}"""
+
+    lines = [line + "\n" for line in lines]
+    return {
+        lines[i][12:16].strip(): v
+        for i, v in ligand_check.element_corrections(lines).items()
+    }
+
+
+def test_a_real_chlorine_one_carbon_no_hydrogen_is_corrected():
+    assert corrections(
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+        atom(3, "H1", "LIG", 1, 2.3, 0.9, 0.0, "H"),  # on C1, 2.4 A from Cl
+    ) == {"CL1": ("C", "CL")}
+
+
+def test_a_real_bromine_is_corrected():
+    assert corrections(
+        atom(1, "BR", "LIG", 1, 0.0, 0.0, 0.0, "B"),
+        atom(2, "C7", "LIG", 1, 0.0, 1.94, 0.0, "C"),
+    ) == {"BR": ("B", "BR")}
+
+
+def test_a_methyl_carbon_named_cl1_stays_carbon():
+    """4gh6, 3l9m, 3mg7...: CL1 is a methyl, three H at 1.09 A."""
+
+    assert corrections(
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C2", "LIG", 1, 1.53, 0.0, 0.0, "C"),
+        atom(3, "H1", "LIG", 1, -0.36, 1.03, 0.0, "H"),
+        atom(4, "H2", "LIG", 1, -0.36, -0.51, 0.89, "H"),
+        atom(5, "H3", "LIG", 1, -0.36, -0.51, -0.89, "H"),
+    ) == {}
+
+
+def test_a_ring_carbon_named_cl_stays_carbon():
+    """2pcp: phencyclidine's ring carbon CL, two C neighbours and two H."""
+
+    assert corrections(
+        atom(1, "CL", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "CK", "LIG", 1, 1.53, 0.0, 0.0, "C"),
+        atom(3, "CG", "LIG", 1, -0.5, 1.45, 0.0, "C"),
+        atom(4, "H24", "LIG", 1, -0.4, -0.5, 0.9, "H"),
+        atom(5, "H25", "LIG", 1, -0.4, -0.5, -0.9, "H"),
+    ) == {}
+
+
+def test_an_aromatic_carbon_named_cl_with_no_hydrogen_stays_carbon():
+    """3gur: CL has no H but three heavy neighbours at ~1.4 A."""
+
+    assert corrections(
+        atom(1, "CL", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "CK", "LIG", 1, 1.40, 0.0, 0.0, "C"),
+        atom(3, "CM", "LIG", 1, -0.70, 1.21, 0.0, "C"),
+        atom(4, "N1", "LIG", 1, -0.70, -1.21, 0.0, "N"),
+    ) == {}
+
+
+def test_a_carbon_named_cu_stays_carbon_and_a_real_copper_is_corrected():
+    """3oc0: CU is a CH carbon. A copper sits >= 1.9 A from its ligands."""
+
+    assert corrections(
+        atom(1, "CU", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "CT", "LIG", 1, 1.52, 0.0, 0.0, "C"),
+        atom(3, "H9", "LIG", 1, -0.4, 1.0, 0.0, "H"),
+    ) == {}
+    assert corrections(
+        atom(1, "CU1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "N1", "LIG", 1, 2.0, 0.0, 0.0, "N"),
+        atom(3, "N2", "LIG", 1, -2.0, 0.0, 0.0, "N"),
+        atom(4, "N3", "LIG", 1, 0.0, 2.0, 0.0, "N"),
+    ) == {"CU1": ("C", "CU")}
+
+
+def test_a_metal_named_atom_with_a_short_heavy_bond_stays():
+    assert corrections(
+        atom(1, "ZN", "LIG", 1, 0.0, 0.0, 0.0, "Z"),
+        atom(2, "N1", "LIG", 1, 1.47, 0.0, 0.0, "N"),
+    ) == {}
+
+
+def test_a_selenium_between_two_carbons_is_corrected():
+    assert corrections(
+        atom(1, "SE1", "LIG", 1, 0.0, 0.0, 0.0, "S"),
+        atom(2, "C1", "LIG", 1, 1.95, 0.0, 0.0, "C"),
+        atom(3, "C2", "LIG", 1, -1.95, 0.0, 0.0, "C"),
+    ) == {"SE1": ("S", "SE")}
+
+
+def test_two_chlorines_on_one_carbon_are_both_corrected():
+    """Each Cl has one heavy neighbour; the other Cl is 2.9 A away."""
+
+    assert corrections(
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "CL2", "LIG", 1, 2.9, 0.0, 0.0, "C"),
+        atom(3, "C1", "LIG", 1, 1.45, 0.95, 0.0, "C"),
+    ) == {"CL1": ("C", "CL"), "CL2": ("C", "CL")}
+
+
+def test_hydrogen_is_recognised_by_name_when_the_column_is_empty():
+    assert corrections(
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C2", "LIG", 1, 1.53, 0.0, 0.0, "C"),
+        atom(3, "H1", "LIG", 1, -0.36, 1.03, 0.0, ""),
+    ) == {}
+
+
+def test_neighbours_count_only_within_the_same_residue():
+    """A protein carbon 1.5 A away (a clash) does not make a Cl a carbon."""
+
+    assert corrections(
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+        atom(3, "CB", "ALA", 2, -1.5, 0.0, 0.0, "C"),
+    ) == {"CL1": ("C", "CL")}
+
+
+def test_every_model_is_corrected_with_its_own_neighbours():
+    lines = [
+        "MODEL        1",
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+        "ENDMDL",
+        "MODEL        2",
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+        "ENDMDL",
+    ]
+    fixes = ligand_check.element_corrections([x + "\n" for x in lines])
+    assert sorted(fixes) == [1, 5]
+
+
+def test_unreadable_coordinates_are_not_corrected():
+    line = atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C")
+    line = line[:30] + "   xxxxx" + line[38:]
+    assert corrections(line, atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C")) == {}
+
+
+def test_disagreements_and_the_corrected_file_agree(pdb_file):
+    """The preflight flag and the correction now make the same decision."""
+
+    text = "\n".join([
+        atom(1, "CL1", "LIG", 1, 0.0, 0.0, 0.0, "C"),
+        atom(2, "C1", "LIG", 1, 1.75, 0.0, 0.0, "C"),
+        atom(3, "CL", "LIG", 2, 10.0, 0.0, 0.0, "C"),
+        atom(4, "CK", "LIG", 2, 11.53, 0.0, 0.0, "C"),
+        atom(5, "CM", "LIG", 2, 9.5, 1.45, 0.0, "C"),
+    ]) + "\n"
+    src = pdb_file(text)
+    dst = src.with_name("corrected.pdb")
+
+    assert ligand_check.element_column_disagreements(str(src)) == ["CL1:C!=CL"]
+    assert ligand_check.write_element_corrected(str(src), str(dst)) == [
+        "CL1:C->CL"
+    ]
+    out = dst.read_text().splitlines()
+    assert out[0].endswith("CL") and out[2].endswith(" C")
+
+
+# --------------------------------------------------
+# Real bundles (the 2026-11-16 survey copies on the ddd host); skipped
+# elsewhere.
+SURVEY = pathlib.Path("/mdrepotmp/ddd/work-structure-wins/survey-work")
+
+
+@pytest.mark.skipif(not SURVEY.is_dir(), reason="ddd host survey copies")
+@pytest.mark.parametrize(
+    "bundle,expected",
+    [
+        ("2pcp", []),  # ring carbon CL
+        ("4gh6", []),  # methyl CL1
+        ("3oc0", []),  # CH carbons CU and CL
+        ("1bxq", []),  # methyls CL1, CL2
+        ("3gur", []),  # aromatic CL, no H
+    ],
+)
+def test_real_carbons_named_cl_or_cu_are_left_alone(bundle, expected):
+    pdb = SURVEY / bundle / "Pro_lig.pdb"
+    assert ligand_check.element_column_disagreements(str(pdb)) == expected
+
+
+@pytest.mark.skipif(not SURVEY.is_dir(), reason="ddd host survey copies")
+def test_real_chlorines_and_bromines_are_all_still_corrected():
+    """The 32 corrections in the 499 that ARE halogens (no H, one heavy
+    neighbour; elemfix-check/corrections.tsv) are all still made, and the
+    18 carbons none."""
+
+    table = SURVEY.parent / "elemfix-check" / "corrections.tsv"
+    if not table.is_file():
+        pytest.skip("elemfix-check/corrections.tsv not present")
+    real, carbon = set(), set()
+    for row in table.read_text().splitlines()[1:]:
+        f = row.split("\t")
+        key = (f[0], f[1].upper())
+        (carbon if int(f[4]) or int(f[5]) > 1 else real).add(key)
+    assert len(real) == 32 and len(carbon) == 18
+
+    found = set()
+    for bundle in {b for b, _ in real | carbon}:
+        for item in ligand_check.element_column_disagreements(
+            str(SURVEY / bundle / "Pro_lig.pdb")
+        ):
+            found.add((bundle, item.split(":")[0]))
+    assert found == real
