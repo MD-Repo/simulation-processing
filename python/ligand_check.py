@@ -46,8 +46,9 @@ Purpose: The DDD prod wave's ligand verdict, shared by preflight_ligands.py
          its BLOCK stands, which is the check still working.
 """
 
+import math
 import os
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import compare_smiles
 
@@ -84,50 +85,144 @@ def worst(verdicts: Sequence[str]) -> str:
 
 
 # --------------------------------------------------
+# 2026-11-16: THE NAME ALONE IS NOT ENOUGH. Some DDD bundles name a
+# ligand's carbons alphabetically (CA, CB, ... CL, ... CU) with element C,
+# which is right. Trusting the name turned those carbons into chlorine and
+# copper: 18 of 50 corrections in the 499 structure-wins bundles, e.g.
+# 2pcp's ring carbon CL (phencyclidine has no Cl) and 4gh6's methyl CL1,
+# which RDKit then "explained" as [ClH3+3]. So a name-implied element
+# replaces the column only when the atom's surroundings fit it:
+#   - Cl, Br: no hydrogen bonded (<= 1.25 A) and at most one heavy atom
+#     within 2.1 A (C-Cl 1.75 A, C-Br 1.94 A; a carbon has H or 2+
+#     neighbours at ~1.5 A);
+#   - metals and Se: no hydrogen bonded and no heavy atom closer than
+#     1.7 A (metal-ligand and Se-C bonds are >= 1.9 A; C-C/C-N/C-O are not).
+HALOGENS = ("CL", "BR")
+H_BOND_A = 1.25
+HALOGEN_BOND_A = 2.1
+SHORT_BOND_A = 1.7
+
+
+def _is_hydrogen(name: str, element: str) -> bool:
+    """H by the element column, or by the name when the column is empty"""
+
+    if element:
+        return element in ("H", "D")
+    return name[:1] in ("H", "D")
+
+
+def _ligand_atoms(lines: Sequence[str]) -> List[dict]:
+    """The ligand atoms of these PDB lines, each with its line index,
+    residue key (model, name, chain, number), name, element column and
+    coordinates (None when they cannot be read). Every model is read, as
+    before; neighbours are looked for within the atom's own model."""
+
+    atoms = []
+    model = 0
+    for i, line in enumerate(lines):
+        if line.startswith("ENDMDL"):
+            model += 1
+            continue
+        if not line.startswith(("HETATM", "ATOM  ")) or len(line) < 78:
+            continue
+        # Ligand only: HETATM is a ligand by definition, but this corpus
+        # writes its ligand as ATOM records (1aid/Pro_lig.pdb has 3,175 ATOM
+        # and zero HETATM), so those are filtered by residue name.
+        if line.startswith("ATOM  ") and \
+                line[17:20].strip().upper() not in LIGAND_RESNAMES:
+            continue
+        try:
+            xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        except ValueError:
+            xyz = None
+        atoms.append({
+            "i": i,
+            "res": (model, line[17:21].strip(), line[21], line[22:27].strip()),
+            "name": line[12:16].strip().upper(),
+            "element": line[76:78].strip().upper(),
+            "xyz": xyz,
+        })
+    return atoms
+
+
+def _fits(atom: dict, implied: str, residue: List[dict]) -> bool:
+    """Do this atom's surroundings fit the name-implied element?"""
+
+    if atom["xyz"] is None:
+        return False
+    h = heavy_near = 0
+    shortest = None
+    for other in residue:
+        if other is atom or other["xyz"] is None:
+            continue
+        d = math.dist(atom["xyz"], other["xyz"])
+        if _is_hydrogen(other["name"], other["element"]):
+            if d <= H_BOND_A:
+                h += 1
+            continue
+        if d <= HALOGEN_BOND_A:
+            heavy_near += 1
+        if shortest is None or d < shortest:
+            shortest = d
+    if h:
+        return False
+    if implied in HALOGENS:
+        return heavy_near <= 1
+    return shortest is None or shortest >= SHORT_BOND_A
+
+
+def element_corrections(lines: Sequence[str]) -> Dict[int, Tuple[str, str]]:
+    """{line index: (column element, name-implied element)} for the ligand
+    atoms whose name implies a two-letter element the column contradicts
+    AND whose surroundings fit that element (see above). A carbon that only
+    happens to be named CL... or CU... is left alone."""
+
+    atoms = _ligand_atoms(lines)
+    by_res: Dict[Tuple[int, str, str, str], List[dict]] = {}
+    for a in atoms:
+        by_res.setdefault(a["res"], []).append(a)
+
+    out = {}
+    for a in atoms:
+        if not a["name"] or not a["element"]:
+            continue
+        implied = next(
+            (e for e in TWO_LETTER_ELEMENTS if a["name"].startswith(e)), None
+        )
+        if implied and a["element"] != implied and \
+                _fits(a, implied, by_res[a["res"]]):
+            out[a["i"]] = (a["element"], implied)
+    return out
+
+
+# --------------------------------------------------
 def element_column_disagreements(pdb_path: str) -> List[str]:
     """Ligand atoms whose PDB element column contradicts the element implied
-    by the atom name. OpenBabel trusts that column silently, so a
+    by the atom name, where the atom's surroundings fit the implied element
+    (element_corrections). OpenBabel trusts that column silently, so a
     disagreement means the inference's own INPUT may be wrong -- worth
     flagging regardless of what the SMILES comparison then says (MDR-40).
     """
 
-    bad = []
     try:
         with open(pdb_path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                # ATOM as well as HETATM: this corpus writes its ligand as
-                # ATOM records (1aid/Pro_lig.pdb has 3,175 ATOM and zero
-                # HETATM), so a HETATM-only scan silently examines nothing
-                # and reports every bundle clean.
-                if not line.startswith(("HETATM", "ATOM  ")):
-                    continue
-                # Ligand only: HETATM is a ligand by definition, but this
-                # corpus writes its ligand as ATOM records (1aid has 3,175
-                # ATOM and zero HETATM), so those are filtered by residue.
-                if line.startswith("ATOM  ") and \
-                        line[17:20].strip().upper() not in LIGAND_RESNAMES:
-                    continue
-                name = line[12:16].strip().upper()
-                element = line[76:78].strip().upper()
-                if not name or not element:
-                    continue
-                implied = next(
-                    (s for s in TWO_LETTER_ELEMENTS if name.startswith(s)),
-                    None,
-                )
-                if implied and element != implied:
-                    bad.append(f"{name}:{element}!={implied}")
+            lines = fh.readlines()
     except OSError as e:
         return [f"unreadable: {e}"]
 
-    return sorted(set(bad))
+    fixes = element_corrections(lines)
+    return sorted({
+        f"{lines[i][12:16].strip().upper()}:{col}!={implied}"
+        for i, (col, implied) in fixes.items()
+    })
 
 
 # --------------------------------------------------
 def write_element_corrected(src: str, dst: str) -> List[str]:
     """Copy a structure file, setting the element column from the atom name
     wherever a LIGAND atom's name implies a two-letter element the column
-    contradicts. Returns the corrections made.
+    contradicts and the atom's surroundings fit that element
+    (element_corrections). Returns the corrections made.
 
     THIS NEVER TOUCHES THE CONTRIBUTOR'S FILE. The caller writes to a scratch
     path, uses it only to infer the ligand's identity, and discards it; the
@@ -139,27 +234,21 @@ def write_element_corrected(src: str, dst: str) -> List[str]:
     convergent evidence, not the contributor's testimony: on 2026-08-28 all
     804 held-out bundles that took a correction stopped mismatching, and the
     corrected formulas matched PDBbind's declared halogen counts. Worth the
-    contributor confirming rather than us assuming indefinitely.
+    contributor confirming rather than us assuming indefinitely. It does
+    NOT hold for a carbon that is merely named CL... or CU... (2026-11-16).
     """
 
+    with open(src, encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+
+    fixes = element_corrections(lines)
     fixed = []
-    with open(src, encoding="utf-8", errors="replace") as fh, \
-            open(dst, "w", encoding="utf-8") as out:
-        for line in fh:
-            if line.startswith(("HETATM", "ATOM  ")) and len(line) >= 78:
-                is_ligand = line.startswith("HETATM") or (
-                    line[17:20].strip().upper() in LIGAND_RESNAMES
-                )
-                if is_ligand:
-                    name = line[12:16].strip().upper()
-                    elem = line[76:78].strip().upper()
-                    implied = next(
-                        (e for e in TWO_LETTER_ELEMENTS
-                         if name.startswith(e)), None,
-                    )
-                    if implied and elem != implied:
-                        line = line[:76] + implied.ljust(2) + line[78:]
-                        fixed.append(f"{name}:{elem}->{implied}")
+    with open(dst, "w", encoding="utf-8") as out:
+        for i, line in enumerate(lines):
+            if i in fixes:
+                col, implied = fixes[i]
+                line = line[:76] + implied.ljust(2) + line[78:]
+                fixed.append(f"{line[12:16].strip().upper()}:{col}->{implied}")
             out.write(line)
     return fixed
 
