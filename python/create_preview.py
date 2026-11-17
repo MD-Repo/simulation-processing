@@ -17,6 +17,7 @@ import fcntl
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 from typing import NamedTuple, Iterator
@@ -230,6 +231,33 @@ def make_transparent(image: Image.Image) -> Image.Image:
 
 
 # --------------------------------------------------
+def first_frame_xtc(path: str) -> bytes:
+    """The trajectory's first frame, as an XTC of its own.
+
+    The thumbnail is a still: Mol* shows the first frame of what it is given
+    and nothing plays. Passing the whole trajectory as base64 killed the
+    browser on large systems: zenodo:6797842's pore_33mer, 548,478 atoms and
+    a 176 MB sampled.xtc (about 234 MB as a string), ended every attempt in
+    "Target page, context or browser has been closed", and 21 systems in
+    three records failed their import (#42). Its first frame is about 2 MB.
+
+    Read and written with XTCFile, which leaves no offsets cache beside the
+    trajectory as MDAnalysis's XTC reader does.
+    """
+
+    from MDAnalysis.lib.formats.libmdaxdr import XTCFile
+
+    with XTCFile(path) as src:
+        frame = src.read()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "first.xtc")
+        with XTCFile(out, "w") as dst:
+            dst.write(frame.x, frame.box, frame.step, frame.time, frame.prec)
+        with open(out, "rb") as fh:
+            return fh.read()
+
+
+# --------------------------------------------------
 def main() -> None:
     """ Make a jazz noise here """
 
@@ -242,8 +270,7 @@ def main() -> None:
 
     xtc_b64 = None
     if args.trajectory and os.path.isfile(args.trajectory):
-        with open(args.trajectory, "rb") as fh:
-            xtc_b64 = base64.b64encode(fh.read()).decode("ascii")
+        xtc_b64 = base64.b64encode(first_frame_xtc(args.trajectory)).decode("ascii")
 
     # Under the concurrent render storm an individual render can crash
     # (TargetClosedError) and even take its Xvfb down. Retry a few times; each
