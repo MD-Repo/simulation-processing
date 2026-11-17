@@ -2005,16 +2005,30 @@ def write_gromacs_bash(
 
 # --------------------------------------------------
 # Residues
+#
+# Every name mdr-process's sequence extraction reads as water
+# (mdrepo-rs mdr-process/src/sequence.rs) is here too. Desmond names TIP3P
+# T3P, and without it Zenodo 4501408's 20 staging deposits kept all their
+# water in minimal.*: 190,491 of 221,089 atoms, which crashed the preview
+# until #58 and then showed the protein buried in solvent (#59).
 KNOWN_WATER = [
     "WAT",
     "HOH",
+    "H2O",
+    "DOD",
+    "TIP",
     "TIP3",
     "TIP3P",
+    "TP3",
+    "T3P",
     "TIP4",
     "TIP4P",
+    "T4P",
     "TIP5",
+    "T5P",
     "OPC",
     "SPC",
+    "SPCE",
     "SOL",
 ]
 KNOWN_IONS = [
