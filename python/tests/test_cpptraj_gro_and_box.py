@@ -281,3 +281,18 @@ def test_lipid_path_with_nothing_to_strip_is_the_failing_shape():
 
     kept = structure[c.keep_mask(structure, LIPID_STRIP)]
     assert [a.residue.name for a in kept.atoms] == ["MET", "POPC", "POPC"]
+
+
+def test_desmond_water_is_stripped_from_minimal():
+    """Desmond names TIP3P water T3P (Zenodo 4501408, #59)."""
+    structure = FakeStructure(["LEU", "T3P", "T3P", "T3P", "NA", "CL"])
+    strip = set(c.KNOWN_WATER + c.KNOWN_IONS + c.KNOWN_LIPIDS)
+    kept = structure[c.keep_mask(structure, strip)]
+    assert [a.residue.name for a in kept.atoms] == ["LEU"]
+
+
+def test_every_water_name_mdr_process_knows_is_stripped():
+    """mdr-process's sequence.rs WATER list, as of mdr-process 0.41.3."""
+    sequence_rs = ["HOH", "WAT", "SOL", "H2O", "DOD", "TIP", "TIP3", "TIP4",
+                   "TIP5", "T3P", "T4P", "T5P", "SPC", "SPCE", "TP3"]
+    assert set(sequence_rs) <= set(c.KNOWN_WATER)
