@@ -203,6 +203,43 @@ def get_args() -> Args:
 
 
 # --------------------------------------------------
+def collapse_tracebacks(text: str) -> str:
+    """Replace each Python traceback with the error line it ends on
+
+    An uncaught exception prints a stack of indented "File ..." lines and then
+    the error itself, unindented. In Slack only the error is useful, and the
+    stack pushes everything else out of the TAIL_LINES window. The log keeps
+    the full text; this is only for the message.
+
+    A chained exception prints two tracebacks joined by a "During handling..."
+    line; each collapses to its own error line, and the joining line is kept.
+    """
+
+    out: List[str] = []
+    in_traceback = False
+    for line in text.splitlines():
+        if line.startswith("Traceback (most recent call last):"):
+            in_traceback = True
+            continue
+        if in_traceback:
+            # Stack frames, source lines and ^^^ markers are all indented; the
+            # first unindented line is the exception, which ends the block.
+            if line[:1].isspace() or not line:
+                continue
+            in_traceback = False
+        out.append(line)
+
+    return "\n".join(out)
+
+
+# --------------------------------------------------
+def message_tail(output: str) -> str:
+    """The last TAIL_LINES lines of output, with tracebacks collapsed"""
+
+    return "\n".join(collapse_tracebacks(output).strip().splitlines()[-TAIL_LINES:])
+
+
+# --------------------------------------------------
 def state_path(state_dir: str, label: str) -> str:
     """Path of the state file for this label
 
@@ -337,7 +374,7 @@ def main() -> None:
     if code == 0:
         if args.notify_success:
             message = f"CRON OK: {args.label}"
-            tail = "\n".join(output.strip().splitlines()[-TAIL_LINES:])
+            tail = message_tail(output)
             if tail:
                 message += f"\n```\n{tail}\n```"
             send_slack_message(message, base_url)
@@ -388,7 +425,7 @@ def main() -> None:
     state.setdefault("first_failure", state["last_failure"])
 
     if should_alert(state, failures, args.threshold, args.repeat_after, now):
-        tail = "\n".join(output.strip().splitlines()[-TAIL_LINES:])
+        tail = message_tail(output)
         message = f"CRON FAILED: {args.label} (exit {code})"
         if failures > 1:
             message += (
