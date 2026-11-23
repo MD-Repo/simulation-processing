@@ -4,9 +4,10 @@ Author : Ken Youens-Clark <kyclark@arizona.edu>
 Date   : 2026-10-20
 Purpose: Revoke iRODS read tickets on simulations that are not released.
 
-         A simulation's stored read ticket (md_simulation.irods_ticket) has no
-         expiry and unlimited uses, and it covers the whole MDR* collection,
-         so anyone holding the string can read the files anonymously.
+         A simulation's stored read ticket (md_simulation.irods_ticket) has
+         unlimited uses and covers the whole MDR* collection, so anyone
+         holding the string can read the files anonymously until it expires
+         (30 days since MDR-115; older ones never expire).
          Embargoing a simulation only sets is_embargoed; the ticket keeps
          working. This deletes the ticket in iRODS for every simulation that
          is not released (not is_public, or is_embargoed, or is_placeholder)
@@ -15,9 +16,12 @@ Purpose: Revoke iRODS read tickets on simulations that are not released.
          retries it. A ticket iRODS no longer knows (CAT_TICKET_INVALID) is
          already revoked, so its column is cleared.
 
-         md-repo-app's get_download_ticket() stores a new permanent ticket
-         when a contributor or superuser downloads a hidden simulation, so
-         this runs nightly to keep that ticket's life to a day.
+         md-repo-app's get_download_ticket() no longer stores a ticket for a
+         hidden simulation (since md-repo-app#434 it mints one that expires
+         with the download token), so this mostly catches simulations that
+         were released, got a stored ticket, and were then hidden again.
+         The column and its expiry (irods_ticket_expires_at) are cleared
+         together.
 
          --sweep also searches the iRODS catalog for tickets that
          md_simulation does not track (legacy per-request tickets, MDR-83) on
@@ -249,7 +253,8 @@ def revoke_stored(session, cur, sim: Hidden, dry_run: bool) -> int:
     cur.execute(
         """
         update md_simulation
-        set    irods_ticket = null
+        set    irods_ticket = null,
+               irods_ticket_expires_at = null
         where  id = %s
         and    irods_ticket = %s
         """,

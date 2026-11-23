@@ -31,3 +31,30 @@ def test_hidden_simulations_refused():
         unreleased_reason({**RELEASED, "is_placeholder": True})
         == "a placeholder"
     )
+
+
+# --------------------------------------------------
+def _run(*argv):
+    import subprocess
+
+    script = Path(__file__).resolve().parent.parent / "create_irods_ticket.py"
+    return subprocess.run(
+        [sys.executable, str(script), *argv], capture_output=True, text=True
+    )
+
+
+# --------------------------------------------------
+def test_lifetime_must_outlast_the_renewal_point():
+    # A ticket born with 16 days or fewer would be renewed the same night
+    # (MDR-115), so the option refuses it before touching the database.
+    out = _run("--simulation-id", "1", "-p", "/x", "--lifetime-days", "16")
+    assert out.returncode == 2
+    assert "--lifetime-days '16' must be more than 16" in out.stderr
+
+
+# --------------------------------------------------
+def test_help_shows_lifetime_default():
+    out = _run("--help")
+    assert out.returncode == 0
+    assert "--lifetime-days" in out.stdout
+    assert "(default: 30)" in out.stdout

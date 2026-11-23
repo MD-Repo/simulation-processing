@@ -5,12 +5,15 @@ Date   : 2026-07-09
 Purpose: Create an unlimited-use iRODS ticket for a simulation's iRODS
          path and store it in md_simulation.irods_ticket.
 
-The ticket never expires and has unlimited uses, so a read ticket
-is only issued for a released simulation (approved, not embargoed, not a
-placeholder).
+A read ticket expires after --lifetime-days (30 by default) and its expiry is
+stored in md_simulation.irods_ticket_expires_at; renew_public_tickets.py
+replaces it nightly before it ends (MDR-115). Anyone holding the string can
+read the simulation until then, so a read ticket is only issued for a
+released simulation (approved, not embargoed, not a placeholder).
 """
 
 import argparse
+import datetime
 import os
 import psycopg2
 import psycopg2.extras
@@ -20,6 +23,8 @@ from irods.session import iRODSSession
 from irods.ticket import Ticket
 from typing import NamedTuple, Optional
 
+import shared_tickets as st
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -28,6 +33,7 @@ class Args(NamedTuple):
     path: str
     server: str
     permission: str
+    lifetime_days: int
 
 
 # --------------------------------------------------
@@ -72,13 +78,28 @@ def get_args() -> Args:
         default="read",
     )
 
+    parser.add_argument(
+        "--lifetime-days",
+        help="Days a read ticket lives",
+        metavar="INT",
+        type=int,
+        default=st.LIFETIME_DAYS,
+    )
+
     args = parser.parse_args()
+
+    if args.lifetime_days <= st.RENEW_WITHIN_DAYS:
+        parser.error(
+            f"--lifetime-days '{args.lifetime_days}' must be more than "
+            f"{st.RENEW_WITHIN_DAYS}, or the nightly renewal replaces it at once"
+        )
 
     return Args(
         simulation_id=args.simulation_id,
         path=args.path,
         server=args.server,
         permission=args.permission,
+        lifetime_days=args.lifetime_days,
     )
 
 
@@ -135,25 +156,33 @@ def main() -> None:
 
     print(f"{mdrepo_id} -> {args.path}")
 
+    expires_at = None
     with iRODSSession(irods_env_file=irods_env) as session:
-        ticket = Ticket(session)
-        ticket.issue(args.permission, args.path)
+        if args.permission == "read":
+            expires_at = st.now_utc() + datetime.timedelta(days=args.lifetime_days)
+            string = st.mint_read_ticket(session, args.path, expires_at)
+        else:
+            ticket = Ticket(session)
+            ticket.issue(args.permission, args.path)
 
-        # Allow the ticket to be used an unlimited number of times
-        # (equivalent to "iticket mod <ticket-string> uses 0"). The value
-        # must be a string; a falsy int like 0 is dropped by the client.
-        ticket.modify("uses", "0")
+            # Allow the ticket to be used an unlimited number of times
+            # (equivalent to "iticket mod <ticket-string> uses 0"). The value
+            # must be a string; a falsy int like 0 is dropped by the client.
+            ticket.modify("uses", "0")
+            string = ticket.ticket
 
     cur.execute(
         """
         update md_simulation
-        set    irods_ticket=%s
+        set    irods_ticket=%s,
+               irods_ticket_expires_at=%s
         where  id=%s
         """,
-        (ticket.ticket, args.simulation_id),
+        (string, expires_at, args.simulation_id),
     )
 
-    print(f"Done. {mdrepo_id} = {ticket.ticket}")
+    until = f", expires {expires_at:%Y-%m-%d %H:%MZ}" if expires_at else ""
+    print(f"Done. {mdrepo_id} = {string}{until}")
 
 
 # --------------------------------------------------
